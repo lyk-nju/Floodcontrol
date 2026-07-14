@@ -1,6 +1,6 @@
 # Floodcontrol 新版框架讨论索引
 
-状态：模型结构和实现迁移方案已进入协议冻结阶段；当前代码仍是恢复后的 FloodNet 迁移基线，不能把设计文档误认为已落盘实现。未标记为 `LOCKED` 的内容仍在讨论中。
+状态：`MODEL_CORE_IMPLEMENTED / STRICT4_VAE_AND_RUNTIME_OPEN`。Hybrid LDF、Root/Body两阶段主干、CFG和合成张量stream核心已经落地；strict-4 VAE、真实训练数据与Web runtime仍未接线。未标记为`LOCKED`的内容继续视为讨论项。
 
 这个目录用于把新版 Floodcontrol 的设计讨论拆成可独立审阅的主题，避免把模型协议、数据语义、在线状态、训练目标和实验超参数混在同一份文档里。
 
@@ -52,5 +52,4 @@
 - `LOCKED`：LDF 公共 hybrid 字段为 `root_motion/latent_motion`；root 使用 translation-only stable anchor 坐标元数据，五维为 `[x,y,z,cos(yaw),sin(yaw)]`。
 - `OPEN`：OriginEpoch 触发策略、VAE/FSQ 选择、latent width、self-forcing 方案和全部训练超参数。
 
-历史实现与实验材料不在新版仓库重复保存；需要追溯时直接查看同级的
-`FloodNet`、`FloodDiffusion` 和 `ardy` 仓库。
+历史实现与实验材料不在新版仓库重复保存；本文只保留对FloodDiffusion、FloodNet和ARDY设计来源的必要说明。

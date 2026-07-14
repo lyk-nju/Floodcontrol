@@ -1,96 +1,17 @@
-# Real-time 3D Motion Generation Demo
+# Floodcontrol Web Runtime
 
-## Quick Start
+状态：`BLOCKED_ON_STRICT4_VAE`。
 
-```bash
-cd web_demo
-./server.sh start
-```
+当前仓库只发布新版Hybrid LDF模型核心。旧的full-motion VAE、ControlNet和外置root planner已经删除，而strict `4 frames / token` body VAE、commit-time decoder事务与Web runtime尚未接线。
 
-Visit: **http://localhost:5000**  
-Refresh: `Ctrl+Shift+R` (clear cache)
+因此本目录保留HTTP/UI边界和显式迁移守卫，但不能启动真实动作生成。`web_demo.model_manager.ModelManager`会在加载legacy checkpoint之前抛出带有`BLOCKED_ON_STRICT4_VAE`的错误。
 
-## Features
+恢复Web生成需要依次完成：
 
--   🎨 **Text-driven**: Input motion descriptions to generate 3D animations in real-time
--   🎭 **Streaming Rendering**: Smooth 20 FPS playback
--   🎪 **Colorful Stick Figure**: Different colors for different body parts
--   📹 **Smart Camera Follow**: Auto-follow after 3 seconds of inactivity
--   🌐 **Infinite Scene**: 1000x1000 unit ground with grid
+1. strict-4 body VAE与causal decoder state；
+2. explicit root + body latent数据协议和真实statistics；
+3. runtime condition compiler与`LDF.stream_generate_step()`接线；
+4. Hybrid commit与VAE decoder state的原子snapshot/restore；
+5. full/cached decode parity和端到端stream测试。
 
-## Usage
-
-1. Enter motion description (e.g., "walk forward", "jump", "dance")
-2. Click "Start"
-3. Watch real-time generated 3D animation
-4. Use "Update Text" to change motion anytime
-5. Mouse drag to rotate view, scroll to zoom
-6. Camera auto-follows character after 3 seconds of inactivity
-
-## Architecture
-
-```
-Text Input → Model(1 token) → VAE(4 frames) →
-StreamJointRecovery(22 joints) → Buffer → 20fps Rendering
-```
-
-## File Structure
-
-```
-web_demo/
-├── app.py                # Flask server
-├── model_manager.py      # Model and buffer management
-├── server.sh            # Server management script
-├── start.sh             # Legacy startup script
-├── static/
-│   ├── css/style.css    # Clean white UI
-│   └── js/
-│       ├── main.js      # Main logic (20fps + camera follow)
-│       └── skeleton.js  # Stick figure rendering (colorful)
-└── templates/
-    └── index.html       # Web interface
-```
-
-## Performance
-
--   **Model Generation**: 52 FPS on 5090 (76ms/step)
--   **Rendering**: 20 FPS (matches model output)
--   **Buffer**: 4 frames minimum
-
-## Technical Details
-
-### StreamJointRecovery263
-
--   Process 263-dim motion data frame by frame
--   Output 22 joint 3D coordinates
--   Test verified: Identical to batch processing
-
-### HumanML3D Skeleton
-
-```python
-[0,2,5,8,11]      # Spine (orange)
-[0,1,4,7,10]      # Left leg (cyan)
-[0,3,6,9,12,15]   # Right leg (blue)
-[9,14,17,19,21]   # Left arm (amber)
-[9,13,16,18,20]   # Right arm (aquamarine)
-```
-
-## Server Management
-
-Use `server.sh` for reliable process management:
-
-```bash
-./server.sh start    # Start server
-./server.sh stop     # Stop server
-./server.sh restart  # Restart server
-./server.sh status   # Check status
-```
-
-## Tiny Model
-
-You can use different model configurations by specifying a config file:
-
-```bash
-./server.sh start configs/stream_tiny.yaml
-./server.sh restart configs/stream_tiny.yaml
-```
+在这些条件满足前，不应把静态前端或旧server脚本视为可用生成demo。

@@ -53,7 +53,7 @@ class MotionApp {
         this.updateStatus();
         this.setupBeforeUnload();
 
-        console.log('FloodNet web_demo JS build: trajectory-debug-20260517');
+        console.log('Floodcontrol web_demo JS build: strict4-runtime-blocked');
         console.log('Session ID:', this.sessionId);
     }
 

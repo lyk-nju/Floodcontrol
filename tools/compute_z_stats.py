@@ -1,4 +1,4 @@
-"""Compute VAE latent z stats (z_mean, z_std) for history corruption (T_B_02).
+"""Compute per-channel VAE latent statistics from a pretokenized cache.
 
 Walks a pretokenize cache of per-clip VAE latents and accumulates per-channel
 Welford mean/std over all latent vectors. Output:
@@ -6,8 +6,9 @@ Welford mean/std over all latent vectors. Output:
     deps/body_stats/z_mean.npy   [D] float32
     deps/body_stats/z_std.npy    [D] float32
 
-These are loaded into the Wan model via `WanModel.load_z_stats(stats_dir)` and
-used (with `mask_emb`) by the T_B_03 history-corruption augmentation.
+The current Hybrid LDF does not load these files directly. They are retained as
+an offline data utility for the upcoming strict-4 body-latent protocol, whose
+normalization owner and final artifact schema are still to be frozen.
 
 CLI:
     python tools/compute_z_stats.py \

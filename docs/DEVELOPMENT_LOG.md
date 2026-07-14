@@ -205,3 +205,52 @@
 
 - strict-4数据与训练接线时必须直接提供两套position IDs，并使用相同回归测试验证随机训练裁窗与stream rolling的一致性。
 - runtime route compiler恢复时只负责absolute future timeline；generation-centered RoPE转换继续由LDF合同统一完成。
+
+## 2026-07-14 · Public v0.1首版发布卫生清理
+
+类型：公开仓库准备 / 配置 / 工具 / 文档 / 文件删除
+
+改动内容：
+
+- 新增根目录`.gitignore`，排除Python缓存、测试缓存、日志、实验追踪目录、本地数据/依赖/输出目录以及checkpoint和数组artifact。
+- 将`configs/paths_default.yaml`中的开发机绝对路径替换为相对默认目录，并支持`FLOODCONTROL_DATA/FLOODCONTROL_DEPS/FLOODCONTROL_OUTPUTS`环境变量覆盖。
+- 移除`run_pytest.sh`中的个人Conda路径fallback，保留当前Conda环境或`python3`的可移植选择。
+- 删除仍调用不存在的legacy LDF配置、ablation工具和stream benchmark的`bench_body_7d_ablation.sh`，以及包含个人数据机绝对路径的一次性`shuffle_train_hard_txt.sh`。
+- `pretokenize_t5_text.py`不再静默使用已删除的`configs/ldf.yaml`，改为要求显式`--config`。
+- `metrics.stream`改为使用仓库内motion recovery，并提供本地numeric summary，解除对同级FloodNet/eval包的运行时依赖。
+- README、Web README、Web包标识和rearchitecture索引更新为当前`MODEL_CORE_IMPLEMENTED / BLOCKED_ON_STRICT4_VAE`真实状态，不再宣称旧Web生成可用或依赖本地同级仓库。
+- 更新`compute_z_stats.py`说明，移除已经删除的`WanModel.load_z_stats/mask_emb`旧所有权描述。
+
+改动理由：
+
+- public首版不能提交缓存、日志、模型artifact、credential或开发机绝对路径。
+- 首版只保证Hybrid LDF模型核心；保留会调用不存在旧入口的脚本和可用Web demo说明会误导使用者。
+- 仓库内工具应能独立导入，不应要求发布范围之外的FloodNet Python package。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`24 passed`。
+- 全仓Python文件执行`py_compile`：通过。
+- `metrics.stream`、新版LDF模型和condition模块独立import smoke：通过。
+- shell入口执行`bash -n`：通过。
+- credential扫描只命中从环境变量读取的W&B配置，没有发现硬编码token、password或private key。
+- 大文件/模型artifact扫描未发现待提交文件；`web_demo/app.log`为零字节并由`.gitignore`排除。
+
+涉及文件：
+
+- `.gitignore`
+- `README.md`
+- `configs/paths_default.yaml`
+- `scripts/run_pytest.sh`
+- `tools/pretokenize_t5_text.py`
+- `tools/compute_z_stats.py`
+- `metrics/stream.py`
+- `web_demo/README.md`及Web包标识
+- `docs/rearchitecture/README.md`
+- `docs/DEVELOPMENT_LOG.md`
+- 删除：`scripts/bench_body_7d_ablation.sh`、`scripts/shuffle_train_hard_txt.sh`
+
+后续事项：
+
+- public仓库当前未声明统一项目许可证；第三方来源文件继续保留各自版权头，项目级许可证需由仓库所有者单独决定。
+- strict-4 VAE、真实训练配置和Web runtime完成后再发布下一里程碑。

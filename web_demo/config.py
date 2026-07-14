@@ -1,4 +1,4 @@
-"""Configuration helpers for the FloodNet web demo."""
+"""Configuration helpers for the Floodcontrol web demo."""
 
 from __future__ import annotations
 
@@ -33,4 +33,3 @@ def load_debug_preset_cfg(path: str):
 
 
 __all__ = ["load_debug_preset_cfg", "load_traj_mask_cfg"]
-

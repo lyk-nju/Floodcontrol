@@ -1,4 +1,4 @@
-"""HTTP route registration for the FloodNet web demo."""
+"""HTTP route registration for the Floodcontrol web demo."""
 
 from __future__ import annotations
 
