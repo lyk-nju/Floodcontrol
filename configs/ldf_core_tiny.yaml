@@ -1,0 +1,25 @@
+status: model_core_only
+model:
+  target: models.diffusion_forcing_wan.LDF
+  params:
+    latent_dim: 8
+    root_mean: [0.0, 0.0, 0.0, 0.0, 0.0]
+    root_std: [1.0, 1.0, 1.0, 1.0, 1.0]
+    local_root_mean: [0.0, 0.0, 0.0, 0.0]
+    local_root_std: [1.0, 1.0, 1.0, 1.0]
+    hidden_dim: 32
+    ffn_dim: 64
+    freq_dim: 16
+    text_dim: 16
+    text_len: 8
+    num_heads: 4
+    root_num_layers: 1
+    body_num_layers: 1
+    chunk_size: 2
+    noise_steps: 4
+    fps: 20.0
+    cfg_mode: separated
+    cfg_scale_text: 1.0
+    cfg_scale_constraint: 1.0
+    cfg_scale_joint: 1.0
+

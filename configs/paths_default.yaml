@@ -1,0 +1,10 @@
+dirs:
+    deps: "${oc.env:FLOODCONTROL_DEPS,./deps}"
+    outputs: "${oc.env:FLOODCONTROL_OUTPUTS,./outputs}"
+    raw_data: "${oc.env:FLOODCONTROL_DATA,./data}"
+
+# Credentials are runtime state and must never be committed to this repository.
+wandb_info:
+    key: "${oc.env:WANDB_API_KEY,}"
+    project: "Floodcontrol"
+    entity: "${oc.env:WANDB_ENTITY,}"
