@@ -1,6 +1,6 @@
 # Floodcontrol 新版框架讨论索引
 
-状态：`MODEL_CORE_IMPLEMENTED / STRICT4_VAE_AND_RUNTIME_OPEN`。Hybrid LDF、Root/Body两阶段主干、CFG和合成张量stream核心已经落地；strict-4 VAE、真实训练数据与Web runtime仍未接线。未标记为`LOCKED`的内容继续视为讨论项。
+状态：`LDF_AND_STRICT4_VAE_CORE_IMPLEMENTED / NATIVE_DATA_AND_RUNTIME_OPEN`。Hybrid LDF、strict4 BodyVAE和合成张量stream核心已经落地；原生rotations数据、正式checkpoint/latent artifacts与Web runtime仍未接线。未标记为`LOCKED`的内容继续视为讨论项。
 
 这个目录用于把新版 Floodcontrol 的设计讨论拆成可独立审阅的主题，避免把模型协议、数据语义、在线状态、训练目标和实验超参数混在同一份文档里。
 
@@ -10,6 +10,8 @@
    只讨论模型结构和输入输出协议，包括 body tokenizer/VAE、hybrid token、root-first/body-second LDF，以及各类 mask 和 observation 如何进入网络。
 2. [`02_DATA_PIPELINE.md`](02_DATA_PIPELINE.md)
    只讨论离线表示构建、完整 clip 恢复、数据增强、window/epoch 采样、token cache 和 Dataset/DataLoader。
+   [`02_VAE_AND_BODY_REPRESENTATION.md`](02_VAE_AND_BODY_REPRESENTATION.md)
+   冻结body265、四组统计、strict4 VAE、loss和显式decoder state协议。
 3. [`03_STREAMING_ACTIVE_WINDOW.md`](03_STREAMING_ACTIVE_WINDOW.md)
    只讨论推理时 authoritative world state、SessionFrame、OriginEpoch、active noisy window、buffer roll、cache 生命周期和原子更新。
 4. [`04_TRAINING_METHOD.md`](04_TRAINING_METHOD.md)
@@ -50,6 +52,6 @@
 - `LOCKED`：physical root、decoder root condition 和 HumanML legacy root 是不同类型，必须使用显式 codec。
 - `LOCKED`：LDF 第一版保留 FloodDiffusion 的线性 flow/v-predict 与三角 token noise schedule，不因采用 ARDY 结构而替换调度器。
 - `LOCKED`：LDF 公共 hybrid 字段为 `root_motion/latent_motion`；root 使用 translation-only stable anchor 坐标元数据，五维为 `[x,y,z,cos(yaw),sin(yaw)]`。
-- `OPEN`：OriginEpoch 触发策略、VAE/FSQ 选择、latent width、self-forcing 方案和全部训练超参数。
+- `OPEN`：OriginEpoch触发策略、self-forcing方案和正式训练资源/消融超参数。
 
 历史实现与实验材料不在新版仓库重复保存；本文只保留对FloodDiffusion、FloodNet和ARDY设计来源的必要说明。

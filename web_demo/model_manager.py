@@ -5,8 +5,9 @@ from __future__ import annotations
 
 WEB_MIGRATION_ERROR = (
     "Floodcontrol Web generation is BLOCKED_ON_STRICT4_VAE: the external planner "
-    "and legacy full-motion LDF were removed. Connect the strict four-frame body "
-    "VAE, the new data protocol, and commit-time decoder transaction before "
+    "and legacy full-motion LDF were removed. Train the strict four-frame body "
+    "VAE from native rotations, connect its verified latent artifacts, and add "
+    "the commit-time decoder transaction before "
     "starting the Web runtime."
 )
 

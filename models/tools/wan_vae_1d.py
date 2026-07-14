@@ -1,798 +1,219 @@
-# This module uses modified code from Alibaba Wan Team
-# Original source: https://github.com/Wan-Video/Wan2.2
-# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-# Modified to support 1d features with (B, C, T)
+"""Token-axis causal convolutional backbone for the strict-4 body VAE.
+
+Unlike the legacy frame-axis VAE, patch boundaries are explicit: four body
+frames are flattened before the encoder and every decoder token projects to
+exactly four output frames.
+"""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import copy
+from utils.conditions.vae import (
+    BODY_CONTACT_DIM,
+    BODY_CONTINUOUS_DIM,
+    BODY_DIM,
+    FRAMES_PER_TOKEN,
+    LOCAL_ROOT_DIM,
+    BodyPrediction,
+    VAEDecoderState,
+    VAEPosterior,
+)
 
-CACHE_T = 2
 
+class ChannelLayerNorm(nn.Module):
+    """Layer normalization over channels without mixing token positions."""
 
-def _clone_cache_value(value):
-    if torch.is_tensor(value):
-        return value.detach().clone()
-    if isinstance(value, list):
-        return [_clone_cache_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_cache_value(item) for item in value)
-    if isinstance(value, dict):
-        return {key: _clone_cache_value(item) for key, item in value.items()}
-    return copy.deepcopy(value)
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.norm(value.transpose(1, 2)).transpose(1, 2)
 
 
 class CausalConv1d(nn.Conv1d):
-    """
-    Causal 1d convolusion.
-    """
+    def __init__(self, channels: int, kernel_size: int = 3):
+        super().__init__(channels, channels, kernel_size=kernel_size, padding=0)
+        self.cache_length = int(kernel_size) - 1
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._padding = (
-            2 * self.padding[0],
-            0,
-        )
-        self.padding = (0,)
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return super().forward(F.pad(value, (self.cache_length, 0)))
 
-    def forward(self, x, cache_x=None):
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[0] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[0] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+    def init_cache(self, batch_size: int, *, device, dtype) -> torch.Tensor:
+        return torch.zeros(batch_size, self.in_channels, self.cache_length, device=device, dtype=dtype)
 
-        return super().forward(x)
+    def stream_step(
+        self, value: torch.Tensor, cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if value.shape[-1] != 1:
+            raise ValueError("causal stream step accepts exactly one token")
+        expected = (value.shape[0], self.in_channels, self.cache_length)
+        if tuple(cache.shape) != expected:
+            raise ValueError(f"invalid causal cache shape {tuple(cache.shape)}, expected {expected}")
+        joined = torch.cat([cache.to(value), value], dim=-1)
+        output = super().forward(joined)
+        return output, joined[..., -self.cache_length :].clone()
 
 
-class RMS_norm(nn.Module):
-    def __init__(self, dim, channel_first=True, bias=False):
+class CausalResidualBlock(nn.Module):
+    def __init__(self, channels: int, *, kernel_size: int = 3, dropout: float = 0.0):
         super().__init__()
-        broadcastable_dims = (1,)
-        shape = (dim, *broadcastable_dims) if channel_first else (dim,)
+        self.norm1 = ChannelLayerNorm(channels)
+        self.norm2 = ChannelLayerNorm(channels)
+        self.conv1 = CausalConv1d(channels, kernel_size)
+        self.conv2 = CausalConv1d(channels, kernel_size)
+        self.dropout = nn.Dropout(dropout)
 
-        self.channel_first = channel_first
-        self.scale = dim**0.5
-        self.gamma = nn.Parameter(torch.ones(shape))
-        self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        hidden = self.conv1(F.silu(self.norm1(value)))
+        hidden = self.conv2(self.dropout(F.silu(self.norm2(hidden))))
+        return value + hidden
 
-    def forward(self, x):
+    def init_cache(self, batch_size: int, *, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
         return (
-            F.normalize(x, dim=(1 if self.channel_first else -1))
-            * self.scale
-            * self.gamma
-            + self.bias
+            self.conv1.init_cache(batch_size, device=device, dtype=dtype),
+            self.conv2.init_cache(batch_size, device=device, dtype=dtype),
         )
 
-
-class Upsample(nn.Upsample):
-    def forward(self, x):
-        """
-        Fix bfloat16 support for nearest neighbor interpolation.
-        """
-        return super().forward(x.float()).type_as(x)
-
-
-class Resample(nn.Module):
-    def __init__(self, dim, mode):
-        assert mode in (
-            "upsample1d",
-            "downsample1d",
+    def stream_step(
+        self,
+        value: torch.Tensor,
+        caches: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        hidden, first = self.conv1.stream_step(F.silu(self.norm1(value)), caches[0])
+        hidden, second = self.conv2.stream_step(
+            self.dropout(F.silu(self.norm2(hidden))), caches[1]
         )
-        super().__init__()
-        self.dim = dim
-        self.mode = mode
-
-        # layers
-        if mode == "upsample1d":
-            self.time_conv = CausalConv1d(dim, dim * 2, (3,), padding=(1,))
-        elif mode == "downsample1d":
-            self.time_conv = CausalConv1d(dim, dim, (3,), stride=(2,), padding=(0,))
-
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        b, c, t = x.size()
-        if self.mode == "upsample1d":
-            if feat_cache is not None:
-                idx = feat_idx[0]
-                if feat_cache[idx] is None:
-                    feat_cache[idx] = "Rep"
-                    feat_idx[0] += 1
-                else:
-                    cache_x = x[:, :, -CACHE_T:].clone()
-                    if (
-                        cache_x.shape[2] < 2
-                        and feat_cache[idx] is not None
-                        and feat_cache[idx] != "Rep"
-                    ):
-                        # cache last frame of last two chunk
-                        cache_x = torch.cat(
-                            [
-                                feat_cache[idx][:, :, -1]
-                                .unsqueeze(2)
-                                .to(cache_x.device),
-                                cache_x,
-                            ],
-                            dim=2,
-                        )
-                    if (
-                        cache_x.shape[2] < 2
-                        and feat_cache[idx] is not None
-                        and feat_cache[idx] == "Rep"
-                    ):
-                        cache_x = torch.cat(
-                            [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
-                            dim=2,
-                        )
-                    if feat_cache[idx] == "Rep":
-                        x = self.time_conv(x)
-                    else:
-                        x = self.time_conv(x, feat_cache[idx])
-                    feat_cache[idx] = cache_x
-                    feat_idx[0] += 1
-                    x = x.reshape(b, 2, c, t)
-                    x = torch.stack((x[:, 0, :, :], x[:, 1, :, :]), 3)
-                    x = x.reshape(b, c, t * 2)
-
-        if self.mode == "downsample1d":
-            if feat_cache is not None:
-                idx = feat_idx[0]
-                if feat_cache[idx] is None:
-                    feat_cache[idx] = x.clone()
-                    feat_idx[0] += 1
-                else:
-                    cache_x = x[:, :, -1:].clone()
-                    x = self.time_conv(torch.cat([feat_cache[idx][:, :, -1:], x], 2))
-                    feat_cache[idx] = cache_x
-                    feat_idx[0] += 1
-        return x
+        return value + hidden, (first, second)
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, dropout=0.0):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
+class Strict4CausalVAE(nn.Module):
+    """Body-only VAE with explicit four-frame patches and local-root decoder condition."""
 
-        # layers
-        self.residual = nn.Sequential(
-            RMS_norm(in_dim),
-            nn.SiLU(),
-            CausalConv1d(in_dim, out_dim, 3, padding=1),
-            RMS_norm(out_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            CausalConv1d(out_dim, out_dim, 3, padding=1),
-        )
-        self.shortcut = (
-            CausalConv1d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
-        )
-
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        h = self.shortcut(x)
-        for layer in self.residual:
-            if isinstance(layer, CausalConv1d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat(
-                        [
-                            feat_cache[idx][:, :, -1].unsqueeze(2).to(cache_x.device),
-                            cache_x,
-                        ],
-                        dim=2,
-                    )
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-            else:
-                x = layer(x)
-        return x + h
-
-
-class AvgDown1D(nn.Module):
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        factor_t,
+        *,
+        latent_dim: int = 128,
+        hidden_dim: int = 512,
+        encoder_layers: int = 6,
+        decoder_layers: int = 6,
+        kernel_size: int = 3,
+        dropout: float = 0.0,
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor_t = factor_t
-        self.factor = self.factor_t
-
-        assert in_channels * self.factor % out_channels == 0
-        self.group_size = in_channels * self.factor // out_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
-        pad = (pad_t, 0)
-        x = F.pad(x, pad)
-        B, C, T = x.shape
-        x = x.view(
-            B,
-            C,
-            T // self.factor_t,
-            self.factor_t,
+        self.latent_dim = int(latent_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.encoder_input = nn.Linear(FRAMES_PER_TOKEN * BODY_DIM, hidden_dim)
+        self.encoder_blocks = nn.ModuleList(
+            [CausalResidualBlock(hidden_dim, kernel_size=kernel_size, dropout=dropout)
+             for _ in range(encoder_layers)]
         )
-        x = x.permute(0, 1, 3, 2).contiguous()
-        x = x.view(
-            B,
-            C * self.factor,
-            T // self.factor_t,
-        )
-        x = x.view(
-            B,
-            self.out_channels,
-            self.group_size,
-            T // self.factor_t,
-        )
-        x = x.mean(dim=2)
-        return x
+        self.posterior_head = nn.Linear(hidden_dim, latent_dim * 2)
 
+        decoder_input_dim = latent_dim + FRAMES_PER_TOKEN * LOCAL_ROOT_DIM * 2
+        self.decoder_input = nn.Linear(decoder_input_dim, hidden_dim)
+        self.decoder_blocks = nn.ModuleList(
+            [CausalResidualBlock(hidden_dim, kernel_size=kernel_size, dropout=dropout)
+             for _ in range(decoder_layers)]
+        )
+        self.continuous_head = nn.Linear(
+            hidden_dim, FRAMES_PER_TOKEN * BODY_CONTINUOUS_DIM
+        )
+        self.contact_head = nn.Linear(hidden_dim, FRAMES_PER_TOKEN * BODY_CONTACT_DIM)
 
-class DupUp1D(nn.Module):
-    def __init__(
+    @staticmethod
+    def _patch_body(body_motion: torch.Tensor) -> torch.Tensor:
+        if body_motion.ndim != 3 or body_motion.shape[-1] != BODY_DIM:
+            raise ValueError("body_motion must be [B,F,265]")
+        if body_motion.shape[1] % FRAMES_PER_TOKEN:
+            raise ValueError("frame length must be divisible by four")
+        return body_motion.reshape(body_motion.shape[0], -1, FRAMES_PER_TOKEN * BODY_DIM)
+
+    def encode(self, normalized_body: torch.Tensor) -> VAEPosterior:
+        hidden = self.encoder_input(self._patch_body(normalized_body)).transpose(1, 2)
+        for block in self.encoder_blocks:
+            hidden = block(hidden)
+        mu, logvar = self.posterior_head(hidden.transpose(1, 2)).chunk(2, dim=-1)
+        return VAEPosterior(mu=mu, logvar=logvar.clamp(min=-20.0, max=10.0))
+
+    @staticmethod
+    def _decoder_features(
+        latent: torch.Tensor,
+        normalized_local_root: torch.Tensor,
+        local_root_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if latent.ndim != 3:
+            raise ValueError("latent must be [B,T,D]")
+        expected = (*latent.shape[:2], FRAMES_PER_TOKEN, LOCAL_ROOT_DIM)
+        if tuple(normalized_local_root.shape) != expected:
+            raise ValueError(f"local root must have shape {expected}")
+        if tuple(local_root_valid_mask.shape) != expected or local_root_valid_mask.dtype != torch.bool:
+            raise ValueError("local_root_valid_mask must be bool and match local root")
+        local = torch.where(
+            local_root_valid_mask, normalized_local_root, torch.zeros_like(normalized_local_root)
+        )
+        return torch.cat(
+            [latent, local.flatten(2), local_root_valid_mask.flatten(2).to(latent.dtype)], dim=-1
+        )
+
+    def _project_output(self, hidden: torch.Tensor) -> BodyPrediction:
+        hidden = hidden.transpose(1, 2)
+        batch, tokens = hidden.shape[:2]
+        continuous = self.continuous_head(hidden).reshape(
+            batch, tokens * FRAMES_PER_TOKEN, BODY_CONTINUOUS_DIM
+        )
+        contacts = self.contact_head(hidden).reshape(
+            batch, tokens * FRAMES_PER_TOKEN, BODY_CONTACT_DIM
+        )
+        return BodyPrediction(continuous, contacts)
+
+    def decode(
         self,
-        in_channels: int,
-        out_channels: int,
-        factor_t,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        latent: torch.Tensor,
+        normalized_local_root: torch.Tensor,
+        local_root_valid_mask: torch.Tensor,
+    ) -> BodyPrediction:
+        hidden = self.decoder_input(
+            self._decoder_features(latent, normalized_local_root, local_root_valid_mask)
+        ).transpose(1, 2)
+        for block in self.decoder_blocks:
+            hidden = block(hidden)
+        return self._project_output(hidden)
 
-        self.factor_t = factor_t
-        self.factor = self.factor_t
-
-        assert out_channels * self.factor % in_channels == 0
-        self.repeats = out_channels * self.factor // in_channels
-
-    def forward(self, x: torch.Tensor, first_chunk=False) -> torch.Tensor:
-        x = x.repeat_interleave(self.repeats, dim=1)
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            self.factor_t,
-            x.size(2),
+    def init_decoder_state(self, batch_size: int, *, device, dtype) -> VAEDecoderState:
+        return VAEDecoderState(
+            tuple(block.init_cache(batch_size, device=device, dtype=dtype)
+                  for block in self.decoder_blocks),
+            token_index=0,
         )
-        x = x.permute(0, 1, 3, 2).contiguous()
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            x.size(2) * self.factor_t,
-        )
-        if first_chunk:
-            x = x[
-                :,
-                :,
-                self.factor_t - 1 :,
-            ]
-        return x
 
-
-class Down_ResidualBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, dropout, mult, temperal_downsample=False):
-        super().__init__()
-
-        # Shortcut path with downsample
-        if temperal_downsample:
-            self.avg_shortcut = AvgDown1D(
-                in_dim,
-                out_dim,
-                factor_t=2,
-            )
-        else:
-            self.avg_shortcut = None
-
-        # Main path with residual blocks and downsample
-        downsamples = []
-        for _ in range(mult):
-            downsamples.append(ResidualBlock(in_dim, out_dim, dropout))
-            in_dim = out_dim
-
-        # Add the final downsample block
-        if temperal_downsample:
-            downsamples.append(Resample(out_dim, mode="downsample1d"))
-
-        self.downsamples = nn.Sequential(*downsamples)
-
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        x_copy = x.clone()
-        for module in self.downsamples:
-            x = module(x, feat_cache, feat_idx)
-        if self.avg_shortcut is None:
-            return x
-        else:
-            return x + self.avg_shortcut(x_copy)
-
-
-class Up_ResidualBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, dropout, mult, temperal_upsample=False):
-        super().__init__()
-        # Shortcut path with upsample
-        if temperal_upsample:
-            self.avg_shortcut = DupUp1D(
-                in_dim,
-                out_dim,
-                factor_t=2,
-            )
-        else:
-            self.avg_shortcut = None
-
-        # Main path with residual blocks and upsample
-        upsamples = []
-        for _ in range(mult):
-            upsamples.append(ResidualBlock(in_dim, out_dim, dropout))
-            in_dim = out_dim
-
-        # Add the final upsample block
-        if temperal_upsample:
-            upsamples.append(Resample(out_dim, mode="upsample1d"))
-
-        self.upsamples = nn.Sequential(*upsamples)
-
-    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
-        x_main = x.clone()
-        for module in self.upsamples:
-            x_main = module(x_main, feat_cache, feat_idx)
-        if self.avg_shortcut is not None:
-            x_shortcut = self.avg_shortcut(x, first_chunk)
-            return x_main + x_shortcut
-        else:
-            return x_main
-
-
-class Encoder1d(nn.Module):
-    def __init__(
+    def stream_decode_step(
         self,
-        input_dim,
-        dim=128,
-        z_dim=4,
-        dim_mult=[1, 2, 4, 4],
-        num_res_blocks=2,
-        temperal_downsample=[True, True, False],
-        dropout=0.0,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.z_dim = z_dim
-        self.dim_mult = dim_mult
-        self.num_res_blocks = num_res_blocks
-        self.temperal_downsample = temperal_downsample
-
-        # dimensions
-        dims = [dim * u for u in [1] + dim_mult]
-        scale = 1.0
-
-        # init block
-        self.conv1 = CausalConv1d(input_dim, dims[0], 3, padding=1)
-
-        # downsample blocks
-        downsamples = []
-        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            t_down_flag = (
-                temperal_downsample[i] if i < len(temperal_downsample) else False
+        latent_token: torch.Tensor,
+        normalized_local_root_patch: torch.Tensor,
+        local_root_valid_mask: torch.Tensor,
+        state: VAEDecoderState,
+    ) -> tuple[VAEDecoderState, BodyPrediction]:
+        if latent_token.ndim != 3 or latent_token.shape[1] != 1:
+            raise ValueError("latent_token must be [B,1,D]")
+        if len(state.caches) != len(self.decoder_blocks):
+            raise ValueError("decoder state does not match decoder depth")
+        hidden = self.decoder_input(
+            self._decoder_features(
+                latent_token, normalized_local_root_patch, local_root_valid_mask
             )
-            downsamples.append(
-                Down_ResidualBlock(
-                    in_dim=in_dim,
-                    out_dim=out_dim,
-                    dropout=dropout,
-                    mult=num_res_blocks,
-                    temperal_downsample=t_down_flag,
-                )
-            )
-            scale /= 2.0
-        self.downsamples = nn.Sequential(*downsamples)
-
-        # middle blocks
-        self.middle = nn.Sequential(
-            ResidualBlock(out_dim, out_dim, dropout),
-            RMS_norm(out_dim),
-            CausalConv1d(out_dim, out_dim, 1),
-            ResidualBlock(out_dim, out_dim, dropout),
-        )
-
-        # # output blocks
-        self.head = nn.Sequential(
-            RMS_norm(out_dim),
-            nn.SiLU(),
-            CausalConv1d(out_dim, z_dim, 3, padding=1),
-        )
-
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
-        else:
-            x = self.conv1(x)
-
-        ## downsamples
-        for layer in self.downsamples:
-            if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
-            else:
-                x = layer(x)
-
-        ## middle
-        for layer in self.middle:
-            if isinstance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
-            else:
-                x = layer(x)
-
-        ## head
-        for layer in self.head:
-            if isinstance(layer, CausalConv1d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    cache_x = torch.cat(
-                        [
-                            feat_cache[idx][:, :, -1].unsqueeze(2).to(cache_x.device),
-                            cache_x,
-                        ],
-                        dim=2,
-                    )
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-            else:
-                x = layer(x)
-
-        return x
+        ).transpose(1, 2)
+        caches = []
+        for block, block_cache in zip(self.decoder_blocks, state.caches, strict=True):
+            hidden, next_cache = block.stream_step(hidden, block_cache)
+            caches.append(next_cache)
+        prediction = self._project_output(hidden)
+        return VAEDecoderState(tuple(caches), state.token_index + 1), prediction
 
 
-class Decoder1d(nn.Module):
-    def __init__(
-        self,
-        output_dim,
-        dim=128,
-        z_dim=4,
-        dim_mult=[1, 2, 4, 4],
-        num_res_blocks=2,
-        temperal_upsample=[False, True, True],
-        dropout=0.0,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.z_dim = z_dim
-        self.dim_mult = dim_mult
-        self.num_res_blocks = num_res_blocks
-        self.temperal_upsample = temperal_upsample
-
-        # dimensions
-        dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
-        scale = 1.0 / 2 ** (len(dim_mult) - 2)
-        # init block
-        self.conv1 = CausalConv1d(z_dim, dims[0], 3, padding=1)
-
-        # middle blocks
-        self.middle = nn.Sequential(
-            ResidualBlock(dims[0], dims[0], dropout),
-            RMS_norm(dims[0]),
-            CausalConv1d(dims[0], dims[0], 1),
-            ResidualBlock(dims[0], dims[0], dropout),
-        )
-
-        # upsample blocks
-        upsamples = []
-        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            t_up_flag = temperal_upsample[i] if i < len(temperal_upsample) else False
-            upsamples.append(
-                Up_ResidualBlock(
-                    in_dim=in_dim,
-                    out_dim=out_dim,
-                    dropout=dropout,
-                    mult=num_res_blocks + 1,
-                    temperal_upsample=t_up_flag,
-                )
-            )
-        self.upsamples = nn.Sequential(*upsamples)
-
-        # output blocks
-        self.head = nn.Sequential(
-            RMS_norm(out_dim),
-            nn.SiLU(),
-            CausalConv1d(out_dim, output_dim, 3, padding=1),
-        )
-
-    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
-        if feat_cache is not None:
-            idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:].clone()
-            if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                cache_x = torch.cat(
-                    [
-                        feat_cache[idx][:, :, -1].unsqueeze(2).to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
-            feat_idx[0] += 1
-        else:
-            x = self.conv1(x)
-
-        for layer in self.middle:
-            if isinstance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
-            else:
-                x = layer(x)
-
-        ## upsamples
-        for layer in self.upsamples:
-            if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx, first_chunk)
-            else:
-                x = layer(x)
-
-        ## head
-        for layer in self.head:
-            if isinstance(layer, CausalConv1d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    cache_x = torch.cat(
-                        [
-                            feat_cache[idx][:, :, -1].unsqueeze(2).to(cache_x.device),
-                            cache_x,
-                        ],
-                        dim=2,
-                    )
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-            else:
-                x = layer(x)
-        return x
-
-
-def count_conv1d(model):
-    count = 0
-    for m in model.modules():
-        if isinstance(m, CausalConv1d):
-            count += 1
-    return count
-
-
-class WanVAE_(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        dim=160,
-        dec_dim=256,
-        z_dim=16,
-        dim_mult=[1, 2, 4, 4],
-        num_res_blocks=1,
-        temperal_downsample=[True, True, False],
-        dropout=0.0,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.z_dim = z_dim
-        self.dim_mult = dim_mult
-        self.num_res_blocks = num_res_blocks
-        self.temperal_downsample = temperal_downsample
-        self.temperal_upsample = temperal_downsample[::-1]
-
-        # modules
-        self.encoder = Encoder1d(
-            input_dim,
-            dim,
-            z_dim * 2,
-            dim_mult,
-            num_res_blocks,
-            self.temperal_downsample,
-            dropout,
-        )
-        self.conv1 = CausalConv1d(z_dim * 2, z_dim * 2, 1)
-        self.conv2 = CausalConv1d(z_dim, z_dim, 1)
-        self.decoder = Decoder1d(
-            input_dim,
-            dec_dim,
-            z_dim,
-            dim_mult,
-            num_res_blocks,
-            self.temperal_upsample,
-            dropout,
-        )
-
-    def forward(self, x, scale=[0, 1]):
-        mu = self.encode(x, scale)
-        x_recon = self.decode(mu, scale)
-        return x_recon, mu
-
-    def encode(self, x, scale, return_dist=False):
-        self.clear_cache()
-        t = x.shape[2]
-        iter_ = 1 + (t - 1) // 4
-        for i in range(iter_):
-            self._enc_conv_idx = [0]
-            if i == 0:
-                out = self.encoder(
-                    x[:, :, :1],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx,
-                )
-            else:
-                out_ = self.encoder(
-                    x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx,
-                )
-                out = torch.cat([out, out_], 2)
-        mu, log_var = self.conv1(out).chunk(2, dim=1)
-        if isinstance(scale[0], torch.Tensor):
-            mu = (mu - scale[0].view(1, self.z_dim, 1)) * scale[1].view(
-                1, self.z_dim, 1
-            )
-        else:
-            mu = (mu - scale[0]) * scale[1]
-        self.clear_cache()
-        if return_dist:
-            return mu, log_var
-        return mu
-
-    def decode(self, z, scale):
-        self.clear_cache()
-        if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.z_dim, 1) + scale[0].view(1, self.z_dim, 1)
-        else:
-            z = z / scale[1] + scale[0]
-        iter_ = z.shape[2]
-        x = self.conv2(z)
-        for i in range(iter_):
-            self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i : i + 1],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                    first_chunk=True,
-                )
-            else:
-                out_ = self.decoder(
-                    x[:, :, i : i + 1],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                )
-                out = torch.cat([out, out_], 2)
-        self.clear_cache()
-        return out
-
-    @torch.no_grad()
-    def stream_encode(self, x, first_chunk, scale, return_dist=False):
-        t = x.shape[2]
-        if first_chunk:
-            iter_ = 1 + (t - 1) // 4
-        else:
-            iter_ = t // 4
-        for i in range(iter_):
-            self._enc_conv_idx = [0]
-            if i == 0:
-                if first_chunk:
-                    out = self.encoder(
-                        x[:, :, :1],
-                        feat_cache=self._enc_feat_map,
-                        feat_idx=self._enc_conv_idx,
-                    )
-                else:
-                    out = self.encoder(
-                        x[:, :, :4],
-                        feat_cache=self._enc_feat_map,
-                        feat_idx=self._enc_conv_idx,
-                    )
-            else:
-                if first_chunk:
-                    out_ = self.encoder(
-                        x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i],
-                        feat_cache=self._enc_feat_map,
-                        feat_idx=self._enc_conv_idx,
-                    )
-                else:
-                    out_ = self.encoder(
-                        x[:, :, 4 * i : 4 * (i + 1)],
-                        feat_cache=self._enc_feat_map,
-                        feat_idx=self._enc_conv_idx,
-                    )
-                out = torch.cat([out, out_], 2)
-        mu, log_var = self.conv1(out).chunk(2, dim=1)
-        if isinstance(scale[0], torch.Tensor):
-            mu = (mu - scale[0].view(1, self.z_dim, 1)) * scale[1].view(
-                1, self.z_dim, 1
-            )
-        else:
-            mu = (mu - scale[0]) * scale[1]
-        if return_dist:
-            return mu, log_var
-        else:
-            return mu
-
-    @torch.no_grad()
-    def stream_decode(self, z, first_chunk, scale):
-        if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.z_dim, 1) + scale[0].view(1, self.z_dim, 1)
-        else:
-            z = z / scale[1] + scale[0]
-        iter_ = z.shape[2]
-        x = self.conv2(z)
-        for i in range(iter_):
-            self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i : i + 1],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                    first_chunk=first_chunk,  # Use the external first_chunk parameter
-                )
-            else:
-                out_ = self.decoder(
-                    x[:, :, i : i + 1],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                    first_chunk=False,  # Explicitly set to False for subsequent time steps within the same chunk
-                )
-                out = torch.cat([out, out_], 2)
-        return out
-
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return eps * std + mu
-
-    def sample(self, imgs, deterministic=False):
-        mu, log_var = self.encode(imgs)
-        if deterministic:
-            return mu
-        std = torch.exp(0.5 * log_var.clamp(-30.0, 20.0))
-        return mu + std * torch.randn_like(std)
-
-    def clear_cache(self):
-        self._conv_num = count_conv1d(self.decoder)
-        self._conv_idx = [0]
-        self._feat_map = [None] * self._conv_num
-        # cache encode
-        self._enc_conv_num = count_conv1d(self.encoder)
-        self._enc_conv_idx = [0]
-        self._enc_feat_map = [None] * self._enc_conv_num
-
-    def snapshot_stream_state(self):
-        """Capture both causal encoder and decoder streaming caches."""
-        names = (
-            "_conv_num",
-            "_conv_idx",
-            "_feat_map",
-            "_enc_conv_num",
-            "_enc_conv_idx",
-            "_enc_feat_map",
-        )
-        return {
-            name: _clone_cache_value(getattr(self, name))
-            for name in names
-            if hasattr(self, name)
-        }
-
-    def restore_stream_state(self, state):
-        if not isinstance(state, dict):
-            raise TypeError("VAE stream state must be a dict")
-        for name, value in state.items():
-            setattr(self, name, _clone_cache_value(value))
+__all__ = [
+    "CausalConv1d", "CausalResidualBlock", "Strict4CausalVAE"
+]

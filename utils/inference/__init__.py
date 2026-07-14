@@ -1,7 +1,8 @@
 """Model-independent inference timeline utilities.
 
-End-to-end generation is intentionally unavailable until the strict-4 VAE is
-connected to the new hybrid LDF.
+End-to-end generation is intentionally unavailable until a trained strict-4
+VAE, verified latent artifacts, and the commit-time decoder transaction are
+connected to the hybrid LDF.
 """
 
 from .condition_manager import ConditionManager

@@ -44,28 +44,39 @@ def _to_feature_tensor(pred_feature: torch.Tensor | np.ndarray) -> torch.Tensor:
 def decode_stream_chunks(
     vae,
     latent_chunks: Sequence[torch.Tensor],
+    local_root_chunks: Sequence[torch.Tensor],
+    local_root_valid_chunks: Sequence[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, List[torch.Tensor], List[int]]:
+    """Decode strict4 chunks with an explicit per-call decoder state."""
+    if len(latent_chunks) != len(local_root_chunks):
+        raise ValueError("latent and local-root chunk counts must match")
+    if local_root_valid_chunks is None:
+        local_root_valid_chunks = [torch.ones_like(item, dtype=torch.bool) for item in local_root_chunks]
     decoded_chunks: List[torch.Tensor] = []
     chunk_frame_ends: List[int] = []
     total_frames = 0
-    first_chunk = True
-
-    vae.clear_cache()
-    try:
-        for latent_chunk in latent_chunks:
-            if latent_chunk is None:
-                continue
-            chunk = latent_chunk.detach()
-            if chunk.ndim == 2:
-                chunk = chunk.unsqueeze(0)
-            decoded_chunk = vae.stream_decode(chunk, first_chunk=first_chunk)[0]
-            decoded_chunk = decoded_chunk.float().detach().cpu()
-            first_chunk = False
-            decoded_chunks.append(decoded_chunk)
-            total_frames += int(decoded_chunk.shape[0])
-            chunk_frame_ends.append(total_frames)
-    finally:
-        vae.clear_cache()
+    state = None
+    for latent_chunk, root_chunk, valid_chunk in zip(
+        latent_chunks, local_root_chunks, local_root_valid_chunks, strict=True
+    ):
+        chunk = latent_chunk.detach()
+        if chunk.ndim == 2:
+            chunk = chunk.unsqueeze(0)
+        if state is None:
+            state = vae.init_decoder_state(chunk.shape[0], device=chunk.device, dtype=chunk.dtype)
+        token_outputs = []
+        for token in range(chunk.shape[1]):
+            state, output = vae.stream_decode_step(
+                chunk[:, token : token + 1],
+                root_chunk[:, token : token + 1],
+                state,
+                valid_chunk[:, token : token + 1],
+            )
+            token_outputs.append(output.body_motion())
+        decoded_chunk = torch.cat(token_outputs, dim=1)[0].float().detach().cpu()
+        decoded_chunks.append(decoded_chunk)
+        total_frames += int(decoded_chunk.shape[0])
+        chunk_frame_ends.append(total_frames)
 
     if decoded_chunks:
         decoded_feature = torch.cat(decoded_chunks, dim=0)

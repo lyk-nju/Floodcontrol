@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from models.diffusion_forcing_wan import LDF
+from models.vae_wan_1d import BodyVAE
 from train_ldf import TRAINING_MIGRATION_ERROR, main as train_main
 from utils.initialize import instantiate, load_config
 from web_demo.model_manager import WEB_MIGRATION_ERROR, get_model_manager
@@ -15,6 +16,19 @@ def test_tiny_core_config_instantiates_public_ldf():
     cfg = load_config(str(ROOT / "configs" / "ldf_core_tiny.yaml"))
     model = instantiate(cfg.model.target, cfg=None, **cfg.model.params)
     assert isinstance(model, LDF)
+
+
+def test_tiny_vae_config_instantiates_public_body_vae():
+    cfg = load_config(str(ROOT / "configs" / "vae_strict4_tiny.yaml"))
+    model = instantiate(cfg.model.target, cfg=None, **cfg.model.params)
+    assert isinstance(model, BodyVAE)
+
+
+def test_legacy_vae_config_and_class_are_removed():
+    assert not (ROOT / "configs" / "vae_wan_1d.yaml").exists()
+    import models.vae_wan_1d as module
+
+    assert not hasattr(module, "VAEWanModel")
 
 
 def test_training_entry_is_explicitly_blocked():

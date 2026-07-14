@@ -254,3 +254,78 @@
 
 - public仓库当前未声明统一项目许可证；第三方来源文件继续保留各自版权头，项目级许可证需由仓库所有者单独决定。
 - strict-4 VAE、真实训练配置和Web runtime完成后再发布下一里程碑。
+
+## 2026-07-14 · 删除重复的AGENT入口文件
+
+类型：仓库维护 / 文件删除
+
+改动内容：
+
+- 删除根目录`AGENT.md`。
+- 保留Codex正式识别并覆盖整个仓库的`AGENTS.md`作为唯一agent规则来源。
+
+改动理由：
+
+- `AGENT.md`仅重复指向`AGENTS.md`，不是本仓库需要维护的正式规则文件；同时保留两者会造成规则入口含糊。
+
+验证：
+
+- 搜索仓库引用后确认，除`AGENT.md`自身外，其他文件只引用`AGENTS.md`。
+- 本次只删除重复文档入口，没有修改运行代码，因此未运行模型或测试套件。
+
+涉及文件：
+
+- 删除：`AGENT.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 无。
+
+## 2026-07-14 · Strict-4 Body VAE、body265协议与原生旋转数据边界
+
+类型：模型重构 / 数据协议 / 训练与推理接口 / 测试 / 文档
+
+实际改动内容：
+
+- 将旧full-motion `VAEWanModel/WanVAE_`物理替换为body-only `BodyVAE/Strict4CausalVAE`。encoder先显式patch四帧再在token轴执行causal convolution；decoder读取128D latent与`[4,4]` local-root patch并严格输出四帧。
+- 新增`VAEInput/VAEPosterior/BodyPrediction/VAEPrediction/VAEDecoderState`合同。decoder cache改为调用方持有的不可共享状态，删除module-global cache、`first_chunk`和`1+4n`首帧特殊协议。
+- 冻结root5/body265表示：21个非root位置、22个global rotation6d、22个backward global velocity和4个contact；实现pack/unpack、yaw同步旋转、backward velocity、contact与backward/current-heading-local root codec。
+- 增加root/local-root/body-continuous/latent-mu四组统计所有权。真实模型必须加载physical statistics；VAE冻结前允许显式缺少latent stats，但`tokenize/detokenize`在latent stats未就绪时会fail-fast。
+- 实现分block normalized SmoothL1、contact BCE、ARDY式0.01 skating loss和warmup KL；geodesic、FK-to-GT、direct/FK position consistency和backward velocity consistency为默认零的独立可选项，FK相关项缺少版本化HumanML22 skeleton时明确报错。
+- 新增strict4 artifact dataset/collate、native-rotation NPZ预处理、train-split motion statistics和deterministic-mu latent artifact工具。输入缺少原生rotations时明确报`STRICT4_NATIVE_ROTATIONS_REQUIRED`，不使用IK或旧263D降级。
+- LDF Body Stage增加从唯一clean root派生的首有效帧heading condition；heading与local root一起在训练stage boundary detach，保持Body loss不反传Root Stage，所有CFG body分支共享同一root/heading。
+- 将共享token/frame工具及HumanML/BABEL token crop改为`token k -> frames [4k,4k+4)`；删除旧特殊映射和越界fallback。
+- 删除仍依赖已不存在`stream_execution`、旧root feedback和`first_chunk`的`StreamRuntimeSession`；Web入口继续fail-fast，等待正式VAE/latent artifact与commit-time decoder事务接线。
+- 删除旧`configs/vae_wan_1d.yaml`，新增正式/tiny strict4配置；重写`train_vae.py`使用新dataset、BodyVAE和loss，并在manifest或statistics缺失时明确阻断。
+- 新增独立VAE/body表示设计文档，并更新模型、数据、README和Web状态说明。
+
+改动理由：
+
+- 旧VAE把首帧与后续四帧token混合，无法与LDF严格四帧时间轴、逐token commit和稳定cache事务一致。
+- explicit root必须保持LDF原生生成变量；body encoder不应重新隐藏root，而decoder需要local root运动学条件来降低foot skating。
+- body使用global rotations时，local-root4不包含绝对heading；从clean root补充heading可以解决pure-noise cold start的朝向不可辨识，同时不引入raw constraint旁路。
+- 当前HumanML legacy数据没有原生joint rotations，不能假装能够无损生成ARDY式body表示，因此把数据缺失暴露为正式前置条件。
+
+验证：
+
+- `python -m py_compile`覆盖仓库Python文件，通过。
+- `python -m pytest -q tests`：44 passed；仅出现运行环境无法初始化NVML的PyTorch warning，不影响CPU测试。
+- 新增测试覆盖body265 round-trip、contacts不归一化、strict4映射、backward local root、全局yaw下local velocity不变量、encoder因果性、offline/stream decode parity、session state隔离、snapshot/restore、KL warmup、独立geometry loss开关、短样本overfit、native NPZ到dataset集成和迁移守卫。
+- `python train_vae.py --config configs/vae_strict4.yaml`已验证在缺少真实statistics时抛出`STRICT4_MOTION_STATS_REQUIRED`。
+- `git diff --check`通过；`ruff`未运行，因为flooddiffusion环境未安装该模块。
+- 全仓活跃源码搜索未发现`WanVAE_`、`VAEWanModel`、旧`(crop_start+3)//4`、`4N-3`或可执行`first_chunk`路径。
+
+涉及文件：
+
+- 模型与合同：`models/vae_wan_1d.py`、`models/tools/wan_vae_1d.py`、`models/diffusion_forcing_wan.py`、`utils/conditions/vae.py`、`utils/motion_representation.py`、`utils/token_frame.py`。
+- 数据与训练：`datasets/strict4.py`、`train_vae.py`、`utils/training/vae_loss.py`、`tools/preprocess_strict4_smpl.py`、`tools/compute_vae_stats.py`、`tools/pretokenize_body_latents.py`、strict4配置。
+- 测试与文档：VAE/token-frame测试、rearchitecture文档、README/Web状态与本日志。
+- 删除：旧VAE配置、旧`utils/inference/stream_runtime/session.py`。
+
+尚未完成的后续事项：
+
+- 提供并审核原生SMPL/AMASS rotations数据路径、retarget skeleton offsets/parents和真实train/val/test manifest；当前只用合成native rotations验证了数据工具。
+- 用真实train split计算physical statistics，训练VAE，冻结checkpoint并生成带hash的latent statistics/artifacts。
+- 真实数据上评估rotation/FK consistency、foot contact阈值、重建和skating，再逐项决定是否启用几何消融loss。
+- 将正式latent artifact接入LDF dataset/loss，完成Hybrid commit与`VAEDecoderState`原子snapshot/restore后再解除`train_ldf.py`与Web守卫。

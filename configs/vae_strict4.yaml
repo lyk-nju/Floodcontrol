@@ -1,0 +1,72 @@
+exp_name: vae_strict4_body265
+seed: 1234
+debug: false
+train: true
+save_dir: ./outputs
+resume_ckpt: null
+test_ckpt: null
+
+trainer:
+  max_steps: 4000000
+  accelerator: gpu
+  devices: [0]
+  log_every_n_steps: 50
+validation:
+  validation_steps: 1000
+  test_steps: 10000
+  save_every_n_steps: 10000
+  save_top_k: 20
+
+data:
+  target: datasets.strict4.Strict4ArtifactDataset
+  collate_fn: datasets.strict4.collate_strict4
+  manifest_path: ${oc.env:STRICT4_MANIFEST,null}
+  train_bs: 128
+  val_bs: 64
+  test_bs: 64
+  num_workers: 8
+  min_frames: 20
+  max_frames: 200
+  random_yaw: true
+
+model:
+  target: models.vae_wan_1d.BodyVAE
+  ema_decay: 0.99
+  params:
+    latent_dim: 128
+    hidden_dim: 512
+    encoder_layers: 6
+    decoder_layers: 6
+    kernel_size: 3
+    dropout: 0.0
+    fps: 20.0
+    motion_stats_path: ${oc.env:STRICT4_MOTION_STATS,null}
+    latent_stats_path: null
+    allow_identity_statistics: false
+    require_latent_statistics: false
+
+loss:
+  lambda_position: 1.0
+  lambda_rotation: 1.0
+  lambda_velocity: 1.0
+  lambda_contact: 1.0
+  lambda_skating: 0.01
+  beta_kl: 1.0e-4
+  kl_warmup_steps: 50000
+  lambda_geodesic: 0.0
+  lambda_fk: 0.0
+  lambda_position_consistency: 0.0
+  lambda_velocity_consistency: 0.0
+
+optimizer:
+  target: AdamW
+  params:
+    lr: 2.0e-4
+    betas: [0.9, 0.99]
+    weight_decay: 0.0
+    eps: 1.0e-8
+lr_scheduler:
+  target: diffusers.optimization.get_cosine_schedule_with_warmup
+  params:
+    num_warmup_steps: 10000
+    num_training_steps: 4000000

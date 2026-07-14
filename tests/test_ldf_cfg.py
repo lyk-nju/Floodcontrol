@@ -51,8 +51,11 @@ def test_separated_cfg_combination_and_shared_root_boundary():
     def root_branch(self, call_inputs, cond):
         return torch.full_like(call_inputs.noisy_motion.root_motion, branch_value(cond))
 
-    def body_branch(self, call_inputs, cond, local, valid):
+    seen_heading = []
+
+    def body_branch(self, call_inputs, cond, local, valid, heading):
         seen_local.append(local.clone())
+        seen_heading.append(heading.clone())
         return torch.full_like(call_inputs.noisy_motion.latent_motion, branch_value(cond))
 
     model._predict_root = types.MethodType(root_branch, model)
@@ -64,6 +67,7 @@ def test_separated_cfg_combination_and_shared_root_boundary():
     assert torch.allclose(output.velocity.latent_motion, torch.full_like(output.velocity.latent_motion, 8.0))
     assert len(seen_local) == 3
     assert all(torch.equal(seen_local[0], item) for item in seen_local[1:])
+    assert all(torch.equal(seen_heading[0], item) for item in seen_heading[1:])
 
 
 def test_cfg_formula_scale_zero_returns_history():

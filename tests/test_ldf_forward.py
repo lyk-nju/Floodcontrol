@@ -81,6 +81,16 @@ def test_constraint_view_does_not_mutate_noisy_state():
     assert torch.equal(inputs.noisy_motion.root_motion, root_before)
 
 
+def test_body_heading_is_derived_from_clean_root():
+    model = make_model()
+    inputs = make_input(batch=1, tokens=4)
+    clean = torch.zeros_like(inputs.noisy_motion.root_motion)
+    clean[..., 3] = 0
+    clean[..., 4] = 1
+    heading = model._body_heading_condition(clean, inputs)
+    assert torch.allclose(heading, torch.tensor([[0.0, 1.0]]))
+
+
 def test_future_root_uses_generation_centered_rope_without_extending_body():
     model = make_model().eval()
     root = torch.randn(1, 4, 4, 5)

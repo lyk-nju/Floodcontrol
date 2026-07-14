@@ -1,260 +1,262 @@
+"""Public strict-4 body VAE wrapper."""
+
+from __future__ import annotations
+
+import json
+from typing import Mapping
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-import copy
-
-from .tools.wan_vae_1d import WanVAE_
-
-
-_STREAM_CACHE_NAMES = (
-    "_conv_num",
-    "_conv_idx",
-    "_feat_map",
-    "_enc_conv_num",
-    "_enc_conv_idx",
-    "_enc_feat_map",
+from models.tools.wan_vae_1d import Strict4CausalVAE
+from utils.conditions.vae import (
+    BODY_CONTINUOUS_DIM,
+    BODY_DIM,
+    CONTRACT_VERSION,
+    FRAMES_PER_TOKEN,
+    LOCAL_ROOT_DIM,
+    BodyPrediction,
+    VAEDecoderState,
+    VAEInput,
+    VAEPrediction,
+    VAEPosterior,
 )
+from utils.motion_representation import MotionStatistics, derive_patched_local_root
 
 
-def _clone_stream_cache(value):
-    if torch.is_tensor(value):
-        return value.detach().clone()
-    if isinstance(value, list):
-        return [_clone_stream_cache(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_stream_cache(item) for item in value)
-    if isinstance(value, dict):
-        return {key: _clone_stream_cache(item) for key, item in value.items()}
-    return copy.deepcopy(value)
+def _stat_tensor(name: str, value, dim: int, *, positive: bool = False) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32)
+    if tuple(tensor.shape) != (dim,):
+        raise ValueError(f"{name} must have shape [{dim}], got {tuple(tensor.shape)}")
+    if positive and bool((tensor <= 0).any()):
+        raise ValueError(f"{name} must be strictly positive")
+    return tensor
 
 
-class VAEWanModel(nn.Module):
+class BodyVAE(nn.Module):
+    """Body-only VAE; physical values cross the public boundary."""
+
+    contract_version = CONTRACT_VERSION
+
     def __init__(
         self,
-        input_dim,
-        mean_path=None,
-        std_path=None,
-        z_dim=256,
-        dim=160,
-        dec_dim=512,
-        num_res_blocks=1,
-        dropout=0.0,
-        dim_mult=[1, 1, 1],
-        temperal_downsample=[True, True],
-        vel_window=[0, 0],
-        **kwargs,
+        *,
+        latent_dim: int = 128,
+        hidden_dim: int = 512,
+        encoder_layers: int = 6,
+        decoder_layers: int = 6,
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+        fps: float = 20.0,
+        motion_stats_path: str | None = None,
+        latent_stats_path: str | None = None,
+        body_cont_mean=None,
+        body_cont_std=None,
+        local_root_mean=None,
+        local_root_std=None,
+        latent_mean=None,
+        latent_std=None,
+        allow_identity_statistics: bool = False,
+        require_latent_statistics: bool = True,
     ):
         super().__init__()
-
-        self.mean_path = mean_path
-        self.std_path = std_path
-        self.input_dim = input_dim
-        self.z_dim = z_dim
-        self.dim = dim
-        self.dec_dim = dec_dim
-        self.num_res_blocks = num_res_blocks
-        self.dropout = dropout
-        self.dim_mult = dim_mult
-        self.temperal_downsample = temperal_downsample
-        self.vel_window = vel_window
-        self.RECONS_LOSS = nn.SmoothL1Loss()
-        self.LAMBDA_FEATURE = kwargs.get("LAMBDA_FEATURE", 1.0)
-        self.LAMBDA_VELOCITY = kwargs.get("LAMBDA_VELOCITY", 0.5)
-        self.LAMBDA_KL = kwargs.get("LAMBDA_KL", 10e-6)
-
-        if self.mean_path is not None:
-            self.register_buffer(
-                "mean", torch.from_numpy(np.load(self.mean_path)).float()
+        self.latent_dim = int(latent_dim)
+        self.fps = float(fps)
+        if motion_stats_path is not None:
+            stats = MotionStatistics.load(motion_stats_path)
+            body_cont_mean = stats.body_cont_mean
+            body_cont_std = stats.body_cont_std
+            local_root_mean = stats.local_root_mean
+            local_root_std = stats.local_root_std
+        if latent_stats_path is not None:
+            with np.load(latent_stats_path, allow_pickle=False) as data:
+                latent_mean = data["latent_mu_mean"]
+                latent_std = data["latent_mu_std"]
+                metadata = json.loads(str(data["metadata"]))
+            if metadata.get("contract_version") != CONTRACT_VERSION:
+                raise ValueError("latent statistics contract version mismatch")
+            if int(metadata.get("latent_dim", -1)) != self.latent_dim:
+                raise ValueError("latent statistics dimension mismatch")
+        physical_missing = [name for name, value in (
+            ("body_cont_mean", body_cont_mean), ("body_cont_std", body_cont_std),
+            ("local_root_mean", local_root_mean), ("local_root_std", local_root_std),
+        ) if value is None]
+        latent_missing = latent_mean is None or latent_std is None
+        missing = physical_missing + (
+            ["latent_mean", "latent_std"] if latent_missing and require_latent_statistics else []
+        )
+        if missing and not allow_identity_statistics:
+            raise ValueError(
+                "BodyVAE requires explicit real statistics; missing " + ", ".join(missing)
             )
-        else:
-            self.register_buffer("mean", torch.zeros(input_dim))
+        if physical_missing and not allow_identity_statistics:
+            raise ValueError("physical VAE statistics may not use identity fallback")
+        if allow_identity_statistics:
+            body_cont_mean = torch.zeros(BODY_CONTINUOUS_DIM) if body_cont_mean is None else body_cont_mean
+            body_cont_std = torch.ones(BODY_CONTINUOUS_DIM) if body_cont_std is None else body_cont_std
+            local_root_mean = torch.zeros(LOCAL_ROOT_DIM) if local_root_mean is None else local_root_mean
+            local_root_std = torch.ones(LOCAL_ROOT_DIM) if local_root_std is None else local_root_std
+            latent_mean = torch.zeros(self.latent_dim) if latent_mean is None else latent_mean
+            latent_std = torch.ones(self.latent_dim) if latent_std is None else latent_std
+        elif latent_missing and not require_latent_statistics:
+            latent_mean = torch.zeros(self.latent_dim)
+            latent_std = torch.ones(self.latent_dim)
+        self.latent_statistics_ready = bool(allow_identity_statistics or not latent_missing)
+        self.register_buffer("body_cont_mean", _stat_tensor("body_cont_mean", body_cont_mean, BODY_CONTINUOUS_DIM))
+        self.register_buffer("body_cont_std", _stat_tensor("body_cont_std", body_cont_std, BODY_CONTINUOUS_DIM, positive=True))
+        self.register_buffer("local_root_mean", _stat_tensor("local_root_mean", local_root_mean, LOCAL_ROOT_DIM))
+        self.register_buffer("local_root_std", _stat_tensor("local_root_std", local_root_std, LOCAL_ROOT_DIM, positive=True))
+        self.register_buffer("latent_mean", _stat_tensor("latent_mean", latent_mean, self.latent_dim))
+        self.register_buffer("latent_std", _stat_tensor("latent_std", latent_std, self.latent_dim, positive=True))
+        self.model = Strict4CausalVAE(
+            latent_dim=self.latent_dim,
+            hidden_dim=hidden_dim,
+            encoder_layers=encoder_layers,
+            decoder_layers=decoder_layers,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
 
-        if self.std_path is not None:
-            self.register_buffer(
-                "std", torch.from_numpy(np.load(self.std_path)).float()
+    def normalize_body(self, body_motion: torch.Tensor) -> torch.Tensor:
+        if body_motion.shape[-1] != BODY_DIM:
+            raise ValueError("body_motion must end in 265")
+        continuous = (body_motion[..., :BODY_CONTINUOUS_DIM] - self.body_cont_mean) / self.body_cont_std
+        contacts = body_motion[..., BODY_CONTINUOUS_DIM:]
+        return torch.cat([continuous, contacts], dim=-1)
+
+    def normalize_local_root(self, local_root_motion: torch.Tensor) -> torch.Tensor:
+        return (local_root_motion - self.local_root_mean) / self.local_root_std
+
+    def normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if not self.latent_statistics_ready:
+            raise RuntimeError("latent mu statistics must be computed after freezing the VAE")
+        return (latent - self.latent_mean) / self.latent_std
+
+    def unnormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if not self.latent_statistics_ready:
+            raise RuntimeError("latent mu statistics must be loaded before LDF detokenization")
+        return latent * self.latent_std + self.latent_mean
+
+    def encode(
+        self, body_motion: torch.Tensor, frame_valid_mask: torch.Tensor
+    ) -> VAEPosterior:
+        if body_motion.ndim != 3 or body_motion.shape[-1] != BODY_DIM:
+            raise ValueError("body_motion must be [B,F,265]")
+        if tuple(frame_valid_mask.shape) != tuple(body_motion.shape[:2]) or frame_valid_mask.dtype != torch.bool:
+            raise ValueError("frame_valid_mask must be bool [B,F]")
+        normalized = self.normalize_body(body_motion)
+        normalized = torch.where(frame_valid_mask[..., None], normalized, torch.zeros_like(normalized))
+        return self.model.encode(normalized)
+
+    def decode(
+        self,
+        latent_tokens: torch.Tensor,
+        local_root_motion: torch.Tensor,
+        local_root_valid_mask: torch.Tensor,
+        frame_valid_mask: torch.Tensor | None = None,
+    ) -> BodyPrediction:
+        normalized_root = self.normalize_local_root(local_root_motion)
+        output = self.model.decode(latent_tokens, normalized_root, local_root_valid_mask)
+        physical = output.continuous_body * self.body_cont_std + self.body_cont_mean
+        if frame_valid_mask is not None:
+            if tuple(frame_valid_mask.shape) != tuple(physical.shape[:2]):
+                raise ValueError("frame_valid_mask does not match decoded frames")
+            physical = torch.where(frame_valid_mask[..., None], physical, torch.zeros_like(physical))
+        result = BodyPrediction(physical, output.contact_logits)
+        result.validate()
+        return result
+
+    def forward(self, inputs: VAEInput | Mapping[str, torch.Tensor]) -> VAEPrediction:
+        if not isinstance(inputs, VAEInput):
+            inputs = VAEInput(
+                body_motion=inputs["body_motion"],
+                root_motion=inputs["root_motion"],
+                frame_valid_mask=inputs["frame_valid_mask"],
+                previous_root_frame=inputs.get("previous_root_frame"),
+                previous_root_valid_mask=inputs.get("previous_root_valid_mask"),
+                body_feature_valid_mask=inputs.get("body_feature_valid_mask"),
             )
-        else:
-            self.register_buffer("std", torch.ones(input_dim))
-
-        # Paper Sec 3.4: Causal VAE — encoder/decoder use causal conv so decode at time t only uses past latents (streaming decode).
-        self.model = WanVAE_(
-            input_dim=self.input_dim,
-            dim=self.dim,
-            dec_dim=self.dec_dim,
-            z_dim=self.z_dim,
-            dim_mult=self.dim_mult,
-            num_res_blocks=self.num_res_blocks,
-            temperal_downsample=self.temperal_downsample,
-            dropout=self.dropout,
+        inputs.validate()
+        posterior = self.encode(inputs.body_motion, inputs.frame_valid_mask)
+        latent = posterior.sample()
+        local_root, local_valid = derive_patched_local_root(
+            inputs.root_motion, inputs.previous_root_frame, fps=self.fps,
+            previous_root_valid_mask=inputs.previous_root_valid_mask,
         )
-
-        downsample_factor = 1
-        for flag in self.temperal_downsample:
-            if flag:
-                downsample_factor *= 2
-        self.downsample_factor = downsample_factor
-
-    def preprocess(self, x):
-        # (bs, T, C) -> (bs, C, T)
-        x = x.permute(0, 2, 1)
-        return x
-
-    def postprocess(self, x):
-        # (bs, C, T) ->  (bs, T, C)
-        x = x.permute(0, 2, 1)
-        return x
-
-    def forward(self, x):
-        features = x["feature"]
-        feature_length = x["feature_length"]
-        features = (features - self.mean) / self.std
-        # create mask based on feature_length
-        batch_size, seq_len = features.shape[:2]
-        mask = torch.zeros(
-            batch_size, seq_len, dtype=torch.bool, device=features.device
+        frame_valid = inputs.frame_valid_mask.reshape(
+            inputs.frame_valid_mask.shape[0], -1, FRAMES_PER_TOKEN, 1
         )
-        for i in range(batch_size):
-            mask[i, : feature_length[i]] = True
-
-        x_in = self.preprocess(features)  # (bs, input_dim, T)
-        mu, log_var = self.model.encode(
-            x_in, scale=[0, 1], return_dist=True
-        )  # (bs, z_dim, T)
-        z = self.model.reparameterize(mu, log_var)
-        x_decoder = self.model.decode(z, scale=[0, 1])  # (bs, input_dim, T)
-        x_out = self.postprocess(x_decoder)  # (bs, T, input_dim)
-
-        if x_out.size(1) != features.size(1):
-            min_len = min(x_out.size(1), features.size(1))
-            x_out = x_out[:, :min_len, :]
-            features = features[:, :min_len, :]
-            mask = mask[:, :min_len]
-
-        mask_expanded = mask.unsqueeze(-1)
-        x_out_masked = x_out * mask_expanded
-        features_masked = features * mask_expanded
-        loss_recons = self.RECONS_LOSS(x_out_masked, features_masked)
-        vel_start = self.vel_window[0]
-        vel_end = self.vel_window[1]
-        loss_vel = self.RECONS_LOSS(
-            x_out_masked[..., vel_start:vel_end],
-            features_masked[..., vel_start:vel_end],
-        )
-
-        # Compute KL divergence loss
-        # KL(N(mu, sigma) || N(0, 1)) = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-        # log_var = log(sigma^2), so we can use it directly
-
-        # Build mask for latent space
-        T_latent = mu.size(2)
-        mask_downsampled = torch.zeros(
-            batch_size, T_latent, dtype=torch.bool, device=features.device
-        )
-        for i in range(batch_size):
-            latent_length = (
-                feature_length[i] + self.downsample_factor - 1
-            ) // self.downsample_factor
-            mask_downsampled[i, :latent_length] = True
-        mask_latent = mask_downsampled.unsqueeze(1)  # (B, 1, T_latent)
-
-        # Compute KL loss per element
-        kl_per_element = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())
-        # Apply mask: only compute KL loss for valid timesteps
-        kl_masked = kl_per_element * mask_latent
-        # Sum over all dimensions and normalize by the number of valid elements
-        kl_loss = torch.sum(kl_masked) / (
-            torch.sum(mask_downsampled) * mu.size(1)
-        )  # normalize by valid timesteps * latent_dim
-
-        # Total loss
-        total_loss = (
-            self.LAMBDA_FEATURE * loss_recons
-            + self.LAMBDA_VELOCITY * loss_vel
-            + self.LAMBDA_KL * kl_loss
-        )
-
-        loss_dict = {}
-        loss_dict["total"] = total_loss
-        loss_dict["recons"] = loss_recons
-        loss_dict["velocity"] = loss_vel
-        loss_dict["kl"] = kl_loss
-
-        return loss_dict
-
-    # inference functions
-    def encode(self, x):
-        x = (x - self.mean) / self.std
-        x_in = self.preprocess(x)  # (bs, T, input_dim) -> (bs, input_dim, T)
-        mu = self.model.encode(x_in, scale=[0, 1])  # (bs, z_dim, T)
-        mu = self.postprocess(mu)  # (bs, T, z_dim)
-        return mu
-
-    def decode(self, mu):
-        mu_in = self.preprocess(mu)  # (bs, T, z_dim) -> (bs, z_dim, T)
-        x_decoder = self.model.decode(mu_in, scale=[0, 1])  # (bs, z_dim, T)
-        x_out = self.postprocess(x_decoder)  # (bs, T, input_dim)
-        x_out = x_out * self.std + self.mean
-        return x_out
+        local_valid = local_valid & frame_valid
+        local_root = torch.where(local_valid, local_root, torch.zeros_like(local_root))
+        body = self.decode(latent, local_root, local_valid, inputs.frame_valid_mask)
+        return VAEPrediction(body, posterior, latent, local_root, local_valid)
 
     @torch.no_grad()
-    def stream_encode(self, x, first_chunk=True):
-        x = (x - self.mean) / self.std
-        x_in = self.preprocess(x)  # (bs, input_dim, T)
-        mu = self.model.stream_encode(x_in, first_chunk=first_chunk, scale=[0, 1])
-        mu = self.postprocess(mu)  # (bs, T, z_dim)
-        return mu
+    def tokenize(self, body_motion: torch.Tensor, frame_valid_mask: torch.Tensor) -> torch.Tensor:
+        return self.normalize_latent(self.encode(body_motion, frame_valid_mask).mu)
 
     @torch.no_grad()
-    def stream_decode(self, mu, first_chunk=True):
-        mu_in = self.preprocess(mu)  # (bs, z_dim, T)
-        x_decoder = self.model.stream_decode(
-            mu_in, first_chunk=first_chunk, scale=[0, 1]
+    def detokenize(
+        self,
+        normalized_mu: torch.Tensor,
+        local_root_motion: torch.Tensor,
+        local_root_valid_mask: torch.Tensor,
+        frame_valid_mask: torch.Tensor | None = None,
+    ) -> BodyPrediction:
+        return self.decode(
+            self.unnormalize_latent(normalized_mu), local_root_motion,
+            local_root_valid_mask, frame_valid_mask
         )
-        x_out = self.postprocess(x_decoder)  # (bs, T, input_dim)
-        x_out = x_out * self.std + self.mean
-        return x_out
 
-    def clear_cache(self):
-        self.model.clear_cache()
+    def init_decoder_state(
+        self, batch_size: int, *, device=None, dtype=torch.float32
+    ) -> VAEDecoderState:
+        device = torch.device(device or self.body_cont_mean.device)
+        return self.model.init_decoder_state(batch_size, device=device, dtype=dtype)
 
-    def snapshot_stream_state(self):
-        """Capture encoder and decoder causal caches owned by the VAE."""
-        if hasattr(self.model, "snapshot_stream_state"):
-            return {"model": self.model.snapshot_stream_state()}
+    @torch.no_grad()
+    def stream_decode_step(
+        self,
+        latent_token: torch.Tensor,
+        local_root_patch: torch.Tensor,
+        state: VAEDecoderState,
+        local_root_valid_mask: torch.Tensor | None = None,
+        *,
+        normalized_latent: bool = True,
+    ) -> tuple[VAEDecoderState, BodyPrediction]:
+        if local_root_valid_mask is None:
+            local_root_valid_mask = torch.ones_like(local_root_patch, dtype=torch.bool)
+        latent = self.unnormalize_latent(latent_token) if normalized_latent else latent_token
+        next_state, output = self.model.stream_decode_step(
+            latent,
+            self.normalize_local_root(local_root_patch),
+            local_root_valid_mask,
+            state,
+        )
+        physical = output.continuous_body * self.body_cont_std + self.body_cont_mean
+        return next_state, BodyPrediction(physical, output.contact_logits)
+
+    @staticmethod
+    def snapshot_decoder_state(state: VAEDecoderState) -> dict:
         return {
-            "model": {
-                name: _clone_stream_cache(getattr(self.model, name))
-                for name in _STREAM_CACHE_NAMES
-                if hasattr(self.model, name)
-            }
+            "contract_version": CONTRACT_VERSION,
+            "token_index": int(state.token_index),
+            "caches": tuple((first.detach().clone(), second.detach().clone())
+                            for first, second in state.caches),
         }
 
-    def restore_stream_state(self, state):
-        if not isinstance(state, dict) or "model" not in state:
-            raise TypeError("VAE stream state must contain model cache state")
-        if hasattr(self.model, "restore_stream_state"):
-            self.model.restore_stream_state(state["model"])
-            return
-        for name, value in state["model"].items():
-            setattr(self.model, name, _clone_stream_cache(value))
+    @staticmethod
+    def restore_decoder_state(snapshot: Mapping[str, object]) -> VAEDecoderState:
+        if snapshot.get("contract_version") != CONTRACT_VERSION:
+            raise ValueError("decoder snapshot contract version mismatch")
+        caches = snapshot.get("caches")
+        if not isinstance(caches, (tuple, list)):
+            raise TypeError("decoder snapshot caches are missing")
+        return VAEDecoderState(
+            tuple((first.clone(), second.clone()) for first, second in caches),
+            int(snapshot["token_index"]),
+        )
 
-    def generate(self, x):
-        features = x["feature"]
-        feature_length = x["feature_length"]
-        y_hat = self.decode(self.encode(features))
 
-        y_hat_out = []
-
-        for i in range(y_hat.shape[0]):
-            # cut off the padding and align lengths
-            valid_len = (
-                feature_length[i] - 1
-            ) // self.downsample_factor * self.downsample_factor + 1
-            # Make sure both have the same length (take minimum)
-            y_hat_out.append(y_hat[i, :valid_len, :])
-
-        out = {}
-        out["generated"] = y_hat_out
-        return out
+__all__ = ["BodyVAE"]

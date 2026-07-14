@@ -1,6 +1,6 @@
 # 01 模型结构与输入输出
 
-状态：`MODEL_CORE_IMPLEMENTED / VAE_AND_RUNTIME_OPEN`
+状态：`LDF_AND_STRICT4_VAE_CORE_IMPLEMENTED / DATA_AND_RUNTIME_OPEN`
 
 ## 设计顺序与文档顺序
 
@@ -91,7 +91,7 @@ coordinate/value types
 - `models/diffusion_forcing_wan.py` 已公开 `RootTransformer/BodyTransformer/LDF`，两阶段不出现在公共文件名或类名中。
 - `generate/stream_generate/stream_generate_step` 已迁移为显式 `HybridMotion/LDFStreamState`，并通过合成张量的commit、rolling和snapshot/restore测试。
 - 旧附加控制网络、专用轨迹编码器、专用attention、tiny模型和外置root planner已经物理删除；constraint CFG由主干接管。
-- 当前VAE仍是旧full-motion 1D接口；`body259 -> latent_motion`和`decode_step(latent_motion, local_root_motion, VAEDecoderState)`尚未实现，因此真实训练与Web生成明确阻断。
+- strict4 body VAE核心、`body265 -> latent_motion`和显式`VAEDecoderState`已经实现；原生SMPL rotations数据、正式checkpoint/latent artifacts与Web接线尚未完成，因此真实LDF训练与Web生成仍明确阻断。
 
 ### 删除状态
 
@@ -132,14 +132,14 @@ Root/Body Transformer 可以在本次调用所提供的有限窗口内做双向 
 ### 1. Body tokenizer/VAE
 
 ```text
-body259 ----------------------> BodyEncoder ------> latent_motion -------+
+body265 ----------------------> BodyEncoder ------> latent_motion -------+
                                                                          |
 root_motion -------> LocalRootMotionCodec --> local_root_motion ---------+
                                                                          v
                                                                    BodyDecoder
                                                                          |
                                                                          v
-                                                               reconstructed body259
+                                                               reconstructed body265
 ```
 
 顶层职责：
@@ -276,7 +276,7 @@ root_visible = where(
 
 同时把 value 与 mask 投影给网络。这个 overwrite 只改变本次 Root Transformer 的可见输入，不原地修改 `LDFInput.noisy_motion.root_motion`。
 
-稀疏 body observations 通常是 frame-level body259/joint/keyframe constraints，并不天然等于 causal body latent。因此 V1 只把它们通过 observation projector 作为条件，不对 latent state 或最终输出做 hard overwrite。
+稀疏 body observations 通常是 frame-level body265/joint/keyframe constraints，并不天然等于 causal body latent。因此 V1 只把它们通过 observation projector 作为条件，不对 latent state 或最终输出做 hard overwrite。
 
 超出 current generation state 的 observations 被编译为 future constraint tokens。它们参加 non-causal window attention，但没有 `root_t/latent_t/beta`，也不会被 scheduler 更新或 commit。
 
@@ -446,7 +446,7 @@ root_motion[f]: RootMotion
 
 坐标约定与现有 geometry contract 对齐：Y-up，yaw 绕 `+Y`，`yaw=0` 面向 `+Z`，forward XZ direction 为 `[sin(yaw), cos(yaw)]`。
 
-这里的 `root_y` 不能删除。body259 已经移除了 HumanML263 的 legacy root4，其中包含 root height；如果 explicit root 只保留 XZ 与 heading，最终没有权威变量能够恢复 pelvis height。
+这里的 `root_y` 不能删除。body265不包含权威global root；如果explicit root只保留XZ与heading，最终没有权威变量能够恢复pelvis height。
 
 ### 2. Anchor 只消除平移，不消除首帧朝向
 
@@ -485,7 +485,7 @@ xz_aug[f]  = R(phi) * xz[f]
 yaw_aug[f] = wrap(yaw[f] + phi)
 ```
 
-对应的 root/path/body observations 必须同步旋转。对真正满足 HumanML root-local 定义的 body259，这个全局 yaw 变换理论上保持 body259 不变；该不变量仍需用 feature round-trip 测试确认，不能仅靠假设。
+对应的root/path/body observations必须同步旋转。body265包含global rotations与global velocities，因此它不会在全局yaw变换下保持数值不变；必须验证的是local-root velocity不变量以及root/body同步旋转后的几何等价性。
 
 这借鉴 ARDY 的 `randomize_first_heading()`，但不照搬其所有数据表示。ARDY 同样使用 `[x,y,z,cos,sin]` 作为生成 root，并在 runtime 只做 XZ translation recenter；它的 derived local-root XZ velocity仍在稳定的世界轴上。
 
@@ -554,7 +554,7 @@ local_root_motion[f] = [
 
 ### 2. 为什么不是ARDY原公式
 
-ARDY同样从显式5D root派生4D local root，并同时供给body stage与tokenizer decoder；但其公开实现使用forward difference和stable/world-axis XZ velocity。Floodcontrol的body259更强调global-yaw invariance，同时V1保留跨commit的causal decoder state，因此改为：
+ARDY同样从显式5D root派生4D local root，并同时供给body stage与tokenizer decoder；但其公开实现使用forward difference和world-axis XZ velocity。Floodcontrol保留跨commit的causal decoder state，因此改为backward/current-heading-local定义：
 
 ```text
 ARDY:        forward + stable-axis velocity + full/window re-decode
@@ -738,7 +738,7 @@ predicted latent
 ## 第二遍：自下而上的协议冻结顺序
 
 1. 冻结命名和坐标类型：world/session root、`root_motion`、`local_root_motion`、`HumanMLLegacyRootMotion`。
-2. 冻结 body explicit representation，确认 body259 在 translation/global-yaw 变换下的不变量。
+2. 冻结body265 explicit representation，确认global-yaw同步变换的几何等价性与local-root不变量。
 3. 冻结 tokenizer/VAE I/O：严格四帧 patch、causal decoder state、backward local-root boundary、padding和deterministic body code。
 4. 冻结 hybrid clean/noisy state：root patch 与 body token 是 named fields，不能只依赖扁平拼接的隐式切片。
 5. 冻结两阶段 LDF：root stage 的输入输出、clean-root 恢复、stage boundary detach、body stage condition。
@@ -776,7 +776,7 @@ cacheability
 - 顶层目标和模块图已有第一轮 `PROVISIONAL` 候选，仍需逐项反例审查后才能 `LOCKED`。
 - CFG 的所有权与输入分支已经冻结；仍需通过训练方法文档和消融决定 separated additive、regular joint 或 hierarchical composition 的默认公式及 condition-dropout 概率。
 - explicit root 已冻结为 translation-only stable anchor 下的 `root_motion=[x,y,z,cos(yaw),sin(yaw)]`；`local_root_motion` 使用backward/current-heading-local派生，速度不进入生成state，也不设置独立physical velocity loss。
-- body encoder 是否严格只看 body259；decoder 是否仅以派生 root4 为外部条件。
+- body encoder是否严格只看body265；decoder是否仅以派生local-root4为外部条件。
 - VAE、连续 deterministic autoencoder 和 FSQ 的第一版对比边界。
 - V1 候选已选择 root/body 都预测 FloodDiffusion convention 下的 `v`，并在 stage boundary 恢复 clean `root_x0`；仍需用数值测试确认与现有 scheduler 的符号和端点完全一致。
 - cold start 的初始 root/heading 是 clean boundary、typed observation，还是单独 prefix token。

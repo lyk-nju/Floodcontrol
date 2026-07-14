@@ -34,7 +34,6 @@ from .composer import ConditionComposer
 from .payload_builder import PayloadBuilder
 from .snapshots import RNGStreamState, restore_rng_state, snapshot_rng_state
 from .source_manager import PreparedSourceTransition, RootSourceManager
-from .session import StreamRuntimeSession
 from .progress import (
     RelativeRouteProgressPolicy,
     RouteProjection,
@@ -73,7 +72,6 @@ __all__ = [
     "SetText",
     "SpaceContract",
     "StreamCommitEvent",
-    "StreamRuntimeSession",
     "RelativeRouteProgressPolicy",
     "WorldRouteProgressPolicy",
     "reduce_commands",

@@ -261,7 +261,10 @@ class HumanML3DDataset(Dataset):
         crop_start = 0
         # if the motion is longer than window_length, randomly crop a window_length clip
         if feature_len > self.window_length:
-            crop_start = random.randint(0, feature_len - self.window_length)
+            if self.window_length % 4:
+                raise ValueError("strict4 feature window_length must be divisible by four")
+            max_start_token = (feature_len - self.window_length) // 4
+            crop_start = random.randint(0, max_start_token) * 4
             feature = feature[crop_start : crop_start + self.window_length]
             feature_len = self.window_length
         return feature, feature_len, crop_start
@@ -271,15 +274,13 @@ class HumanML3DDataset(Dataset):
         crop token to align with feature (VAE temporal factor 4). Otherwise use original random crop."""
         token_length = len(token)
         if crop_start is not None and feature_length is not None:
-            # Causal VAE convention: frame f → token (f+3)//4
-            #   token 0 covers frame 0; token k (k≥1) covers frames [4k-3, 4k]
-            token_start = (crop_start + 3) // 4
-            last_frame = crop_start + feature_length - 1
-            token_end = (last_frame + 3) // 4  # inclusive
-            token_len = token_end - token_start + 1
+            if crop_start % 4 or feature_length % 4:
+                raise ValueError("strict4 token crop requires four-frame aligned bounds")
+            token_start = crop_start // 4
+            token_len = feature_length // 4
             end = min(token_start + token_len, token_length)
             if token_start >= token_length or token_len <= 0:
-                token = token[:1]  # fallback: at least 1 token
+                raise ValueError("strict4 token crop lies outside cached tokens")
             else:
                 token = token[token_start:end]
         elif token_length > self.random_length:
