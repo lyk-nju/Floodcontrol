@@ -15,10 +15,10 @@ root_motion + latent_motion
 - body-only causal VAE核心、body265 codec、分组loss和显式`VAEDecoderState`已经落地；
 - `HybridMotion`、typed condition、Root/Body non-causal LDF和constraint CFG已经落地；
 - `generate/stream_generate/stream_generate_step`已经使用显式Hybrid流式状态；
-- HumanML3D/BABEL 基础读取与 motion recovery；
+- HumanML3D/BABEL的独立body265 artifact、联合statistics与同构multi-dataset训练入口；
 - 分主题架构文档和契约测试。
 
-旧的附加控制网络、外置轨迹编码器和外置root planner已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、HumanML263到body265的显式转换、合成张量流式decode和LDF heading bridge。第一版明确使用HumanML3D预处理提供的IK-derived rotations，并在artifact中标记来源；本地HumanML3D motion artifacts与train statistics已经构建完成，真实LDF训练与Web生成仍需正式VAE checkpoint、latent artifacts和commit-time decoder事务接线。
+旧的附加控制网络、外置轨迹编码器和外置root planner已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、HumanML263到body265的显式转换、合成张量流式decode和LDF heading bridge。第一版明确使用HumanML-style预处理提供的IK-derived rotations，并在artifact中标记来源；本地`HumanML3D_motion`、`BABEL_motion`以及两者联合train statistics已经构建完成，真实LDF训练与Web生成仍需正式VAE checkpoint、latent artifacts和commit-time decoder事务接线。
 
 ## 当前可验证范围
 

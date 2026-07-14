@@ -1,10 +1,4 @@
-"""Build root5/body265 artifacts from the processed HumanML3D dataset.
-
-The builder reads ``new_joint_vecs`` and source split TXT files from one
-HumanML3D root, then writes a separate, resumable ``HumanML3D_motion`` dataset.
-Rotations are explicitly identified as HumanML3D IK-derived rotations rather
-than native AMASS/SMPL pose parameters.
-"""
+"""Build versioned root5/body265 artifacts from BABEL_streamed motions."""
 
 from __future__ import annotations
 
@@ -12,38 +6,31 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Mapping
 
 import numpy as np
 
+from tools.motion_artifact import (
+    artifact_is_current,
+    atomic_write_text,
+    process_file,
+)
 from utils.conditions.vae import CONTRACT_VERSION, FRAMES_PER_TOKEN
 from utils.motion_representation import (
     HUMANML_DIM,
     HUMANML_SOURCE_REPRESENTATION,
 )
-from tools.motion_artifact import (
-    artifact_is_current,
-    atomic_write_text as _atomic_write_text,
-    process_file,
-)
 
 
-SOURCE_REPRESENTATION = HUMANML_SOURCE_REPRESENTATION
-DEFAULT_SPLITS = ("train", "val", "test")
-
-
-def _convert_task(task: tuple[str, str, float]) -> tuple[str, int]:
-    source_value, target_value, fps = task
-    source, target = Path(source_value), Path(target_value)
-    if artifact_is_current(source, target):
-        return "skipped", 0
-    result = process_file(source, target, fps=fps)
-    return "converted", int(result["frames"])
+DEFAULT_SPLIT_FILES = {
+    "train": "train_processed.txt",
+    "val": "val_processed.txt",
+}
 
 
 def _read_split(path: Path) -> list[str]:
     if not path.is_file():
-        raise RuntimeError(f"HumanML3D split metadata file not found at {path}")
+        raise RuntimeError(f"BABEL split metadata file not found at {path}")
     names: list[str] = []
     for line_number, line in enumerate(path.read_text().splitlines(), start=1):
         name = line.strip()
@@ -55,7 +42,9 @@ def _read_split(path: Path) -> list[str]:
             )
         names.append(name)
     if not names:
-        raise RuntimeError(f"HumanML3D split contains no sample ids: {path}")
+        raise RuntimeError(f"BABEL split contains no sample ids: {path}")
+    if len(names) != len(set(names)):
+        raise ValueError(f"BABEL split contains duplicate sample ids: {path}")
     return names
 
 
@@ -63,16 +52,26 @@ def _usable_frames(path: Path) -> int:
     feature = np.load(path, mmap_mode="r", allow_pickle=False)
     if feature.ndim != 2 or feature.shape[-1] != HUMANML_DIM:
         raise ValueError(
-            f"HumanML3D source must be [F,{HUMANML_DIM}], got {feature.shape} at {path}"
+            f"BABEL motion must be [F,{HUMANML_DIM}], got {feature.shape} at {path}"
         )
     return int(feature.shape[0]) // FRAMES_PER_TOKEN * FRAMES_PER_TOKEN
+
+
+def _convert_task(task: tuple[str, str, float]) -> tuple[str, int]:
+    source_value, target_value, fps = task
+    source, target = Path(source_value), Path(target_value)
+    if artifact_is_current(source, target):
+        return "skipped", 0
+    result = process_file(source, target, fps=fps)
+    return "converted", int(result["frames"])
 
 
 def build_dataset(
     source_root: Path,
     output: Path,
     *,
-    splits: Iterable[str] = DEFAULT_SPLITS,
+    split_files: Mapping[str, str] | None = None,
+    motion_path: str = "motions",
     artifact_path: str = "artifacts",
     workers: int = 1,
     fps: float = 20.0,
@@ -80,37 +79,39 @@ def build_dataset(
     skip_missing: bool = False,
 ) -> dict[str, object]:
     source_root, output = Path(source_root), Path(output)
-    motion_root = source_root / "new_joint_vecs"
-    if not motion_root.is_dir():
-        raise RuntimeError(
-            f"HUMANML3D_DATA_REQUIRED: 263D source directory not found at {motion_root}"
-        )
-    if output.resolve() == source_root.resolve():
-        raise ValueError(
-            "output must not be the legacy HumanML3D root because source split "
-            "TXT files would be overwritten"
-        )
+    motion_subdir = Path(motion_path)
     artifact_subdir = Path(artifact_path)
-    if artifact_subdir.is_absolute() or ".." in artifact_subdir.parts:
-        raise ValueError("artifact_path must be a relative directory")
-    artifact_root = output / artifact_subdir
+    for name, value in (("motion_path", motion_subdir), ("artifact_path", artifact_subdir)):
+        if value.is_absolute() or ".." in value.parts:
+            raise ValueError(f"{name} must be a relative directory")
+    motion_root = source_root / motion_subdir
+    if not motion_root.is_dir():
+        raise RuntimeError(f"BABEL_DATA_REQUIRED: motion directory not found at {motion_root}")
+    if output.resolve() == source_root.resolve():
+        raise ValueError("output must be separate from the legacy BABEL_streamed root")
 
     min_frames = int(min_frames)
     if min_frames < FRAMES_PER_TOKEN or min_frames % FRAMES_PER_TOKEN:
         raise ValueError("min_frames must be a positive multiple of four")
+    split_files = dict(split_files or DEFAULT_SPLIT_FILES)
+    if not split_files:
+        raise ValueError("at least one BABEL split must be configured")
+    unsupported = set(split_files) - {"train", "val", "test"}
+    if unsupported:
+        raise ValueError(f"unsupported target splits: {sorted(unsupported)}")
 
     source_split_names: dict[str, list[str]] = {}
     missing_by_split: dict[str, list[str]] = {}
-    for split in splits:
-        split = str(split)
-        if split not in DEFAULT_SPLITS:
-            raise ValueError(f"unsupported split {split!r}")
-        names = _read_split(source_root / f"{split}.txt")
+    for split, source_name in split_files.items():
+        source_path = Path(source_name)
+        if source_path.is_absolute() or ".." in source_path.parts:
+            raise ValueError("BABEL split paths must be relative to source_root")
+        names = _read_split(source_root / source_path)
         missing = [name for name in names if not (motion_root / f"{name}.npy").is_file()]
         if missing and not skip_missing:
             preview = ", ".join(missing[:5])
             raise RuntimeError(
-                f"HUMANML3D_DATA_REQUIRED: {len(missing)} {split} motions are missing; "
+                f"BABEL_DATA_REQUIRED: {len(missing)} {split} motions are missing; "
                 f"first entries: {preview}"
             )
         missing_set = set(missing)
@@ -135,6 +136,7 @@ def build_dataset(
         for name in names:
             unique_names[name] = None
 
+    artifact_root = output / artifact_subdir
     tasks = [
         (
             str(motion_root / f"{name}.npy"),
@@ -143,8 +145,9 @@ def build_dataset(
         )
         for name in unique_names
     ]
-    converted = skipped = total_frames = 0
+    converted = skipped = converted_frames = 0
     workers = max(1, int(workers))
+    executor = None
     if workers == 1:
         results = map(_convert_task, tasks)
     else:
@@ -154,27 +157,28 @@ def build_dataset(
         for index, (status, frames) in enumerate(results, start=1):
             converted += status == "converted"
             skipped += status == "skipped"
-            total_frames += frames
+            converted_frames += frames
             if index % 500 == 0 or index == len(tasks):
                 print(
-                    f"processed {index}/{len(tasks)} artifacts "
+                    f"processed {index}/{len(tasks)} BABEL artifacts "
                     f"(converted={converted}, skipped={skipped})",
                     flush=True,
                 )
     finally:
-        if workers > 1:
+        if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
 
     output.mkdir(parents=True, exist_ok=True)
     for split, names in split_names.items():
-        _atomic_write_text(
-            output / f"{split}.txt", "".join(f"{name}\n" for name in names)
-        )
+        atomic_write_text(output / f"{split}.txt", "".join(f"{name}\n" for name in names))
     summary = {
         "contract_version": CONTRACT_VERSION,
-        "source_representation": SOURCE_REPRESENTATION,
+        "source_dataset": "BABEL_streamed",
+        "source_representation": HUMANML_SOURCE_REPRESENTATION,
         "source_root": str(source_root.resolve()),
+        "motion_path": str(motion_subdir),
         "artifact_path": str(artifact_subdir),
+        "split_files": split_files,
         "fps": float(fps),
         "min_frames": min_frames,
         "splits": {name: len(values) for name, values in split_names.items()},
@@ -183,43 +187,41 @@ def build_dataset(
         "unique_artifacts": len(tasks),
         "converted": converted,
         "skipped": skipped,
-        "converted_frames": total_frames,
+        "converted_frames": converted_frames,
     }
-    _atomic_write_text(
-        output / "build_summary.json", json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(
+        output / "build_summary.json",
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
     )
     return summary
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--source-root", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--train-split", default="train_processed.txt")
+    parser.add_argument("--val-split", default="val_processed.txt")
     parser.add_argument(
-        "--source-root",
-        required=True,
-        help="legacy HumanML3D root containing new_joint_vecs and split TXT files",
+        "--test-split",
+        default=None,
+        help="Optional real test split; test_min_processed is intentionally not used by default",
     )
-    parser.add_argument(
-        "--output",
-        required=True,
-        help="separate processed dataset root, for example HumanML3D_motion",
-    )
-    parser.add_argument(
-        "--splits", nargs="+", default=list(DEFAULT_SPLITS), choices=DEFAULT_SPLITS
-    )
+    parser.add_argument("--motion-path", default="motions")
     parser.add_argument("--artifact-path", default="artifacts")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--min-frames", type=int, default=20)
-    parser.add_argument(
-        "--skip-missing",
-        action="store_true",
-        help="write filtered target splits instead of failing on missing source motions",
-    )
+    parser.add_argument("--skip-missing", action="store_true")
     args = parser.parse_args()
+    split_files = {"train": args.train_split, "val": args.val_split}
+    if args.test_split:
+        split_files["test"] = args.test_split
     summary = build_dataset(
         Path(args.source_root),
         Path(args.output),
-        splits=args.splits,
+        split_files=split_files,
+        motion_path=args.motion_path,
         artifact_path=args.artifact_path,
         workers=args.workers,
         fps=args.fps,

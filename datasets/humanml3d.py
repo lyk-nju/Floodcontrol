@@ -276,6 +276,7 @@ def collate_humanml3d(batch: list[dict]) -> dict[str, object]:
         "body_feature_valid_mask": feature_mask,
         "previous_root_frame": previous,
         "previous_root_valid_mask": previous_valid,
+        "dataset": [item["dataset"] for item in batch],
         "name": [item["name"] for item in batch],
         "text": [item["text"] for item in batch],
     }

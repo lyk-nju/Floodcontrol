@@ -60,6 +60,19 @@ def test_formal_vae_training_config_matches_frozen_recipe():
     assert dict(cfg.lr_scheduler.params) == {"num_warmup_steps": 1_000}
 
 
+def test_multi_vae_config_keeps_source_datasets_explicit():
+    cfg = load_config(str(ROOT / "configs" / "vae_multi.yaml"))
+    assert cfg.data.target == "datasets.multi.MultiDataset"
+    assert cfg.data.collate_fn == "datasets.multi.collate_multi"
+    assert [entry.target for entry in cfg.data.datasets] == [
+        "datasets.humanml3d.HumanML3DDataset",
+        "datasets.babel.BABELDataset",
+    ]
+    assert cfg.model.params.motion_stats_path == (
+        f"{cfg.dirs.raw_data}/HumanML3D_BABEL_motion_stats.npz"
+    )
+
+
 def test_vae_dataset_builder_requires_preprocessed_motion_artifacts(tmp_path):
     cfg = load_config(str(ROOT / "configs" / "vae.yaml"))
     cfg.config.data.train_meta_paths = [str(tmp_path / "missing.txt")]
