@@ -47,7 +47,7 @@ def decode_stream_chunks(
     local_root_chunks: Sequence[torch.Tensor],
     local_root_valid_chunks: Sequence[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, List[torch.Tensor], List[int]]:
-    """Decode strict4 chunks with an explicit per-call decoder state."""
+    """Decode four-frame chunks with an explicit per-call decoder state."""
     if len(latent_chunks) != len(local_root_chunks):
         raise ValueError("latent and local-root chunk counts must match")
     if local_root_valid_chunks is None:

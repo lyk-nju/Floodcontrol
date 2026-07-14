@@ -1,4 +1,4 @@
-"""Fail-fast model loader pending strict-4 VAE/runtime integration."""
+"""Fail-fast model loader pending body-VAE/runtime integration."""
 
 from __future__ import annotations
 

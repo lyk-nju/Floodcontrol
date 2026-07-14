@@ -10,7 +10,7 @@ from .step_semantics import (
     resolve_runtime_max_steps,
     resolve_scheduler_steps,
 )
-from .vae_loss import VAELoss
+from .vae import VAELightningModule, VAELoss
 
 __all__ = [
     "BasicLightningModule",
@@ -22,5 +22,6 @@ __all__ = [
     "load_resume_step_offset",
     "resolve_runtime_max_steps",
     "resolve_scheduler_steps",
+    "VAELightningModule",
     "VAELoss",
 ]

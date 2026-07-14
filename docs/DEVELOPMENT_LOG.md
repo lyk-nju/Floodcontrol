@@ -329,3 +329,493 @@
 - 用真实train split计算physical statistics，训练VAE，冻结checkpoint并生成带hash的latent statistics/artifacts。
 - 真实数据上评估rotation/FK consistency、foot contact阈值、重建和skating，再逐项决定是否启用几何消融loss。
 - 将正式latent artifact接入LDF dataset/loss，完成Hybrid commit与`VAEDecoderState`原子snapshot/restore后再解除`train_ldf.py`与Web守卫。
+
+## 2026-07-15 · 统一VAE训练入口命名
+
+类型：训练入口重命名 / 可读性维护
+
+实际改动内容：
+
+- 将`Strict4VAELightningModule`重命名为`VAELightningModule`，避免在通用训练封装名称中重复强调四帧协议。
+- 将输入和数据集构造函数统一为`_create_input()`与`_create_dataset()`；将局部变量`module`、`checkpoint`明确为`lightning_module`、`checkpoint_callback`。
+- 保留`_step()`名称，因为它是`BasicLightningModule`训练流程调用的覆写钩子。
+- 将训练入口的缺失数据与统计错误码改为`NATIVE_ROTATION_DATA_REQUIRED`和`MOTION_STATISTICS_REQUIRED`；模型内部仍严格执行四帧一token合同。
+
+改动理由：
+
+- strict-4是VAE的时间协议，而不是每个训练类和辅助函数都需要携带的实现前缀。训练入口使用职责命名更简洁，也更便于后续保持单一正式VAE实现。
+- 显式区分Lightning封装与checkpoint callback，减少`main()`内通用名称带来的歧义。
+
+验证：
+
+- `python -m py_compile train_vae.py`通过。
+- VAE合同、数据、loss、模型与迁移守卫测试：`27 passed`；仅有运行环境无法初始化NVML的PyTorch warning。
+- `train_vae.py`内搜索确认不再包含`Strict4/strict4`，`git diff --check`通过。
+
+涉及文件：
+
+- `train_vae.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮不重命名仍承担协议版本辨识职责的dataset、配置文件、artifact contract或底层模型类；是否进一步统一由后续命名讨论决定。
+
+## 2026-07-15 · VAE薄训练入口与模型专属训练包
+
+类型：训练代码重构 / 文件迁移 / 测试
+
+实际改动内容：
+
+- 将`train_vae.py`缩减为只导入并调用`run_vae_training()`的命令行薄入口，不再直接定义LightningModule、dataset、dataloader、logger、checkpoint或Trainer组装逻辑。
+- 新增`utils/training/vae/`模型专属训练包：`lightning_module.py`保存`VAELightningModule`，`data.py`负责dataset/dataloader构造，`runner.py`负责训练运行时组装，`losses.py`保存`VAELoss`，并由包级`__init__.py`统一导出。
+- 物理迁移并删除顶层`utils/training/vae_loss.py`；测试和`utils.training`公共导出切换到新包路径，不保留旧路径兼容壳。
+- checkpoint命名和筛选对齐FloodNet LDF训练语义，统一监控`ckpt_absolute_step`并使用配置中的`validation.save_top_k`。
+- 修正tiny配置未定义`motion_stats_path`时的可选字段读取，使`allow_identity_statistics: true`能够继续进入native-rotation manifest守卫，而不是触发OmegaConf缺键异常。
+- 新增入口结构、训练包导出、数据前置条件和runner fail-fast回归测试。
+
+改动理由：
+
+- 训练入口应只承担CLI启动职责；模型专属Lightning封装、数据构建与运行时组装放入`utils/training/vae/`后，与FloodNet的`utils/training/<model>/`布局一致，后续增加验证指标或训练策略时无需继续膨胀入口文件。
+- loss与LightningModule属于同一个VAE训练子系统，集中所有权比散落在`utils/training`根目录更清楚。
+- `ckpt_absolute_step`是基础Lightning模块已经公开的恢复安全步数语义，checkpoint callback应直接复用该语义。
+
+验证：
+
+- `python -m py_compile`覆盖新入口、VAE训练包和新增测试，通过。
+- `python -m pytest -q tests`：`48 passed`。
+- 直接运行`python train_vae.py --config configs/vae_strict4_tiny.yaml`能够进入新runner，并按设计抛出`NATIVE_ROTATION_DATA_REQUIRED`；未出现旧模块导入错误或OmegaConf缺键错误。
+- 全仓活跃源码搜索确认不存在`utils.training.vae_loss`旧导入；`git diff --check`在最终检查中执行。
+
+涉及文件：
+
+- `train_vae.py`
+- `utils/training/__init__.py`
+- 新增：`utils/training/vae/__init__.py`、`data.py`、`lightning_module.py`、`losses.py`、`runner.py`
+- 删除：`utils/training/vae_loss.py`
+- `tests/test_vae_loss.py`
+- 新增：`tests/test_vae_training.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 真实VAE训练仍需要原生SMPL/AMASS rotation manifest与train-split motion statistics；本轮只验证训练入口结构和前置条件守卫。
+- LDF训练入口仍保持迁移期fail-fast，待strict-4 VAE checkpoint、latent statistics和新数据artifact接入后，再按相同薄入口结构恢复`utils/training/ldf/`。
+
+## 2026-07-15 · 冻结首版VAE三卡训练配置
+
+类型：训练配置 / loss默认值 / 设计文档 / 回归测试
+
+实际改动内容：
+
+- 将正式`configs/vae.yaml`设为300k optimizer steps、三卡DDP、每卡batch size 32（global batch 96）；正式启动时由`CUDA_VISIBLE_DEVICES=2,3,4`绑定物理GPU，配置内部使用`devices: 3`。
+- 保持20–200帧（1–10秒）四帧对齐随机crop、AdamW `2e-4`、10k-step warmup与cosine schedule，并将scheduler总步数同步为300k。
+- 冻结首版目标为`L_total = L_recon + 0.01 L_skate + 1e-5 L_KL`，关闭KL warmup；position、rotation、velocity和contact继续作为分block reconstruction，几何一致性loss不进入正式配置。
+- 将`VAELoss`构造默认值同步为`beta_kl=1e-5`、`kl_warmup_steps=0`，避免未显式传参时偏离正式训练协议；warmup机制仍保留为可显式启用的消融能力。
+- 正式实验名统一为`vae_body265`；测试切换到已统一命名的`configs/vae.yaml`和`configs/ldf.yaml`，不恢复已删除的旧strict/tiny配置文件名。
+- 更新VAE设计文档，并新增正式配置合同测试，锁定steps、DDP、batch、crop、KL、optimizer和scheduler关键值。
+
+改动理由：
+
+- 300k是首轮可控训练预算，后续可根据验证曲线从checkpoint续训；每卡32能够明确控制三卡显存和global batch，不把原单卡batch 128意外放大为384。
+- `1e-5`沿用FloodDiffusion的KL权重；ARDY式0.01 skating loss提供接触期足部静止约束，其余几何loss暂不与表示和数据协议重构同时启用。
+- 正式配置、代码默认值和设计文档必须表达同一个训练目标，避免CLI配置遗漏时产生隐式训练差异。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest -q tests/test_vae_training.py tests/test_vae_loss.py tests/test_migration_guards.py`：20 passed。
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest -q tests`：49 passed。
+- 运行`python train_vae.py --config configs/vae.yaml`在实例化Trainer/GPU前按设计抛出`MOTION_STATISTICS_REQUIRED`，确认正式入口仍拒绝缺失真实train-split statistics的训练。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `configs/vae.yaml`
+- `utils/training/vae/losses.py`
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+- `tests/test_vae_loss.py`
+- `tests/test_vae_training.py`
+- `tests/test_migration_guards.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 训练仍需要设置真实`STRICT4_MANIFEST`和`STRICT4_MOTION_STATS`；当前没有绕过原生SMPL/AMASS rotations与train-split statistics前置条件。
+- 正式开跑前检查GPU 2/3/4空闲显存，并用一个短DDP smoke run验证真实数据吞吐和峰值显存，再启动300k训练。
+
+## 2026-07-15 · VAE学习率调度切换为constant-after-warmup
+
+类型：训练配置修正 / 设计文档 / 回归测试
+
+实际改动内容：
+
+- 将正式VAE scheduler从`diffusers.optimization.get_cosine_schedule_with_warmup`切换为`get_constant_schedule_with_warmup`。
+- warmup从10k调整为1k steps；达到AdamW基础学习率`2e-4`后，在剩余300k训练预算内保持恒定。
+- 删除constant scheduler不需要的`num_training_steps`参数，避免向构造函数传入无效配置。
+- 同步更新VAE设计文档和正式配置合同测试。
+
+改动理由：
+
+- FloodDiffusion VAE实际使用AdamW `2e-4`与1k warmup后的恒定学习率；这是当前causal-convolution工程基础上更直接的已验证基线。
+- ARDY的cosine schedule横跨4M steps且配合AdamAtan2 `2e-5`，将同一曲线压缩到300k会过早把Floodcontrol学习率降至零，也会使300k后的checkpoint续训变得不自然。
+
+验证：
+
+- VAE训练配置与loss测试：8 passed。
+- 全部测试：49 passed；仅有测试环境无法初始化NVML的PyTorch warning。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `configs/vae.yaml`
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+- `tests/test_vae_training.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 正式训练前仍需提供真实manifest与motion statistics，并在GPU 2/3/4上完成短DDP smoke run。
+
+## 2026-07-15 · VAE数据划分迁移为FloodNet风格TXT协议
+
+类型：数据协议 / Dataset / 预处理与统计工具 / 配置 / 测试 / 文档
+
+实际改动内容：
+
+- 删除VAE训练对JSONL内嵌split manifest的依赖，改为`train_meta_paths/val_meta_paths/test_meta_paths`；每个TXT与FloodNet一致，每行只保存一个sample id。
+- 冻结目录解析语义：TXT所在目录是数据根目录，`artifact_path`指定其下的artifact子目录，Dataset按`<txt-parent>/<artifact_path>/<sample-id>.npz`读取root5/body265。
+- 正式配置指向`${dirs.raw_data}/HumanML3D_strict4/{train,val,test}.txt`与`artifacts/`，不再需要`STRICT4_MANIFEST`环境变量；`STRICT4_MOTION_STATS`仍独立提供train-split归一化统计。
+- Dataset新增统一`load_artifact_records()`，验证split TXT、sample id、artifact存在性及artifact内部contract version；不提供legacy263或IK回退。
+- 预处理工具改为读取已有sample-id TXT，只处理对应native-rotation NPZ，并分别输出`train.txt/val.txt/test.txt`；重复运行某个split不会覆盖另外两个split。增加显式`--skip-missing`以生成排除缺失原生旋转样本后的过滤列表。
+- motion statistics工具改为接收一个或多个`--train-meta-paths`，仅在这些训练sample上统计并记录TXT digest。
+- deterministic-mu latent工具改为接收train/val/test TXT，输出对应latent split TXT与`latents/<sample-id>.npy`，metadata记录输入split digest，不再生成latent JSONL manifest。
+- 更新数据/VAE设计文档、README和配置合同测试；新增合成native rotations经过预处理、split TXT Dataset及statistics生成的集成测试。
+
+改动理由：
+
+- FloodNet已验证的TXT协议把“样本属于哪个split”和“样本内部保存什么”清晰分离，人工检查、替换difficult split和组合多个数据源都比JSONL内嵌split更直接。
+- 原预处理每次写`manifest.jsonl`会让后生成的split覆盖先前split；独立`train.txt/val.txt/test.txt`从结构上消除了该冲突。
+- artifact自行携带contract/source identity，split TXT只承担集合选择，避免两处重复维护artifact路径和split字段。
+
+验证：
+
+- `python -m py_compile`覆盖Dataset、VAE data builder、预处理、统计、latent工具和相关测试，通过。
+- TXT数据管线、训练入口与迁移守卫测试：19 passed。
+- 合成native rotations端到端测试成功生成`train.txt`、`artifacts/sample.npz`和`motion_stats.npz`。
+- 全部测试：50 passed。
+- `python train_vae.py --config configs/vae.yaml`在缺少真实statistics时仍按设计于Trainer/GPU初始化前抛出`MOTION_STATISTICS_REQUIRED`。
+- 全仓活跃配置、工具、Dataset、测试和设计文档搜索不再存在`manifest_path`、`--manifest`或`manifest.jsonl`协议引用；`git diff --check`通过。
+
+涉及文件：
+
+- `configs/vae.yaml`
+- `datasets/__init__.py`
+- `datasets/strict4.py`
+- `utils/training/vae/data.py`
+- `tools/preprocess_strict4_smpl.py`
+- `tools/compute_vae_stats.py`
+- `tools/pretokenize_body_latents.py`
+- `tests/test_vae_data_pipeline.py`
+- `tests/test_vae_training.py`
+- `README.md`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 需要获得与HumanML sample id对应的原生SMPL/AMASS rotations，分别用现有HumanML train/val/test TXT生成`HumanML3D_strict4`目录；缺少native NPZ的HumanAct12样本应通过显式过滤列表或`--skip-missing`排除并审核数量。
+- 数据生成完成后计算真实`motion_stats.npz`，设置`STRICT4_MOTION_STATS`并执行三卡短DDP smoke run。
+
+## 2026-07-15 · 移除Strict4迁移命名并统一Motion Dataset接口
+
+类型：命名与公共接口迁移 / Dataset / VAE合同 / 工具 / 配置 / 测试 / 文档
+
+实际改动内容：
+
+- 将`datasets/strict4.py`迁移为`datasets/motion.py`，公共类和collate函数改为`MotionDataset`与`collate_motion`；`load_artifact_records()`继续作为不同来源数据共享的processed-motion解析层。
+- 将原生旋转预处理入口迁移为`tools/preprocess_smpl_motion.py`，同步移除Dataset、统计工具、latent工具、错误消息和测试中的Strict4迁移名称。
+- 正式VAE配置改为加载`datasets.motion.MotionDataset`，motion statistics环境变量从`STRICT4_MOTION_STATS`改为`MOTION_STATS`。
+- 将底层`Strict4CausalVAE`改名为`CausalBodyVAE`，artifact contract version从`strict4-body265-v1`升级为`body265-v1`；旧迁移期artifact会因version mismatch被明确拒绝，不会静默混用。
+- 将训练/Web迁移守卫统一改为`BLOCKED_ON_BODY_VAE`，并更新README、架构文档、Web状态与测试名称。
+- 保留`FRAMES_PER_TOKEN = 4`、四帧整除校验、token对齐crop/padding和对应测试；本次只移除多余命名，不改变四帧协议及数值实现。
+- 历史日志中的旧名称保持原样，以保留当时的真实开发状态；本条目取代其中关于当前环境变量、文件路径和fail-fast状态的后续指引。
+
+改动理由：
+
+- 四帧一token已经是Floodcontrol唯一有效的模型合同，不应继续作为可选模式渗透到类名、文件名、环境变量和错误码。
+- `MotionDataset`表达的是统一root5/body265 artifact消费层；HumanML3D、BABEL等模块负责各自来源适配，避免在每个来源Dataset中重复crop、augmentation、mask和collate协议。
+- 版本名使用`body265-v1`描述artifact本身，比使用迁移阶段名称更稳定，也能通过显式version bump防止新旧artifact误用。
+
+验证：
+
+- `python -m py_compile`覆盖Motion Dataset、BodyVAE、预处理、统计、latent工具及迁移守卫，通过。
+- VAE contract、数据管线、模型、loss、训练配置和迁移守卫定向测试：35 passed。
+- 全部测试：50 passed。
+- 除本开发日志历史记录外，全仓搜索不存在活跃`strict4/STRICT4`名称、旧Dataset导入、旧预处理入口、旧底层VAE类、旧环境变量或旧fail-fast状态。
+
+涉及文件：
+
+- `datasets/motion.py`、`datasets/__init__.py`、`datasets/humanml3d.py`、`datasets/babel.py`
+- `configs/vae.yaml`、`configs/stream.yaml`
+- `models/vae_wan_1d.py`、`models/tools/wan_vae_1d.py`、`utils/conditions/vae.py`
+- `tools/preprocess_smpl_motion.py`、`tools/compute_vae_stats.py`、`tools/pretokenize_body_latents.py`
+- `train_ldf.py`、`web_demo/`、`metrics/stream.py`
+- `tests/test_token_frame_contract.py`及VAE/迁移相关测试
+- `README.md`、`docs/rearchitecture/`、`docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 使用HumanML3D/BABEL split TXT和对应原生SMPL/AMASS rotations生成`body265-v1` motion artifacts。
+- 仅从train split计算真实`motion_stats.npz`，设置`MOTION_STATS`后执行三卡短DDP smoke run。
+
+## 2026-07-15 · HumanML3D 263D正式接入BodyVAE数据协议
+
+类型：数据源决策修正 / motion codec / 预处理 / yaw增强与统计 / 配置 / 测试 / 文档
+
+实际改动内容：
+
+- 撤销此前“真实训练必须等待原生SMPL/AMASS rotations、不得使用HumanML263”的阻塞决策；第一版正式数据源改为现有HumanML3D `new_joint_vecs/*.npy`，artifact显式记录`source_representation=humanml3d-263-ik-v1`，不把IK-derived rotations描述为原生pose。
+- 在`utils/motion_representation.py`实现`humanml263_to_root_body_motion()`：从root增量恢复物理root xyz与完整yaw，从RIC字段恢复global joint positions，将21个IK-derived local rotation6d按HumanML22层级组合为22个global rotations，并重新计算global backward joint velocity（m/s）。旧263D的heading-local forward velocity不直接复用，contacts原样保留。
+- 显式区分HumanML root quaternion的三个语义：RIC/world position使用inverse quaternion，root5 heading使用`root_quat_to_physical_yaw()`的完整角与符号约定，IK global rotation沿用HumanML官方rotation-FK的root quaternion；避免把半角、physical yaw和rotation监督混为一体。
+- 将原生SMPL预处理入口替换为`tools/preprocess_humanml3d.py`，读取现有split TXT与`new_joint_vecs/<id>.npy`，在独立`HumanML3D_motion`目录写入`body265-v1` artifacts和对应train/val/test TXT。工具拒绝输出到legacy HumanML3D根目录，防止覆盖baseline split。
+- 正式VAE配置切换到`${dirs.raw_data}/HumanML3D_motion/{train,val,test}.txt`；Dataset和training builder的fail-fast语义改为`MOTION_ARTIFACT_DATA_REQUIRED`，不再声称需要native rotations。
+- 保留训练期每次采样`Uniform(0,2π)`全局yaw：同一角度同步旋转root xz/heading、root-relative positions、global rotations、global velocities和previous-root boundary；contacts与validity保持不变。crop首帧原始yaw无论是否为零，加上独立均匀角后都服从均匀分布；current-heading-local root velocity保持不变量。
+- motion statistics对每条train motion使用`0/90/180/270`度四点quadrature。所有受yaw影响的标量通道都是cos/sin的线性组合，因此四点法精确匹配连续均匀yaw的一阶与逐维二阶矩，同时避免随机统计结果；metadata记录`yaw_statistics=uniform-four-point-quadrature-v1`与实际source representation。
+- 更新数据/VAE/模型/Web文档、README、迁移守卫文本、正式配置合同和数据集成测试，明确HumanML263只承担离线物理表示来源，不重新成为VAE/LDF运行时接口。
+
+改动理由：
+
+- 原生AMASS rotations是更高质量的数据来源，但不是BodyVAE结构成立的数学前提；为了建立可训练第一版而阻塞于当前不存在的AMASS源数据并不合理。
+- 现有HumanML263已经包含root增量、RIC positions、21个IK rotation6d、velocities和contacts，足以显式转换为同构root5/body265；明确记录rotation来源即可控制数据质量风险。
+- 将263D先离线转换成版本化artifact，能够保持新版模型接口纯净，并避免每个DataLoader worker重复执行root积分、rotation composition和velocity重算。
+- 随机yaw若只修改样本而仍使用canonical-yaw统计，会造成训练分布和归一化统计不一致；确定性四点quadrature消除了该错位。
+
+验证：
+
+- `python -m py_compile`覆盖motion codec、MotionDataset、HumanML预处理、statistics和VAE data builder，通过。
+- 合成HumanML263测试覆盖root/body shape、root积分、global backward velocity、contacts、physical yaw与IK root rotation约定、artifact加载、随机yaw全feature同步和local-root不变量。
+- 真实`000000.npy`验证：恢复joint positions与现有HumanML RIC恢复最大误差为0；global rotation矩阵正交误差约`4.8e-7`；全部root/body值有限。
+- HumanML官方rotation-FK与RIC恢复在真实样本上的joint position最大差约`8.0e-7`，确认rotation composition约定一致。
+- 真实`000021`模块入口smoke成功生成motion artifact和全部四组statistics；metadata正确记录`body265-v1`、`humanml3d-263-ik-v1`和yaw quadrature。
+- 数据完整性扫描：HumanML train/val/test分别包含23384/1460/4384个sample id，`new_joint_vecs`缺失数均为0。
+- 全部测试：53 passed；仅有测试环境无法初始化NVML的PyTorch warning。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `utils/motion_representation.py`
+- `tools/preprocess_humanml3d.py`、`tools/compute_vae_stats.py`
+- `datasets/motion.py`、`utils/training/vae/data.py`
+- `configs/vae.yaml`
+- `tests/test_vae_data_pipeline.py`、`tests/test_vae_training.py`
+- `README.md`、`docs/rearchitecture/`、`train_ldf.py`、`web_demo/`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 在`/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion`完成train/val/test全量artifact构建；本轮只在`/tmp`完成真实单样本smoke，未写入共享数据目录。
+- 用全量train artifacts计算正式`motion_stats.npz`并设置`MOTION_STATS`。
+- 对转换后的rotation-FK与position target做数据集级误差分布抽检，再执行GPU 2/3/4短DDP overfit/吞吐smoke；根据验证曲线决定是否后续升级为原生AMASS rotation监督。
+
+## 2026-07-15 · VAE训练运行时装配迁回train_vae入口
+
+类型：训练入口重构 / 文件删除 / 公共导出清理 / 测试
+
+实际改动内容：
+
+- 物理删除`utils/training/vae/runner.py`，不再用额外runner模块隐藏VAE训练的顶层执行流程。
+- 将配置加载与statistics fail-fast、seed、DataLoader装配、run目录与代码快照、WandB logger、checkpoint callback、Lightning Trainer以及fit/validate分支全部迁入`train_vae.py`。
+- `utils/training/vae/`继续只拥有模型专用组件：`data.py`、`lightning_module.py`和`losses.py`；移除`run_vae_training`在`utils.training.vae`与`utils.training`中的跨层导出。
+- 训练入口公共函数统一为`train_vae.main()`，脚本执行与测试调用同一实现。
+- 更新训练结构测试，要求`train_vae.py`可直接看到Trainer/DataLoader/LightningModule装配，同时继续禁止在入口文件内重新实现`VAELightningModule`。
+
+改动理由：
+
+- 当前runner只有一个调用方，把完整训练装配藏在额外文件中使入口过薄，并增加无实际复用价值的跳转层。
+- 模型、loss和数据构建仍保持模块化，而实验级生命周期装配放在顶层入口，更便于审阅训练究竟如何启动、恢复、记录和验证。
+
+验证：
+
+- `python -m py_compile`覆盖新`train_vae.py`、training package exports和训练测试，通过。
+- VAE训练入口与迁移守卫定向测试：17 passed。
+- 全部测试：53 passed；仅有测试环境无法初始化NVML的PyTorch warning。
+- 全仓活跃代码搜索不存在`run_vae_training`或`training.vae.runner`引用。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `train_vae.py`
+- `utils/training/vae/runner.py`（删除）
+- `utils/training/vae/__init__.py`
+- `utils/training/__init__.py`
+- `tests/test_vae_training.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 全量构建`HumanML3D_motion` artifacts与statistics后，从新入口执行单卡overfit smoke和GPU 2/3/4三卡DDP smoke。
+
+## 2026-07-15 · HumanML3DDataset直接接管processed motion artifacts
+
+类型：Dataset职责收敛 / legacy删除 / 公共命名迁移 / 配置与工具更新 / 测试
+
+实际改动内容：
+
+- 删除旧`datasets/humanml3d.py`中的263D、旧VAE token、trajectory/ControlNet条件和文本拼装实现；新版训练不再保留这一未使用的legacy Dataset。
+- 将`datasets/motion.py`的root5/body265 artifact加载、四帧对齐crop、translation rebase、previous-root boundary、随机全局yaw与collate逻辑迁入`datasets/humanml3d.py`，随后物理删除`datasets/motion.py`。
+- 公共接口统一为`HumanML3DDataset`、`collate_humanml3d()`和`load_humanml3d_records()`；正式VAE配置切换为`datasets.humanml3d.HumanML3DDataset`。
+- statistics与deterministic-latent工具同步改从`datasets.humanml3d`读取HumanML artifact records。
+- 测试全部迁移到新接口；Dataset fail-fast测试显式使用临时缺失路径，不再依赖本机是否已经生成真实`HumanML3D_motion`。
+- 设计文档将通用motion artifact Dataset表述收敛为已实现的`HumanML3DDataset`。
+
+改动理由：
+
+- 当前VAE正式数据源已经冻结为`HumanML3D_motion`，泛化的`MotionDataset`只增加一层不必要的抽象，而旧`HumanML3DDataset`又已完全脱离新版训练路径。
+- 让source-specific Dataset直接消费其versioned processed artifacts，能够使文件名、类名、磁盘数据产品和配置target保持一致；未来BABEL可实现自己的Dataset并输出相同batch contract。
+- 磁盘目录仍使用`HumanML3D_motion`与FloodDiffusion legacy数据隔离；Python侧`HumanML3DDataset`默认即代表新版root5/body265协议，不需要额外Motion后缀。
+
+验证：
+
+- `python -m py_compile`覆盖HumanML3DDataset、exports、statistics/latent工具及相关测试，通过。
+- HumanML数据管线、训练配置和迁移守卫定向测试：23 passed。
+- 全部测试：53 passed；仅有测试环境无法初始化NVML的PyTorch warning。
+- `datasets/motion.py`物理不存在；除历史开发日志外，全仓不存在活跃`datasets.motion`、`MotionDataset`、`collate_motion`或`load_artifact_records`引用。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `datasets/humanml3d.py`
+- `datasets/motion.py`（删除）
+- `datasets/__init__.py`
+- `configs/vae.yaml`
+- `tools/compute_vae_stats.py`、`tools/pretokenize_body_latents.py`
+- `tests/test_vae_data_pipeline.py`、`tests/test_vae_training.py`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 使用全量train artifacts生成正式motion statistics并执行VAE训练smoke。
+- 接入BABEL时新增独立`BABELDataset`，复用VAE batch contract而不恢复旧HumanML trajectory/token分支。
+
+## 2026-07-15 · HumanML3D一键数据构建与正式统计完成
+
+类型：数据构建器 / 断点续跑 / 外部数据产品 / 正式配置 / 测试 / 文档
+
+实际改动内容：
+
+- 将`tools/preprocess_humanml3d.py`增强为一键构建入口：从一个legacy HumanML3D根目录自动读取`new_joint_vecs`和train/val/test TXT，在独立`HumanML3D_motion`目录生成全部artifact及目标split。
+- 增加多进程`--workers`、contract/source hash校验与断点续跑；已有artifact仅在`body265-v1`、`humanml3d-263-ik-v1`和source SHA256全部一致时跳过，源数据变化时自动重建。
+- artifact和目标split均采用临时文件后原子replace；中断不会留下被目标split引用的半写文件。构建结束写入`build_summary.json`，记录split、missing、too-short、converted/skipped和帧数。
+- 在全量构建遇到真实短样本后，将长度/shape检查提升到任务执行前的全量预检；默认`min_frames=20`与VAE训练合同一致，过短样本从目标split显式排除并按split计数，而不是让DataLoader阶段逐样本失败。
+- 正式配置的`motion_stats_path`改为`${dirs.raw_data}/HumanML3D_motion/motion_stats.npz`，与数据split一样使用稳定配置路径，不再要求训练前设置环境变量。
+- 在本机共享数据目录完成全量构建：目标split为train 23240、val 1450、test 4358，共29048个唯一artifact，目录约3.8 GB；源文件缺失为0，少于20帧而排除的样本为train 144、val 10、test 26。
+- 使用train目标split生成正式`motion_stats.npz`；statistics metadata记录`body265-v1`、`humanml3d-263-ik-v1`、HumanML22、train split hash和`uniform-four-point-quadrature-v1`。
+- 删除首次中断构建遗留的8个过短且未被任何目标split引用的artifact；最终artifact集合与三个split引用并集均为29048，无缺失、无临时文件、无孤儿文件。
+- 更新README和rearchitecture状态：本地HumanML motion artifacts/statistics已经就绪，剩余阻塞转为GPU训练、正式VAE checkpoint、latent artifacts和Web/runtime接线。
+
+改动理由：
+
+- `${dirs.raw_data}/HumanML3D_motion/train.txt`是预处理成功后的数据产品，不应要求用户预先手工创建或复制源split；只有构建器确认artifact成功后才可以原子发布目标split。
+- 全量数据构建属于长任务，必须可验证、可恢复且不会因中断污染训练集合；source hash和atomic publish保证重复运行安全。
+- 原始HumanML split确实包含少于VAE最短训练长度的样本，预检过滤比在随机训练过程中抛错更稳定，也使排除数量可审计。
+- statistics已是正式数据产品且位置固定，直接在配置中引用比环境变量更可复现。
+
+验证：
+
+- 构建器合成测试覆盖三split一次构建、重复运行跳过、source变更重建、短样本过滤、atomic artifact和statistics metadata。
+- 全量构建summary：29048 unique artifacts，28132本轮转换、916断点复用；转换帧数3929200（不含复用artifact）。
+- statistics六组数组shape正确、全部finite、全部std严格为正；global heading/xz在yaw quadrature后的mean接近0。
+- `HumanML3DDataset`真实装配：train/val为23240/1450；`num_workers=0` smoke成功读取batch `[32,196,265]`、root `[32,196,5]`并实例化20,212,004参数的`BodyVAE`。
+- 配置中的8-worker DataLoader在Codex受限沙箱因进程间socket权限失败；这是沙箱限制，未修改正式`num_workers: 8`，zero-worker同数据路径验证通过。
+- 全部测试：53 passed；仅有测试环境无法初始化NVML的PyTorch warning。
+- artifact文件数与split唯一引用数均为29048；`git diff --check`通过。
+
+涉及文件与数据产品：
+
+- `tools/preprocess_humanml3d.py`
+- `configs/vae.yaml`
+- `tests/test_vae_data_pipeline.py`、`tests/test_vae_training.py`
+- `README.md`、`docs/rearchitecture/`、`docs/DEVELOPMENT_LOG.md`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/`
+
+尚未完成的后续事项：
+
+- 在GPU 2/3/4运行短DDP VAE smoke，验证8-worker真实吞吐、显存峰值、loss反传和checkpoint写入。
+- 通过短样本overfit与validation reconstruction检查rotation/position/velocity/contact四个block的数值尺度，再决定是否启动300k正式训练。
+
+## 2026-07-15 · HumanML3D artifact合同补全与静默截断清理
+
+类型：Dataset fail-fast / 数据合同校验 / yaw工具收敛 / 测试
+
+实际改动内容：
+
+- `HumanML3DDataset`现在只接受`train/val/test`，并要求`min_frames`和`max_frames`为不小于4的四帧整数倍，不再静默向下取整配置。
+- artifact加载时完整检查contract version、HumanML source representation、期望FPS、root/body/mask shape、共享帧长、四帧整除、finite值及可选`previous_root_frame [5]`。
+- 删除`min(root_len, body_len)//4*4`容错；root/body长度不一致或artifact非四帧对齐时立即失败，损坏数据不能进入crop或collate。
+- 将`humanml3d-263-ik-v1`收敛为motion representation层共享常量，预处理器和Dataset使用同一来源。
+- 增加`rotate_root_yaw()`；随机yaw处理boundary root时不再伪造body输入或执行被丢弃的第二次body旋转。
+- VAE Dataset装配从模型配置传入期望FPS，确保artifact物理时间单位与VAE local-root计算一致。
+- 新增反例测试，覆盖split拼写、非四帧配置、长度不一致、7帧artifact、错误mask、30 FPS、错误source、NaN和错误boundary shape。
+
+改动理由：
+
+- 四帧协议、FPS和source representation属于训练数据的硬合同；静默截断会掩盖预处理损坏，并可能把不同物理时间单位的数据混入同一统计和训练过程。
+- `previous_root_frame`只需要root yaw变换，独立工具能直接表达该语义并避免无意义的body二次变换。
+
+验证：
+
+- Dataset、VAE训练和VAE contract定向测试：24 passed。
+- 全部测试：61 passed。
+- 正式train split真实batch smoke：23240个样本，batch body `[32,172,265]`、root `[32,172,5]`，有效长度20–172帧。
+- `python -m py_compile`覆盖Dataset、motion representation、训练数据装配、预处理器与新增测试，通过。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `datasets/humanml3d.py`
+- `utils/motion_representation.py`
+- `utils/training/vae/data.py`
+- `tools/preprocess_humanml3d.py`
+- `tests/test_vae_data_pipeline.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 在GPU 2/3/4执行短DDP训练smoke，验证多worker读取、完整loss反传、显存和checkpoint流程。
+
+## 2026-07-15 · 恢复配置内WandB认证并修复VAE logger接线
+
+类型：训练配置修复 / logger接线 / 回归测试
+
+实际改动内容：
+
+- 在`configs/paths_default.yaml`恢复旧版`wandb_info.key/project/entity`配置，训练无需额外设置`WANDB_API_KEY`环境变量。
+- `train_vae._create_logger()`改为直接读取`cfg.wandb_info`；key存在时写入当前进程的`WANDB_API_KEY`并创建`WandbLogger`，debug模式或缺少配置/key时才回退到Lightning本地logger。
+- `configs/vae.yaml`不再维护另一套`logger.wandb`结构，避免`wandb_info`与`logger`字段不匹配导致logger被静默禁用。
+- 正式配置测试增加`wandb_info`断言；新增logger构造测试，通过替换`WandbLogger`验证project、entity、run name和key接线，不访问外部网络。
+
+改动理由：
+
+- 此前`paths_default.yaml`提供`wandb_info`，而训练入口检查`logger.wandb`，导致`_create_logger()`直接返回`None`，训练只产生本地TensorBoard events而不上传WandB。
+- 按当前项目约定恢复旧版配置内认证方式，使已有配置无需额外shell环境即可启动在线记录。
+
+验证：
+
+- `python -m py_compile train_vae.py tests/test_vae_training.py`通过。
+- VAE训练配置与迁移守卫定向测试：18 passed。
+- 全部测试：60 passed；仅有测试环境无法初始化NVML的PyTorch warning。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `configs/paths_default.yaml`
+- `configs/vae.yaml`
+- `train_vae.py`
+- `tests/test_vae_training.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 重新启动GPU 2/3/4训练，确认控制台出现`WandB logging enabled`及WandB run URL，并完成短DDP smoke。

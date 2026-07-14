@@ -13,14 +13,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_tiny_core_config_instantiates_public_ldf():
-    cfg = load_config(str(ROOT / "configs" / "ldf_core_tiny.yaml"))
+    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
     model = instantiate(cfg.model.target, cfg=None, **cfg.model.params)
     assert isinstance(model, LDF)
 
 
 def test_tiny_vae_config_instantiates_public_body_vae():
-    cfg = load_config(str(ROOT / "configs" / "vae_strict4_tiny.yaml"))
-    model = instantiate(cfg.model.target, cfg=None, **cfg.model.params)
+    cfg = load_config(str(ROOT / "configs" / "vae.yaml"))
+    params = dict(cfg.model.params)
+    params.update(
+        motion_stats_path=None,
+        latent_stats_path=None,
+        allow_identity_statistics=True,
+        require_latent_statistics=False,
+    )
+    model = instantiate(cfg.model.target, cfg=None, **params)
     assert isinstance(model, BodyVAE)
 
 
@@ -32,15 +39,15 @@ def test_legacy_vae_config_and_class_are_removed():
 
 
 def test_training_entry_is_explicitly_blocked():
-    with pytest.raises(RuntimeError, match="BLOCKED_ON_STRICT4_VAE"):
+    with pytest.raises(RuntimeError, match="BLOCKED_ON_BODY_VAE"):
         train_main()
-    assert "strict four-frame body VAE" in TRAINING_MIGRATION_ERROR
+    assert "four-frame body VAE" in TRAINING_MIGRATION_ERROR
 
 
 def test_web_entry_is_explicitly_blocked():
-    with pytest.raises(RuntimeError, match="BLOCKED_ON_STRICT4_VAE"):
+    with pytest.raises(RuntimeError, match="BLOCKED_ON_BODY_VAE"):
         get_model_manager()
-    assert "strict four-frame body VAE" in WEB_MIGRATION_ERROR
+    assert "four-frame body VAE" in WEB_MIGRATION_ERROR
 
 
 @pytest.mark.parametrize(

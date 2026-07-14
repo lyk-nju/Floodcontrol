@@ -1,6 +1,6 @@
 # 01 模型结构与输入输出
 
-状态：`LDF_AND_STRICT4_VAE_CORE_IMPLEMENTED / DATA_AND_RUNTIME_OPEN`
+状态：`LDF_AND_BODY_VAE_CORE_IMPLEMENTED / DATA_AND_RUNTIME_OPEN`
 
 ## 设计顺序与文档顺序
 
@@ -54,7 +54,7 @@ coordinate/value types
 ## 第一遍：自上而下的架构讨论顺序
 
 1. 冻结目标能力与非目标：text-only motion、结构化 root 生成、body fidelity、精确/稀疏空间约束、长时 streaming、在线条件更新，以及 V1 明确不解决的能力。
-2. 冻结总体生成范式：`explicit root + latent body` 是否是唯一 clean generative state；trajectory 是否完全从附加 ControlNet 条件提升为 root observation；是否保留 strict-4 与 persistent triangular diffusion forcing。
+2. 冻结总体生成范式：`explicit root + latent body` 是否是唯一 clean generative state；trajectory 是否完全从附加 ControlNet 条件提升为 root observation；是否保留四帧token协议与 persistent triangular diffusion forcing。
 3. 冻结顶层模块图和责任边界：body tokenizer/VAE、root stage、body stage、observation projection、scheduler/update，以及哪些功能属于 runtime 而不是模型。
 4. 冻结训练与推理的顶层 dataflow：clean history、noisy generation、future goals 如何进入模型；每个 denoising step 如何先 root 后 body；最终 commit 输出什么。
 5. 冻结顶层模型调用接口和主要结构化返回值，不在这一步决定所有内部维度。
@@ -91,11 +91,11 @@ coordinate/value types
 - `models/diffusion_forcing_wan.py` 已公开 `RootTransformer/BodyTransformer/LDF`，两阶段不出现在公共文件名或类名中。
 - `generate/stream_generate/stream_generate_step` 已迁移为显式 `HybridMotion/LDFStreamState`，并通过合成张量的commit、rolling和snapshot/restore测试。
 - 旧附加控制网络、专用轨迹编码器、专用attention、tiny模型和外置root planner已经物理删除；constraint CFG由主干接管。
-- strict4 body VAE核心、`body265 -> latent_motion`和显式`VAEDecoderState`已经实现；原生SMPL rotations数据、正式checkpoint/latent artifacts与Web接线尚未完成，因此真实LDF训练与Web生成仍明确阻断。
+- body VAE核心、HumanML263到body265转换、全量本地motion artifacts/statistics、`body265 -> latent_motion`和显式`VAEDecoderState`已经实现；正式checkpoint/latent artifacts与Web接线尚未完成，因此真实LDF训练与Web生成仍明确阻断。
 
 ### 删除状态
 
-上述旧模块删除门槛已经由新版forward、CFG、Hybrid stream与全仓残留搜索满足。VAE/data尚未满足端到端门槛，因此训练和Web使用fail-fast，而不是用旧263D VAE建立临时适配层。
+上述旧模块删除门槛已经由新版forward、CFG、Hybrid stream与全仓残留搜索满足。VAE/data尚未满足端到端门槛，因此训练和Web使用fail-fast；HumanML263只作为离线物理表示来源，不作为新版VAE或LDF的运行时接口。
 
 ## 在线因果性不等于 LDF causal attention
 

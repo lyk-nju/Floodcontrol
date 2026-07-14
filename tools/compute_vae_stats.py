@@ -1,4 +1,4 @@
-"""Compute train-split root/local-root/body statistics for strict4 artifacts."""
+"""Compute train-split root/local-root/body statistics for motion artifacts."""
 
 from __future__ import annotations
 
@@ -10,8 +10,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from datasets.humanml3d import load_humanml3d_records
 from utils.conditions.vae import BODY_CONTINUOUS_DIM, CONTRACT_VERSION
-from utils.motion_representation import MotionStatistics, derive_patched_local_root
+from utils.motion_representation import (
+    MotionStatistics,
+    derive_patched_local_root,
+    rotate_root_body_yaw,
+)
 
 
 class Accumulator:
@@ -37,44 +42,73 @@ class Accumulator:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--train-meta-paths", nargs="+", required=True)
+    parser.add_argument("--artifact-path", default="artifacts")
     parser.add_argument("--output", required=True)
     parser.add_argument("--fps", type=float, default=20.0)
     args = parser.parse_args()
-    manifest = Path(args.manifest)
-    if not manifest.is_file():
-        raise RuntimeError("STRICT4_NATIVE_ROTATIONS_REQUIRED: strict4 manifest is missing")
-    root_acc, local_acc, body_acc = Accumulator(5), Accumulator(4), Accumulator(BODY_CONTINUOUS_DIM)
-    records = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
-    train = [record for record in records if record.get("split") == "train"]
-    if not train:
-        raise RuntimeError("statistics must be computed from a non-empty train split")
-    for record in train:
-        if record.get("contract_version") != CONTRACT_VERSION:
-            raise ValueError("manifest contract version mismatch")
-        with np.load(manifest.parent / record["artifact"], allow_pickle=False) as data:
+    root_acc = Accumulator(5)
+    local_acc = Accumulator(4)
+    body_acc = Accumulator(BODY_CONTINUOUS_DIM)
+    records = load_humanml3d_records(
+        args.train_meta_paths, artifact_path=args.artifact_path
+    )
+    source_representations: set[str] = set()
+    yaw_quadrature = torch.arange(4, dtype=torch.float32) * (torch.pi / 2)
+    for record in records:
+        with np.load(Path(record["artifact"]), allow_pickle=False) as data:
+            if (
+                "contract_version" not in data
+                or str(np.asarray(data["contract_version"]).item())
+                != CONTRACT_VERSION
+            ):
+                raise ValueError("motion artifact contract version mismatch")
             root = torch.from_numpy(data["root_motion"]).float()[None]
             body = torch.from_numpy(data["body_motion"]).float()[None]
             body_valid = torch.from_numpy(data["body_feature_valid_mask"]).bool()[None]
-        root_acc.update(root, torch.ones_like(root, dtype=torch.bool))
+            source_representations.add(
+                str(np.asarray(data["source_representation"]).item())
+                if "source_representation" in data else "unknown"
+            )
+        # Training samples receive a fresh uniform global yaw. Four quarter-turn
+        # quadrature points exactly match the first and per-feature second moments
+        # of every x/z vector, heading pair, and global rotation column under a
+        # continuous uniform yaw, without making statistics nondeterministic.
+        for angle in yaw_quadrature:
+            rotated_root, rotated_body = rotate_root_body_yaw(
+                root, body, angle.reshape(1)
+            )
+            root_acc.update(
+                rotated_root, torch.ones_like(rotated_root, dtype=torch.bool)
+            )
+            body_acc.update(
+                rotated_body[..., :BODY_CONTINUOUS_DIM],
+                body_valid[..., :BODY_CONTINUOUS_DIM],
+            )
         local, local_valid = derive_patched_local_root(root, None, fps=args.fps)
         local_acc.update(local, local_valid)
-        body_acc.update(body[..., :BODY_CONTINUOUS_DIM], body_valid[..., :BODY_CONTINUOUS_DIM])
     root_mean, root_std = root_acc.finish()
     local_mean, local_std = local_acc.finish()
     body_mean, body_std = body_acc.finish()
-    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    for meta_value in args.train_meta_paths:
+        meta_path = Path(meta_value)
+        digest.update(str(meta_path.resolve()).encode())
+        digest.update(meta_path.read_bytes())
     MotionStatistics(
         root_mean, root_std, local_mean, local_std, body_mean, body_std,
         metadata={
             "contract_version": CONTRACT_VERSION,
             "split": "train",
             "fps": args.fps,
-            "manifest_sha256": digest,
-            "skeleton": "humanml22-native-rotations-v1",
+            "train_meta_sha256": digest.hexdigest(),
+            "train_meta_paths": [str(Path(path)) for path in args.train_meta_paths],
+            "skeleton": "humanml22-v1",
+            "source_representations": sorted(source_representations),
+            "yaw_statistics": "uniform-four-point-quadrature-v1",
         },
     ).save(args.output)
-    print(f"wrote strict4 motion statistics to {args.output}")
+    print(f"wrote motion statistics to {args.output}")
 
 
 if __name__ == "__main__":

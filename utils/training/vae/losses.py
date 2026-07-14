@@ -1,4 +1,4 @@
-"""Losses for the strict-4 body VAE."""
+"""Optimization losses for the body VAE."""
 
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ class VAELoss(nn.Module):
         lambda_velocity: float = 1.0,
         lambda_contact: float = 1.0,
         lambda_skating: float = 0.01,
-        beta_kl: float = 1e-4,
-        kl_warmup_steps: int = 50_000,
+        beta_kl: float = 1e-5,
+        kl_warmup_steps: int = 0,
         foot_joint_indices: tuple[int, int, int, int] = (7, 10, 8, 11),
         lambda_geodesic: float = 0.0,
         lambda_fk: float = 0.0,

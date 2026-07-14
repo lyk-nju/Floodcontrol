@@ -19,7 +19,7 @@ def make_local(batch=2, tokens=3):
     return local, valid
 
 
-def test_strict4_shapes_and_deterministic_tokenize():
+def test_four_frame_shapes_and_deterministic_tokenize():
     model = make_model()
     body = torch.randn(2, 12, 265)
     body[..., 261:] = torch.randint(0, 2, body[..., 261:].shape).float()

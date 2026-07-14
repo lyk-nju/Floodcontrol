@@ -1,4 +1,4 @@
-"""Strict four-frame token/frame mapping.
+"""Four-frame token/frame mapping.
 
 Token ``k`` always covers the half-open frame range ``[4k, 4(k+1))``.
 There is no first-token special case.

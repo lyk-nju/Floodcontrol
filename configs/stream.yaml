@@ -1,11 +1,10 @@
-status: BLOCKED_ON_STRICT4_VAE
+status: BLOCKED_ON_BODY_VAE
 message: >-
   The legacy full-motion stream runtime was removed. Re-enable this entry only
-  after the strict four-frame body VAE, create_window_condition route compiler,
+  after the four-frame body VAE, create_window_condition route compiler,
   and commit-time decoder transaction are implemented.
 
 traj_mask:
   route_mode: relative_to_actor
   token_dt: 0.20
   horizon_tokens: 20
-

@@ -53,7 +53,7 @@ class MotionApp {
         this.updateStatus();
         this.setupBeforeUnload();
 
-        console.log('Floodcontrol web_demo JS build: strict4-runtime-blocked');
+        console.log('Floodcontrol web_demo JS build: body-vae-runtime-blocked');
         console.log('Session ID:', this.sessionId);
     }
 

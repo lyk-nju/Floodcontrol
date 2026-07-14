@@ -1,10 +1,9 @@
 dirs:
-    deps: "${oc.env:FLOODCONTROL_DEPS,./deps}"
-    outputs: "${oc.env:FLOODCONTROL_OUTPUTS,./outputs}"
-    raw_data: "${oc.env:FLOODCONTROL_DATA,./data}"
+    deps: "/data1/yuankai/text2Motion/FloodDiffusion/deps"
+    outputs: "/data1/yuankai/text2Motion/FloodDiffusion/outputs"
+    raw_data: "/data1/yuankai/text2Motion/FloodDiffusion/raw_data"
 
-# Credentials are runtime state and must never be committed to this repository.
 wandb_info:
-    key: "${oc.env:WANDB_API_KEY,}"
-    project: "Floodcontrol"
-    entity: "${oc.env:WANDB_ENTITY,}"
+    key: "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"
+    project: "VAE_Flood"
+    entity: "laiyuankia-nanjing-university"

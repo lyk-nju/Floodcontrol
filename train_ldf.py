@@ -4,9 +4,9 @@ from __future__ import annotations
 
 
 TRAINING_MIGRATION_ERROR = (
-    "Floodcontrol LDF training is BLOCKED_ON_STRICT4_VAE: the model core is "
-    "available and the strict four-frame body VAE code is implemented, but no "
-    "frozen native-rotation VAE checkpoint, verified latent statistics, or hybrid "
+    "Floodcontrol LDF training is BLOCKED_ON_BODY_VAE: the model core is "
+    "available and the four-frame body VAE code is implemented, but no "
+    "frozen BodyVAE checkpoint, verified latent statistics, or hybrid "
     "training artifacts are connected."
 )
 

@@ -10,7 +10,7 @@ from utils.token_frame import (
 )
 
 
-def test_strict4_mapping_has_no_first_token_exception():
+def test_four_frame_mapping_has_no_first_token_exception():
     assert token_start_frame(0) == 0
     assert token_start_frame(1) == 4
     assert num_frames_for_tokens(1) == 4

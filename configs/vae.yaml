@@ -1,15 +1,16 @@
-exp_name: vae_strict4_body265
+exp_name: vae_body265
 seed: 1234
 debug: false
 train: true
-save_dir: ./outputs
+save_dir: /data1/yuankai/text2Motion/Floodcontrol/vae
 resume_ckpt: null
 test_ckpt: null
 
 trainer:
-  max_steps: 4000000
+  max_steps: 300000
   accelerator: gpu
-  devices: [0]
+  devices: 3
+  strategy: ddp
   log_every_n_steps: 50
 validation:
   validation_steps: 1000
@@ -18,12 +19,18 @@ validation:
   save_top_k: 20
 
 data:
-  target: datasets.strict4.Strict4ArtifactDataset
-  collate_fn: datasets.strict4.collate_strict4
-  manifest_path: ${oc.env:STRICT4_MANIFEST,null}
-  train_bs: 128
-  val_bs: 64
-  test_bs: 64
+  target: datasets.humanml3d.HumanML3DDataset
+  collate_fn: datasets.humanml3d.collate_humanml3d
+  train_meta_paths:
+    - ${dirs.raw_data}/HumanML3D_motion/train.txt
+  val_meta_paths:
+    - ${dirs.raw_data}/HumanML3D_motion/val.txt
+  test_meta_paths:
+    - ${dirs.raw_data}/HumanML3D_motion/test.txt
+  artifact_path: artifacts
+  train_bs: 32
+  val_bs: 32
+  test_bs: 32
   num_workers: 8
   min_frames: 20
   max_frames: 200
@@ -40,7 +47,7 @@ model:
     kernel_size: 3
     dropout: 0.0
     fps: 20.0
-    motion_stats_path: ${oc.env:STRICT4_MOTION_STATS,null}
+    motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
     latent_stats_path: null
     allow_identity_statistics: false
     require_latent_statistics: false
@@ -51,12 +58,8 @@ loss:
   lambda_velocity: 1.0
   lambda_contact: 1.0
   lambda_skating: 0.01
-  beta_kl: 1.0e-4
-  kl_warmup_steps: 50000
-  lambda_geodesic: 0.0
-  lambda_fk: 0.0
-  lambda_position_consistency: 0.0
-  lambda_velocity_consistency: 0.0
+  beta_kl: 1.0e-5
+  kl_warmup_steps: 0
 
 optimizer:
   target: AdamW
@@ -66,7 +69,6 @@ optimizer:
     weight_decay: 0.0
     eps: 1.0e-8
 lr_scheduler:
-  target: diffusers.optimization.get_cosine_schedule_with_warmup
+  target: diffusers.optimization.get_constant_schedule_with_warmup
   params:
-    num_warmup_steps: 10000
-    num_training_steps: 4000000
+    num_warmup_steps: 1000

@@ -7,7 +7,7 @@ Welford mean/std over all latent vectors. Output:
     deps/body_stats/z_std.npy    [D] float32
 
 The current Hybrid LDF does not load these files directly. They are retained as
-an offline data utility for the upcoming strict-4 body-latent protocol, whose
+an offline data utility for the body-latent protocol, whose
 normalization owner and final artifact schema are still to be frozen.
 
 CLI:

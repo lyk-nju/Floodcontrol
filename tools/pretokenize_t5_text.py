@@ -1,7 +1,7 @@
 """
 Offline: run UMT5-XXL encoder on every unique caption under cfg.data (HumanML3D/Babel-style texts/*.txt).
 
-调用方必须显式传入包含 ``model.params`` 与 ``data`` 的训练配置。新版strict-4
+调用方必须显式传入包含 ``model.params`` 与 ``data`` 的训练配置。新版four-frame
 训练配置尚未接线，因此本工具不再回退到已经删除的legacy ``configs/ldf.yaml``。
 
 Saves a single .pt file: { "embeddings": { caption_str: FloatTensor[L, 4096] on CPU }, "text_dim": 4096, ... }

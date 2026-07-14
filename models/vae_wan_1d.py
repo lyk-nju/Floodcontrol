@@ -1,4 +1,4 @@
-"""Public strict-4 body VAE wrapper."""
+"""Public body VAE wrapper."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from models.tools.wan_vae_1d import Strict4CausalVAE
+from models.tools.wan_vae_1d import CausalBodyVAE
 from utils.conditions.vae import (
     BODY_CONTINUOUS_DIM,
     BODY_DIM,
@@ -109,7 +109,7 @@ class BodyVAE(nn.Module):
         self.register_buffer("local_root_std", _stat_tensor("local_root_std", local_root_std, LOCAL_ROOT_DIM, positive=True))
         self.register_buffer("latent_mean", _stat_tensor("latent_mean", latent_mean, self.latent_dim))
         self.register_buffer("latent_std", _stat_tensor("latent_std", latent_std, self.latent_dim, positive=True))
-        self.model = Strict4CausalVAE(
+        self.model = CausalBodyVAE(
             latent_dim=self.latent_dim,
             hidden_dim=hidden_dim,
             encoder_layers=encoder_layers,

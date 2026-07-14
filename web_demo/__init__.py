@@ -1,1 +1,1 @@
-"""Floodcontrol web package, blocked until the strict-4 runtime is connected."""
+"""Floodcontrol web package, blocked until the body-VAE runtime is connected."""

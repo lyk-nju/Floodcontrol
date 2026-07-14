@@ -1,347 +1,288 @@
-import os
+"""HumanML3D root5/body265 artifact Dataset."""
+
+from __future__ import annotations
+
+import math
 import random
+from pathlib import Path
+from typing import Iterable
+
 import numpy as np
 import torch
-
-from typing import Dict, List
-from lightning.pytorch.utilities import rank_zero_info
-from omegaconf import OmegaConf
 from torch.utils.data import Dataset
-from tqdm import tqdm
-from utils.motion_process import (
-    extract_root_traj_feats_7d_263,
-    extract_root_trajectory_263,
+
+from utils.conditions.vae import (
+    BODY_DIM,
+    CONTRACT_VERSION,
+    FRAMES_PER_TOKEN,
+    ROOT_DIM,
 )
-from utils.traj_batch import root_to_traj_feats, smooth_root_xz
+from utils.motion_representation import (
+    HUMANML_SOURCE_REPRESENTATION,
+    rotate_root_body_yaw,
+    rotate_root_yaw,
+)
 
 
-class LengthMismatchError(Exception):
-    pass
+SUPPORTED_SPLITS = frozenset({"train", "val", "test"})
+
+
+def _read_scalar(data, name: str, path: Path):
+    if name not in data:
+        raise ValueError(f"motion artifact is missing {name!r} in {path}")
+    value = np.asarray(data[name])
+    if value.shape != ():
+        raise ValueError(f"motion artifact {name!r} must be scalar in {path}")
+    return value.item()
+
+
+def _load_records(
+    meta_paths: Iterable[str | Path],
+    *,
+    artifact_path: str = "artifacts",
+    dataset_label: str,
+) -> list[dict[str, object]]:
+    """Resolve sample-id TXT files to one processed dataset's artifacts."""
+    artifact_subdir = Path(artifact_path)
+    if artifact_subdir.is_absolute() or ".." in artifact_subdir.parts:
+        raise ValueError("artifact_path must be a relative directory")
+    records: list[dict[str, object]] = []
+    for meta_value in meta_paths:
+        meta_path = Path(meta_value)
+        if not meta_path.is_file():
+            raise RuntimeError(
+                "MOTION_ARTIFACT_DATA_REQUIRED: split metadata file not found at "
+                f"{meta_path}. Preprocess {dataset_label} into root5/body265 artifacts."
+            )
+        dataset_name = meta_path.parent.name
+        for line_number, line in enumerate(meta_path.read_text().splitlines(), start=1):
+            name = line.strip()
+            if not name:
+                continue
+            if Path(name).name != name:
+                raise ValueError(
+                    f"sample id must be a plain filename stem: {meta_path}:{line_number}"
+                )
+            artifact = meta_path.parent / artifact_subdir / f"{name}.npz"
+            if not artifact.is_file():
+                raise RuntimeError(
+                    "MOTION_ARTIFACT_DATA_REQUIRED: artifact missing for sample "
+                    f"{name!r} at {artifact}"
+                )
+            records.append(
+                {"name": name, "dataset": dataset_name, "artifact": artifact}
+            )
+    if not records:
+        raise RuntimeError("motion split metadata contains no samples")
+    return records
+
+
+def load_humanml3d_records(
+    meta_paths: Iterable[str | Path],
+    *,
+    artifact_path: str = "artifacts",
+) -> list[dict[str, object]]:
+    return _load_records(
+        meta_paths,
+        artifact_path=artifact_path,
+        dataset_label="HumanML3D",
+    )
 
 
 class HumanML3DDataset(Dataset):
-    def __init__(self, cfg, split="train"):
-        self.cfg = cfg
-        self.split = split
-        self.stream_mode = cfg.data.get("stream_mode", False)
-        if self.split == "train":
-            self.file_list = cfg.data.train_meta_paths
-            self.min_length = cfg.data.min_length
-            self.max_length = cfg.data.max_length
-            self.window_length = cfg.data.get("window_length", cfg.data.max_length)
-            self.random_length = cfg.data.get("random_length", 0)
-        elif self.split == "val":
-            self.file_list = cfg.data.val_meta_paths
-            self.min_length = cfg.data.min_length
-            self.max_length = cfg.data.max_length
-            self.window_length = cfg.data.max_length
-            self.random_length = 0
-        elif self.split == "test":
-            self.file_list = cfg.data.test_meta_paths
-            self.min_length = 0
-            self.max_length = cfg.data.max_length
-            self.window_length = cfg.data.max_length
-            self.random_length = 0
-        self.feature_path = cfg.data.get("feature_path", None)
-        self.token_path = cfg.data.get("token_path", None)
-        self.text_path = cfg.data.get("text_path", None)
-        self.return_text_all = bool(cfg.data.get("return_text_all", False))
-        self.smooth_traj_sigma = float(cfg.data.get("smooth_traj_sigma", 0.0))
-        # T_B_09 flag-gated 7D migration: 4 = legacy (default, unchanged);
-        # 7 = also emit world-frame traj_cond_7d for the 7D fine-tune path.
-        self.traj_feat_dim = int(cfg.data.get("traj_feat_dim", 4))
-        self.max_loaded_samples = int(cfg.data.get("max_loaded_samples", 0))
-        self.dataset = self._load_file_list()
+    SOURCE_REPRESENTATION = HUMANML_SOURCE_REPRESENTATION
 
-        rank_zero_info(f"Loaded {len(self.dataset)} samples from {split} dataset.")
+    @staticmethod
+    def load_records(
+        meta_paths: Iterable[str | Path],
+        *,
+        artifact_path: str,
+    ) -> list[dict[str, object]]:
+        return load_humanml3d_records(meta_paths, artifact_path=artifact_path)
 
-    def _load_file_list(self) -> List[str]:
-        """Load a list of npy file paths from a text file."""
-        dataset = []
-        ignored_cnt = 0
-        for path in self.file_list:
-            if self.max_loaded_samples > 0 and len(dataset) >= self.max_loaded_samples:
-                break
-            if os.path.exists(path):
-                data_path = os.path.dirname(path)
-                dataset_name = os.path.basename(data_path)
-                rank_zero_info(f"Loading {path} ...")
-                with open(path, "r") as f:
-                    for name in f:
-                        name = name.strip()
-                        if name:
-                            data = {}
-                            try:
-                                data["name"] = name
-                                data["dataset"] = dataset_name
-                                if self.feature_path is not None:
-                                    feature_path = os.path.join(
-                                        data_path, self.feature_path, name + ".npy"
-                                    )
-                                    feature = self.load_feature(feature_path)
-                                    data["feature"] = feature
-                                    data["feature_length"] = feature.shape[0]
-                                if self.token_path is not None:
-                                    token_path = os.path.join(
-                                        data_path,
-                                        self.token_path,
-                                        name + ".npy",
-                                    )
-                                    token = self.load_token(token_path)
-                                    data["token"] = token
-                                    data["token_length"] = token.shape[0]
-                                if self.text_path is not None:
-                                    text_path = os.path.join(
-                                        data_path, self.text_path, name + ".txt"
-                                    )
-                                    text_data = self.load_text(text_path)
-                                    data["text_data"] = text_data
-                                dataset.append(data)
-                            except LengthMismatchError:
-                                ignored_cnt += 1
-                                pass
-                            except Exception as e:
-                                rank_zero_info(f"Error loading data for {name}: {e}")
-                                pass
-                            if self.cfg.debug and len(dataset) >= 100:
-                                rank_zero_info(f"debug mode, break at {len(dataset)}")
-                                break
-                            if (
-                                self.max_loaded_samples > 0
-                                and len(dataset) >= self.max_loaded_samples
-                            ):
-                                break
-        if ignored_cnt > 0:
-            rank_zero_info(f"Ignored {ignored_cnt} samples due to length mismatch.")
-        if len(dataset) == 0:
-            rank_zero_info(
-                f"No data found in {self.file_list}. Please check the file paths and ensure they are correct."
+    def __init__(
+        self,
+        *,
+        meta_paths: Iterable[str | Path],
+        split: str,
+        artifact_path: str = "artifacts",
+        min_frames: int = 20,
+        max_frames: int = 200,
+        random_yaw: bool = False,
+        expected_fps: float = 20.0,
+    ):
+        self.split = str(split)
+        if self.split not in SUPPORTED_SPLITS:
+            raise ValueError(
+                f"unsupported split {self.split!r}; expected one of {sorted(SUPPORTED_SPLITS)}"
             )
+        self.min_frames = int(min_frames)
+        self.max_frames = int(max_frames)
+        for name, original, value in (
+            ("min_frames", min_frames, self.min_frames),
+            ("max_frames", max_frames, self.max_frames),
+        ):
+            if (
+                value != original
+                or value < FRAMES_PER_TOKEN
+                or value % FRAMES_PER_TOKEN
+            ):
+                raise ValueError(f"{name} must be a positive multiple of four")
+        self.expected_fps = float(expected_fps)
+        if not math.isfinite(self.expected_fps) or self.expected_fps <= 0:
+            raise ValueError("expected_fps must be finite and positive")
+        self.random_yaw = bool(random_yaw and self.split == "train")
+        if self.min_frames > self.max_frames:
+            raise ValueError("min_frames must not exceed max_frames")
+        self.records = self.load_records(
+            meta_paths, artifact_path=artifact_path
+        )
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> dict:
+        record = self.records[index]
+        path = Path(record["artifact"])
+        with np.load(path, allow_pickle=False) as data:
+            if str(_read_scalar(data, "contract_version", path)) != CONTRACT_VERSION:
+                raise ValueError(f"motion artifact contract version mismatch in {path}")
+            source_representation = str(
+                _read_scalar(data, "source_representation", path)
+            )
+            if source_representation != self.SOURCE_REPRESENTATION:
+                raise ValueError(
+                    "motion artifact source representation mismatch in "
+                    f"{path}: expected {self.SOURCE_REPRESENTATION!r}, "
+                    f"got {source_representation!r}"
+                )
+            artifact_fps = float(_read_scalar(data, "fps", path))
+            if not math.isclose(
+                artifact_fps, self.expected_fps, rel_tol=0.0, abs_tol=1e-6
+            ):
+                raise ValueError(
+                    f"motion artifact FPS mismatch in {path}: "
+                    f"expected {self.expected_fps}, got {artifact_fps}"
+                )
+            for name in (
+                "root_motion",
+                "body_motion",
+                "body_feature_valid_mask",
+            ):
+                if name not in data:
+                    raise ValueError(f"motion artifact is missing {name!r} in {path}")
+            root = torch.from_numpy(data["root_motion"]).float()
+            body = torch.from_numpy(data["body_motion"]).float()
+            feature_valid = torch.from_numpy(data["body_feature_valid_mask"]).bool()
+            previous_root = (
+                torch.from_numpy(data["previous_root_frame"]).float()
+                if "previous_root_frame" in data else None
+            )
+        if root.ndim != 2 or root.shape[-1] != ROOT_DIM:
+            raise ValueError(f"root_motion must have shape [F,{ROOT_DIM}] in {path}")
+        if body.ndim != 2 or body.shape[-1] != BODY_DIM:
+            raise ValueError(f"body_motion must have shape [F,{BODY_DIM}] in {path}")
+        if tuple(feature_valid.shape) != tuple(body.shape):
+            raise ValueError(f"body_feature_valid_mask must match body_motion in {path}")
+        if root.shape[0] != body.shape[0]:
+            raise ValueError(f"root_motion and body_motion lengths differ in {path}")
+        if root.shape[0] % FRAMES_PER_TOKEN:
+            raise ValueError(f"artifact frame length must be divisible by four in {path}")
+        if not bool(torch.isfinite(root).all()) or not bool(
+            torch.isfinite(body).all()
+        ):
+            raise ValueError(f"motion artifact contains non-finite values in {path}")
+        if previous_root is not None:
+            if tuple(previous_root.shape) != (ROOT_DIM,):
+                raise ValueError(
+                    f"previous_root_frame must have shape [{ROOT_DIM}] in {path}"
+                )
+            if not bool(torch.isfinite(previous_root).all()):
+                raise ValueError(f"previous_root_frame contains non-finite values in {path}")
+        available = root.shape[0]
+        if available < self.min_frames:
+            raise ValueError(f"artifact {path} is shorter than {self.min_frames} frames")
+        crop_length = min(available, self.max_frames)
+        if self.split == "train" and crop_length > self.min_frames:
+            token_count = random.randint(
+                self.min_frames // FRAMES_PER_TOKEN,
+                crop_length // FRAMES_PER_TOKEN,
+            )
+            crop_length = token_count * FRAMES_PER_TOKEN
+        max_start_token = (available - crop_length) // FRAMES_PER_TOKEN
+        start_token = (
+            random.randint(0, max_start_token) if self.split == "train" else 0
+        )
+        start = start_token * FRAMES_PER_TOKEN
+        if start > 0:
+            previous_root = root[start - 1].clone()
+        root = root[start : start + crop_length]
+        body = body[start : start + crop_length]
+        feature_valid = feature_valid[start : start + crop_length]
+        root = root.clone()
+        origin_x = root[0, 0].clone()
+        origin_z = root[0, 2].clone()
+        root[:, 0] -= origin_x
+        root[:, 2] -= origin_z
+        if previous_root is not None:
+            previous_root = previous_root.clone()
+            previous_root[0] -= origin_x
+            previous_root[2] -= origin_z
+        if self.random_yaw:
+            angle = torch.rand(1) * (2 * torch.pi)
+            root, body = rotate_root_body_yaw(root[None], body[None], angle)
+            root, body = root[0], body[0]
+            if previous_root is not None:
+                previous_root = rotate_root_yaw(
+                    previous_root[None, None], angle
+                )[0, 0]
+        return {
+            "body_motion": body,
+            "root_motion": root,
+            "body_feature_valid_mask": feature_valid,
+            "previous_root_frame": previous_root,
+            "name": str(record["name"]),
+            "dataset": str(record["dataset"]),
+            "text": "",
+        }
+
+
+def collate_humanml3d(batch: list[dict]) -> dict[str, object]:
+    max_frames = max(item["body_motion"].shape[0] for item in batch)
+    if max_frames % FRAMES_PER_TOKEN:
+        raise AssertionError("collate padding must be token aligned")
+    batch_size = len(batch)
+    body = torch.zeros(batch_size, max_frames, BODY_DIM)
+    root = torch.zeros(batch_size, max_frames, ROOT_DIM)
+    frame_mask = torch.zeros(batch_size, max_frames, dtype=torch.bool)
+    feature_mask = torch.zeros(batch_size, max_frames, BODY_DIM, dtype=torch.bool)
+    previous = torch.zeros(batch_size, ROOT_DIM)
+    previous_valid = torch.zeros(batch_size, dtype=torch.bool)
+    for idx, item in enumerate(batch):
+        frames = item["body_motion"].shape[0]
+        body[idx, :frames] = item["body_motion"]
+        root[idx, :frames] = item["root_motion"]
+        frame_mask[idx, :frames] = True
+        feature_mask[idx, :frames] = item["body_feature_valid_mask"]
+        if item["previous_root_frame"] is None:
+            pass
         else:
-            for i in range(3):
-                tmp = dataset[i % len(dataset)]  # avoid burning global RNG
-                rank_zero_info(f"Random data {tmp['name']}: {tmp['feature'].shape}")
-        return dataset
-
-    def load_feature(self, feature_path: str) -> np.ndarray:
-        feature = np.load(feature_path)
-        if np.isnan(feature).any():
-            raise ValueError("NaN values found in feature, skip it.")
-        if feature.shape[0] < self.min_length or feature.shape[0] > self.max_length:
-            raise LengthMismatchError("Feature length out of bounds, skip it.")
-        return feature
-
-    def load_token(self, token_path: str) -> np.ndarray:
-        token = np.load(token_path)
-        if np.isnan(token).any():
-            raise ValueError("NaN values found in token, skip it.")
-        return token
-
-    def load_text(self, text_path: str) -> List[Dict]:
-        text_data = []
-        with open(text_path, "r") as text_f:
-            lines = text_f.readlines()
-            for line in lines:
-                text_dict = {}
-                line_split = line.strip().split("#")
-                caption = line_split[0].strip()
-                t_tokens = line_split[1].split(" ")
-                f_tag = float(line_split[2])
-                to_tag = float(line_split[3])
-                f_tag = 0.0 if np.isnan(f_tag) else f_tag
-                to_tag = 0.0 if np.isnan(to_tag) else to_tag
-
-                text_dict["caption"] = caption
-                text_dict["tokens"] = t_tokens
-                text_dict["f_tag"] = f_tag
-                text_dict["to_tag"] = to_tag
-
-                text_data.append(text_dict)
-        return text_data
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        data = self.dataset[idx]
-        return self._process(data)
-
-    def _process(self, data):
-        output = {}
-        output["dataset"] = data["dataset"]
-        output["name"] = data["name"]
-        ##############################
-        # feature
-        ##############################
-        crop_start = 0
-        feature_length = None
-        if "feature" in data:
-            feature, feature_length, crop_start = self.process_feature(data["feature"])
-            output["feature"] = feature
-            output["feature_length"] = feature_length
-            ##############################
-            # traj (root xyz derived from feature)
-            ##############################
-            traj = extract_root_trajectory_263(feature)
-            output["traj"] = traj
-            output["traj_cond"] = traj
-            output["traj_loss_gt"] = traj
-            output["traj_length"] = len(traj)
-
-        ##############################
-        # token
-        ##############################
-        if "token" in data:
-            token, token_length = self.process_token(
-                data["token"],
-                crop_start=crop_start if feature_length is not None else None,
-                feature_length=feature_length,
-            )
-            output["token"] = token
-            output["token_length"] = token_length
-
-            if "traj" in output:
-                traj_length = output["traj_length"]
-                traj_mask = np.ones(traj_length, dtype=np.float32)
-                output["traj_mask"] = traj_mask
-                output["traj_cond_mask"] = traj_mask.copy()
-                output["traj_loss_mask"] = traj_mask.copy()
-
-        ##############################
-        # traj_features
-        ##############################
-        # [x, z, cos(ψ), sin(ψ)] for ControlNet conditioning.
-        # output["traj"] (raw xyz) feeds L_control_xz GT supervision.
-        if "feature" in output and "token" in output:
-            traj_xyz = output["traj"]  # (T, 3)
-            if self.smooth_traj_sigma > 0.0:
-                traj_xz_smooth = smooth_root_xz(traj_xyz[:, [0, 2]], sigma=self.smooth_traj_sigma)
-                traj_xyz_for_cond = traj_xyz.copy()
-                traj_xyz_for_cond[:, 0] = traj_xz_smooth[:, 0]
-                traj_xyz_for_cond[:, 2] = traj_xz_smooth[:, 1]
-            else:
-                traj_xyz_for_cond = traj_xyz
-            traj_features = root_to_traj_feats(traj_xyz_for_cond)
-            output["traj_features"] = traj_features
-
-            if self.traj_feat_dim == 7:
-                output["traj_cond_7d"] = extract_root_traj_feats_7d_263(feature)
-
-        ##############################
-        # text
-        ##############################
-        if "text_data" in data:
-            if self.split in ("val", "test"):
-                import hashlib
-                _idx = int(hashlib.md5(data["name"].encode()).hexdigest(), 16)
-                text_dict = data["text_data"][_idx % len(data["text_data"])]
-            elif self.return_text_all:
-                text_dict = data["text_data"][0]
-            else:
-                text_dict = random.choice(data["text_data"])
-
-            if self.return_text_all or self.split in ("val", "test"):
-                output["text_all"] = [
-                    self.process_text_dict(td)[0] for td in data["text_data"]
-                ]
-
-            text, text_tokens, f_tag, to_tag = self.process_text_dict(text_dict)
-            if self.stream_mode:
-                output["text"] = [text]
-                output["text_tokens"] = text_tokens
-                output["feature_text_end"] = [output["feature_length"]]
-                output["token_text_end"] = [output["token_length"]]
-            else:
-                output["text"] = text
-                output["text_tokens"] = text_tokens
-        return output
-
-    def process_feature(self, feature):
-        feature_len = feature.shape[0]
-        crop_start = 0
-        # if the motion is longer than window_length, randomly crop a window_length clip
-        if feature_len > self.window_length:
-            if self.window_length % 4:
-                raise ValueError("strict4 feature window_length must be divisible by four")
-            max_start_token = (feature_len - self.window_length) // 4
-            crop_start = random.randint(0, max_start_token) * 4
-            feature = feature[crop_start : crop_start + self.window_length]
-            feature_len = self.window_length
-        return feature, feature_len, crop_start
-
-    def process_token(self, token, crop_start=None, feature_length=None):
-        """Process token. When crop_start and feature_length are provided (from feature crop),
-        crop token to align with feature (VAE temporal factor 4). Otherwise use original random crop."""
-        token_length = len(token)
-        if crop_start is not None and feature_length is not None:
-            if crop_start % 4 or feature_length % 4:
-                raise ValueError("strict4 token crop requires four-frame aligned bounds")
-            token_start = crop_start // 4
-            token_len = feature_length // 4
-            end = min(token_start + token_len, token_length)
-            if token_start >= token_length or token_len <= 0:
-                raise ValueError("strict4 token crop lies outside cached tokens")
-            else:
-                token = token[token_start:end]
-        elif token_length > self.random_length:
-            new_token_length = token_length - random.randint(0, self.random_length)
-            start = random.randint(0, token_length - new_token_length)
-            token = token[start : start + new_token_length]
-        token_length = len(token)
-        return token, token_length
-
-    def process_text_dict(self, text_dict: Dict):
-        text = text_dict["caption"]
-        text_tokens = text_dict["tokens"]
-        f_tag = text_dict["f_tag"]
-        to_tag = text_dict["to_tag"]
-        return text, text_tokens, f_tag, to_tag
-
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return None
-
-    output = {}
-    keys = batch[0].keys()
-
-    for key in keys:
-        if key in ["feature", "token", "traj", "traj_cond", "traj_loss_gt", "traj_features",
-                   "traj_cond_7d"]:
-            # Pad sequences
-            items = [
-                torch.from_numpy(b[key]) if isinstance(b[key], np.ndarray) else b[key]
-                for b in batch
-            ]
-            output[key] = torch.nn.utils.rnn.pad_sequence(
-                items, batch_first=True, padding_value=0
-            )
-        elif key in ["traj_mask", "traj_cond_mask", "traj_loss_mask", "token_mask"]:
-
-            items = [
-                torch.from_numpy(b[key])
-                if isinstance(b[key], np.ndarray)
-                else torch.tensor(b[key], dtype=torch.float32)
-                for b in batch
-            ]
-            output[key] = torch.nn.utils.rnn.pad_sequence(
-                items, batch_first=True, padding_value=0
-            )
-        elif key in ["feature_length", "token_length", "traj_length"]:
-            # Stack scalars
-            output[key] = torch.tensor([b[key] for b in batch])
-        else:
-            # Default to list
-            output[key] = [b[key] for b in batch]
-    return output
+            previous[idx] = item["previous_root_frame"]
+            previous_valid[idx] = True
+    return {
+        "body_motion": body,
+        "root_motion": root,
+        "frame_valid_mask": frame_mask,
+        "body_feature_valid_mask": feature_mask,
+        "previous_root_frame": previous,
+        "previous_root_valid_mask": previous_valid,
+        "name": [item["name"] for item in batch],
+        "text": [item["text"] for item in batch],
+    }
 
 
-if __name__ == "__main__":
-    cfg = OmegaConf.load("configs/default.yaml")
-    dataset = HumanML3DDataset(cfg, split="val")
-    print(len(dataset))
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=cfg.data.train_bs, shuffle=True, collate_fn=collate_fn
-    )
-    for idx, data in tqdm(enumerate(dataloader)):
-        pass
+__all__ = [
+    "HumanML3DDataset",
+    "collate_humanml3d",
+    "load_humanml3d_records",
+]

@@ -1,4 +1,4 @@
-"""Strict four-frame body VAE contracts.
+"""Body VAE contracts.
 
 The VAE operates on physical body features and owns normalization internally.
 One latent token always represents exactly four consecutive motion frames.
@@ -21,7 +21,7 @@ BODY_VELOCITY_DIM = NUM_JOINTS * 3
 BODY_CONTINUOUS_DIM = BODY_POSITION_DIM + BODY_ROTATION_DIM + BODY_VELOCITY_DIM
 BODY_CONTACT_DIM = 4
 BODY_DIM = BODY_CONTINUOUS_DIM + BODY_CONTACT_DIM
-CONTRACT_VERSION = "strict4-body265-v1"
+CONTRACT_VERSION = "body265-v1"
 
 
 def _require(name: str, value: torch.Tensor, shape_tail: tuple[int, ...]) -> None:

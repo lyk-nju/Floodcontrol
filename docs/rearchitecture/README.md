@@ -1,6 +1,6 @@
 # Floodcontrol 新版框架讨论索引
 
-状态：`LDF_AND_STRICT4_VAE_CORE_IMPLEMENTED / NATIVE_DATA_AND_RUNTIME_OPEN`。Hybrid LDF、strict4 BodyVAE和合成张量stream核心已经落地；原生rotations数据、正式checkpoint/latent artifacts与Web runtime仍未接线。未标记为`LOCKED`的内容继续视为讨论项。
+状态：`LDF_BODY_VAE_AND_HUMANML_DATA_READY / TRAINING_AND_RUNTIME_OPEN`。Hybrid LDF、BodyVAE、HumanML263转换器、全量本地motion artifacts/statistics和合成张量stream核心已经落地；正式checkpoint/latent artifacts与Web runtime仍未接线。未标记为`LOCKED`的内容继续视为讨论项。
 
 这个目录用于把新版 Floodcontrol 的设计讨论拆成可独立审阅的主题，避免把模型协议、数据语义、在线状态、训练目标和实验超参数混在同一份文档里。
 
@@ -11,7 +11,7 @@
 2. [`02_DATA_PIPELINE.md`](02_DATA_PIPELINE.md)
    只讨论离线表示构建、完整 clip 恢复、数据增强、window/epoch 采样、token cache 和 Dataset/DataLoader。
    [`02_VAE_AND_BODY_REPRESENTATION.md`](02_VAE_AND_BODY_REPRESENTATION.md)
-   冻结body265、四组统计、strict4 VAE、loss和显式decoder state协议。
+   冻结body265、四组统计、四帧VAE、loss和显式decoder state协议。
 3. [`03_STREAMING_ACTIVE_WINDOW.md`](03_STREAMING_ACTIVE_WINDOW.md)
    只讨论推理时 authoritative world state、SessionFrame、OriginEpoch、active noisy window、buffer roll、cache 生命周期和原子更新。
 4. [`04_TRAINING_METHOD.md`](04_TRAINING_METHOD.md)

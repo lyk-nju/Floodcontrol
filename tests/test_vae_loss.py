@@ -2,7 +2,7 @@ import torch
 
 from models.vae_wan_1d import BodyVAE
 from utils.conditions.vae import VAEInput
-from utils.training.vae_loss import VAELoss
+from utils.training.vae.losses import VAELoss
 
 
 def test_vae_loss_blocks_contacts_and_kl_warmup():
@@ -19,6 +19,7 @@ def test_vae_loss_blocks_contacts_and_kl_warmup():
     loss_fn = VAELoss(
         body_cont_mean=model.body_cont_mean,
         body_cont_std=model.body_cont_std,
+        beta_kl=1e-4,
         kl_warmup_steps=100,
     )
     losses = loss_fn(inputs, prediction, global_step=50)

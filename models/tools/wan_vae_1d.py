@@ -1,4 +1,4 @@
-"""Token-axis causal convolutional backbone for the strict-4 body VAE.
+"""Token-axis causal convolutional backbone for the body VAE.
 
 Unlike the legacy frame-axis VAE, patch boundaries are explicit: four body
 frames are flattened before the encoder and every decoder token projects to
@@ -90,7 +90,7 @@ class CausalResidualBlock(nn.Module):
         return value + hidden, (first, second)
 
 
-class Strict4CausalVAE(nn.Module):
+class CausalBodyVAE(nn.Module):
     """Body-only VAE with explicit four-frame patches and local-root decoder condition."""
 
     def __init__(
@@ -215,5 +215,5 @@ class Strict4CausalVAE(nn.Module):
 
 
 __all__ = [
-    "CausalConv1d", "CausalResidualBlock", "Strict4CausalVAE"
+    "CausalBodyVAE", "CausalConv1d", "CausalResidualBlock"
 ]

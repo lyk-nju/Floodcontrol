@@ -23,12 +23,28 @@ from utils.conditions.vae import (
     NUM_JOINTS,
     ROOT_DIM,
 )
+from utils.math.quaternion import cont6d_to_matrix, qinv, qrot, quaternion_to_matrix
+from utils.local_frame import root_quat_to_physical_yaw
+from utils.motion_process import recover_root_rot_pos
 
 
 POSITION_SLICE = slice(0, BODY_POSITION_DIM)
 ROTATION_SLICE = slice(BODY_POSITION_DIM, BODY_POSITION_DIM + BODY_ROTATION_DIM)
 VELOCITY_SLICE = slice(BODY_POSITION_DIM + BODY_ROTATION_DIM, BODY_CONTINUOUS_DIM)
 CONTACT_SLICE = slice(BODY_CONTINUOUS_DIM, BODY_DIM)
+
+HUMANML_DIM = 263
+HUMANML_SOURCE_REPRESENTATION = "humanml3d-263-ik-v1"
+HUMANML_POSITION_SLICE = slice(4, 4 + BODY_POSITION_DIM)
+HUMANML_ROTATION_SLICE = slice(
+    HUMANML_POSITION_SLICE.stop,
+    HUMANML_POSITION_SLICE.stop + (NUM_JOINTS - 1) * 6,
+)
+HUMANML_CONTACT_SLICE = slice(HUMANML_DIM - BODY_CONTACT_DIM, HUMANML_DIM)
+HUMANML22_PARENTS = (
+    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16,
+    17, 18, 19,
+)
 
 
 def rotation_6d_to_matrix(rotation: torch.Tensor) -> torch.Tensor:
@@ -161,13 +177,88 @@ def build_root_body_motion(
     return project_root_heading(root_motion), body, feature_valid
 
 
-def rotate_root_body_yaw(
+def humanml263_to_root_body_motion(
+    motion: torch.Tensor,
+    *,
+    fps: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert processed HumanML3D features into the root5/body265 contract.
+
+    HumanML3D stores heading-canonical joint positions, IK-derived local
+    rotations for the 21 non-root joints, root deltas, heading-local joint
+    velocities, and contacts. This conversion recovers physical positions and
+    root heading, composes all 22 global rotations through the HumanML
+    hierarchy, and recomputes global backward velocities in metres per second.
+    """
+
+    if motion.ndim == 2:
+        motion = motion.unsqueeze(0)
+        squeeze = True
+    elif motion.ndim == 3:
+        squeeze = False
+    else:
+        raise ValueError("HumanML3D motion must be [F,263] or [B,F,263]")
+    if motion.shape[-1] != HUMANML_DIM:
+        raise ValueError(f"HumanML3D motion must end in {HUMANML_DIM} features")
+    if motion.shape[-2] < 1:
+        raise ValueError("HumanML3D motion must contain at least one frame")
+
+    motion = motion.float()
+    canonical_heading, root_positions = recover_root_rot_pos(motion)
+    # HumanML's stored IK rotations use ``canonical_heading`` itself at the
+    # skeleton root (the official rotation-FK recovery follows this convention),
+    # while world positions and physical facing use its inverse. Keep these two
+    # meanings explicit instead of forcing root rotation and path heading equal.
+    global_root_rotation = quaternion_to_matrix(canonical_heading)
+
+    local_positions = motion[..., HUMANML_POSITION_SLICE].reshape(
+        *motion.shape[:-1], NUM_JOINTS - 1, 3
+    )
+    global_positions_non_root = qrot(
+        qinv(canonical_heading)[..., None, :].expand(
+            *local_positions.shape[:-1], 4
+        ),
+        local_positions,
+    )
+    global_positions_non_root[..., 0] += root_positions[..., None, 0]
+    global_positions_non_root[..., 2] += root_positions[..., None, 2]
+    global_positions = torch.cat(
+        [root_positions[..., None, :], global_positions_non_root], dim=-2
+    )
+
+    child_local_rotations = cont6d_to_matrix(
+        motion[..., HUMANML_ROTATION_SLICE].reshape(
+            *motion.shape[:-1], NUM_JOINTS - 1, 6
+        )
+    )
+    global_rotations = [global_root_rotation]
+    for joint in range(1, NUM_JOINTS):
+        parent = HUMANML22_PARENTS[joint]
+        global_rotations.append(
+            global_rotations[parent] @ child_local_rotations[..., joint - 1, :, :]
+        )
+    global_rotations = torch.stack(global_rotations, dim=-3)
+    heading = root_quat_to_physical_yaw(canonical_heading)
+    contacts = motion[..., HUMANML_CONTACT_SLICE]
+    root, body, feature_valid = build_root_body_motion(
+        global_positions,
+        global_rotations,
+        root_positions,
+        heading,
+        fps=fps,
+        foot_contacts=contacts,
+    )
+    if squeeze:
+        return root[0], body[0], feature_valid[0]
+    return root, body, feature_valid
+
+
+def rotate_root_yaw(
     root_motion: torch.Tensor,
-    body_motion: torch.Tensor,
     angle: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if root_motion.ndim != 3 or body_motion.ndim != 3:
-        raise ValueError("root_motion/body_motion must be [B,F,D]")
+) -> torch.Tensor:
+    if root_motion.ndim != 3 or root_motion.shape[-1] != ROOT_DIM:
+        raise ValueError("root_motion must be [B,F,5]")
     batch = root_motion.shape[0]
     angle = torch.as_tensor(angle, device=root_motion.device, dtype=root_motion.dtype)
     if angle.ndim == 0:
@@ -183,6 +274,32 @@ def rotate_root_body_yaw(
     root[..., :3] = torch.einsum("bij,bfj->bfi", rotation, root[..., :3])
     heading = torch.atan2(root_motion[..., 4], root_motion[..., 3]) + angle[:, None]
     root[..., 3], root[..., 4] = torch.cos(heading), torch.sin(heading)
+    return root
+
+
+def rotate_root_body_yaw(
+    root_motion: torch.Tensor,
+    body_motion: torch.Tensor,
+    angle: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if root_motion.ndim != 3 or root_motion.shape[-1] != ROOT_DIM:
+        raise ValueError("root_motion must be [B,F,5]")
+    if body_motion.ndim != 3 or body_motion.shape[-1] != BODY_DIM:
+        raise ValueError(f"body_motion must be [B,F,{BODY_DIM}]")
+    if root_motion.shape[:2] != body_motion.shape[:2]:
+        raise ValueError("root_motion and body_motion must share [B,F]")
+    batch = root_motion.shape[0]
+    angle = torch.as_tensor(angle, device=root_motion.device, dtype=root_motion.dtype)
+    if angle.ndim == 0:
+        angle = angle.expand(batch)
+    if tuple(angle.shape) != (batch,):
+        raise ValueError("angle must be scalar or [B]")
+    cos, sin = torch.cos(angle), torch.sin(angle)
+    rotation = torch.zeros(batch, 3, 3, device=root_motion.device, dtype=root_motion.dtype)
+    rotation[:, 0, 0], rotation[:, 0, 2] = cos, sin
+    rotation[:, 1, 1] = 1
+    rotation[:, 2, 0], rotation[:, 2, 2] = -sin, cos
+    root = rotate_root_yaw(root_motion, angle)
     parts = unpack_body_motion(body_motion)
     positions = torch.einsum("bij,bfkj->bfki", rotation, parts["joint_positions"])
     velocities = torch.einsum("bij,bfkj->bfki", rotation, parts["joint_velocities"])
@@ -273,9 +390,13 @@ class MotionStatistics:
 
 
 __all__ = [
-    "CONTACT_SLICE", "POSITION_SLICE", "ROTATION_SLICE", "VELOCITY_SLICE",
+    "CONTACT_SLICE", "HUMANML22_PARENTS", "HUMANML_CONTACT_SLICE",
+    "HUMANML_DIM", "HUMANML_POSITION_SLICE", "HUMANML_ROTATION_SLICE",
+    "HUMANML_SOURCE_REPRESENTATION",
+    "POSITION_SLICE", "ROTATION_SLICE", "VELOCITY_SLICE",
     "MotionStatistics", "backward_joint_velocities", "build_root_body_motion",
     "derive_patched_local_root", "detect_foot_contacts", "matrix_to_rotation_6d",
-    "pack_body_motion", "rotate_root_body_yaw", "rotation_6d_to_matrix",
-    "unpack_body_motion",
+    "humanml263_to_root_body_motion", "pack_body_motion", "rotate_root_body_yaw",
+    "rotate_root_yaw",
+    "rotation_6d_to_matrix", "unpack_body_motion",
 ]

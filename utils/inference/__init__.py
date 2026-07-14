@@ -1,6 +1,6 @@
 """Model-independent inference timeline utilities.
 
-End-to-end generation is intentionally unavailable until a trained strict-4
+End-to-end generation is intentionally unavailable until a trained body VAE
 VAE, verified latent artifacts, and the commit-time decoder transaction are
 connected to the hybrid LDF.
 """
