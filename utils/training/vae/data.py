@@ -5,6 +5,40 @@ from __future__ import annotations
 from torch.utils.data import DataLoader
 
 from utils.initialize import get_function, instantiate
+from utils.motion_representation import (
+    VAEStatistics,
+    motion_artifact_manifest_sha256,
+)
+
+
+def _dataset_records(dataset) -> list[dict[str, object]]:
+    if hasattr(dataset, "datasets"):
+        records: list[dict[str, object]] = []
+        for child in dataset.datasets:
+            records.extend(_dataset_records(child))
+        return records
+    records = getattr(dataset, "records", None)
+    if records is None:
+        raise TypeError("VAE Dataset must expose artifact records for statistics validation")
+    return list(records)
+
+
+def validate_training_statistics(cfg, dataset) -> None:
+    """Fail before optimization if train artifacts and VAE stats diverge."""
+
+    stats = VAEStatistics.load(
+        cfg.model.params.motion_stats_path,
+        expected_fps=cfg.model.params.fps,
+    )
+    actual, _ = motion_artifact_manifest_sha256(
+        _dataset_records(dataset), expected_fps=cfg.model.params.fps
+    )
+    expected = stats.metadata.get("artifact_manifest_sha256")
+    if expected != actual:
+        raise RuntimeError(
+            "VAE_STATISTICS_STALE: motion statistics were not computed from the "
+            "current train artifacts"
+        )
 
 
 def create_dataset(cfg, split: str):
@@ -42,6 +76,8 @@ def create_dataset(cfg, split: str):
 def create_dataloaders(cfg) -> tuple[DataLoader | None, DataLoader]:
     train_dataset = create_dataset(cfg, "train") if cfg.train else None
     val_dataset = create_dataset(cfg, "val")
+    if train_dataset is not None:
+        validate_training_statistics(cfg, train_dataset)
     collate_fn = get_function(cfg.data.collate_fn)
     loader_kwargs = {
         "num_workers": cfg.data.num_workers,
@@ -66,4 +102,4 @@ def create_dataloaders(cfg) -> tuple[DataLoader | None, DataLoader]:
     return train_dataloader, val_dataloader
 
 
-__all__ = ["create_dataloaders", "create_dataset"]
+__all__ = ["create_dataloaders", "create_dataset", "validate_training_statistics"]

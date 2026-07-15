@@ -36,6 +36,8 @@ class ChannelLayerNorm(nn.Module):
 
 class CausalConv1d(nn.Conv1d):
     def __init__(self, channels: int, kernel_size: int = 3):
+        if int(kernel_size) < 3 or int(kernel_size) % 2 == 0:
+            raise ValueError("causal VAE kernel_size must be odd and at least three")
         super().__init__(channels, channels, kernel_size=kernel_size, padding=0)
         self.cache_length = int(kernel_size) - 1
 
@@ -104,8 +106,14 @@ class CausalBodyVAE(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        if int(kernel_size) < 3 or int(kernel_size) % 2 == 0:
+            raise ValueError("causal VAE kernel_size must be odd and at least three")
         self.latent_dim = int(latent_dim)
         self.hidden_dim = int(hidden_dim)
+        # Each residual block contains two causal convolutions. A convolution
+        # with kernel k contributes k-1 historical tokens, so this is the exact
+        # warm-up prefix required when an LDF crop is encoded online.
+        self.encoder_context_tokens = int(encoder_layers) * 2 * (int(kernel_size) - 1)
         self.encoder_input = nn.Linear(FRAMES_PER_TOKEN * BODY_DIM, hidden_dim)
         self.encoder_blocks = nn.ModuleList(
             [CausalResidualBlock(hidden_dim, kernel_size=kernel_size, dropout=dropout)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -35,6 +36,7 @@ CONTACT_SLICE = slice(BODY_CONTINUOUS_DIM, BODY_DIM)
 
 HUMANML_DIM = 263
 HUMANML_SOURCE_REPRESENTATION = "humanml3d-263-ik-v1"
+MOTION_CONVERTER_VERSION = "humanml265"
 HUMANML_POSITION_SLICE = slice(4, 4 + BODY_POSITION_DIM)
 HUMANML_ROTATION_SLICE = slice(
     HUMANML_POSITION_SLICE.stop,
@@ -189,6 +191,21 @@ def humanml263_to_root_body_motion(
     velocities, and contacts. This conversion recovers physical positions and
     root heading, composes all 22 global rotations through the HumanML
     hierarchy, and recomputes global backward velocities in metres per second.
+
+    ``MOTION_CONVERTER_VERSION == "humanml265"`` owns this complete algorithm:
+
+    1. recover world root translation and physical heading from HumanML root
+       deltas;
+    2. rotate the 21 heading-canonical joint positions back to world space;
+    3. compose the 21 IK-derived local rotations through ``HUMANML22_PARENTS``
+       to obtain 22 global rotations;
+    4. recompute all 22 world-space joint velocities with backward difference
+       at the declared FPS, marking the cold-start velocity invalid; and
+    5. retain the source binary foot contacts and pack root5/body265.
+
+    Any mathematical change to one of these steps changes this single converter
+    version. There are deliberately no separate position/rotation/velocity
+    converter versions.
     """
 
     if motion.ndim == 2:
@@ -311,6 +328,70 @@ def rotate_root_body_yaw(
     return root, body
 
 
+def deterministic_sample_yaw(
+    dataset: str,
+    sample_id: str,
+    *,
+    seed: int = 0,
+) -> float:
+    """Map one namespaced sample to a stable uniform yaw in ``[0, 2π)``."""
+
+    payload = f"{int(seed)}\0{dataset}\0{sample_id}".encode("utf-8")
+    integer = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    return float(integer / 2**64 * (2.0 * np.pi))
+
+
+def motion_artifact_manifest_sha256(
+    records: list[Mapping[str, object]],
+    *,
+    expected_fps: float,
+) -> tuple[str, list[str]]:
+    """Fingerprint the actual converted samples used by a statistics artifact.
+
+    Split TXT contents alone are insufficient because an artifact can be rebuilt
+    in place after its source motion changes. The digest therefore owns the
+    dataset namespace, sample id, source hash, source representation, converter
+    version and FPS of every referenced artifact. Paths are intentionally not
+    hashed so an identical dataset remains portable between machines.
+    """
+
+    digest = hashlib.sha256()
+    source_representations: set[str] = set()
+    identities: list[tuple[str, str, Path]] = []
+    for record in records:
+        identities.append(
+            (
+                str(record.get("dataset", "")),
+                str(record.get("name", "")),
+                Path(record["artifact"]),
+            )
+        )
+    identities.sort(key=lambda item: (item[0], item[1]))
+    seen: set[tuple[str, str]] = set()
+    for dataset, name, path in identities:
+        identity = (dataset, name)
+        if identity in seen:
+            raise ValueError(f"duplicate motion artifact identity: {dataset}/{name}")
+        seen.add(identity)
+        with np.load(path, allow_pickle=False) as data:
+            contract = str(np.asarray(data["contract_version"]).item())
+            converter = str(np.asarray(data["converter_version"]).item())
+            representation = str(np.asarray(data["source_representation"]).item())
+            source_sha256 = str(np.asarray(data["source_sha256"]).item())
+            fps = float(np.asarray(data["fps"]).item())
+        if contract != CONTRACT_VERSION:
+            raise ValueError(f"motion artifact contract version mismatch in {path}")
+        if converter != MOTION_CONVERTER_VERSION:
+            raise ValueError(f"motion artifact converter version mismatch in {path}")
+        if not np.isclose(fps, float(expected_fps), rtol=0.0, atol=1e-6):
+            raise ValueError(f"motion artifact FPS mismatch in {path}")
+        source_representations.add(representation)
+        for value in (dataset, name, source_sha256, representation, converter, repr(fps)):
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest(), sorted(source_representations)
+
+
 def derive_patched_local_root(
     root_motion: torch.Tensor,
     previous_root_frame: torch.Tensor | None,
@@ -336,9 +417,9 @@ def derive_patched_local_root(
 
 
 @dataclass(frozen=True)
-class MotionStatistics:
-    global_root_mean: torch.Tensor
-    global_root_std: torch.Tensor
+class VAEStatistics:
+    """Statistics owned by the body tokenizer, excluding LDF global root."""
+
     local_root_mean: torch.Tensor
     local_root_std: torch.Tensor
     body_cont_mean: torch.Tensor
@@ -347,8 +428,6 @@ class MotionStatistics:
 
     def validate(self) -> None:
         for name, value, dim in (
-            ("global_root_mean", self.global_root_mean, ROOT_DIM),
-            ("global_root_std", self.global_root_std, ROOT_DIM),
             ("local_root_mean", self.local_root_mean, 4),
             ("local_root_std", self.local_root_std, 4),
             ("body_cont_mean", self.body_cont_mean, BODY_CONTINUOUS_DIM),
@@ -356,6 +435,8 @@ class MotionStatistics:
         ):
             if tuple(value.shape) != (dim,):
                 raise ValueError(f"{name} must have shape [{dim}]")
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(f"{name} must contain only finite values")
             if name.endswith("std") and bool((value <= 0).any()):
                 raise ValueError(f"{name} must be positive")
 
@@ -365,8 +446,6 @@ class MotionStatistics:
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             path,
-            global_root_mean=self.global_root_mean.cpu().numpy(),
-            global_root_std=self.global_root_std.cpu().numpy(),
             local_root_mean=self.local_root_mean.cpu().numpy(),
             local_root_std=self.local_root_std.cpu().numpy(),
             body_cont_mean=self.body_cont_mean.cpu().numpy(),
@@ -375,28 +454,45 @@ class MotionStatistics:
         )
 
     @classmethod
-    def load(cls, path: str | Path) -> "MotionStatistics":
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        expected_fps: float | None = None,
+    ) -> "VAEStatistics":
         with np.load(path, allow_pickle=False) as data:
             metadata = json.loads(str(data["metadata"]))
             arrays = [torch.from_numpy(data[name]).float() for name in (
-                "global_root_mean", "global_root_std", "local_root_mean",
-                "local_root_std", "body_cont_mean", "body_cont_std"
+                "local_root_mean", "local_root_std", "body_cont_mean",
+                "body_cont_std"
             )]
         stats = cls(*arrays, metadata=metadata)
         stats.validate()
         if metadata.get("contract_version") != CONTRACT_VERSION:
             raise ValueError("motion statistics contract version mismatch")
+        if metadata.get("converter_version") != MOTION_CONVERTER_VERSION:
+            raise ValueError("motion statistics converter version mismatch")
+        if metadata.get("skeleton") != "humanml22-v1":
+            raise ValueError("motion statistics skeleton version mismatch")
+        if expected_fps is not None and not np.isclose(
+            float(metadata.get("fps", float("nan"))),
+            float(expected_fps),
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError("motion statistics FPS mismatch")
         return stats
 
 
 __all__ = [
     "CONTACT_SLICE", "HUMANML22_PARENTS", "HUMANML_CONTACT_SLICE",
     "HUMANML_DIM", "HUMANML_POSITION_SLICE", "HUMANML_ROTATION_SLICE",
-    "HUMANML_SOURCE_REPRESENTATION",
+    "HUMANML_SOURCE_REPRESENTATION", "MOTION_CONVERTER_VERSION",
     "POSITION_SLICE", "ROTATION_SLICE", "VELOCITY_SLICE",
-    "MotionStatistics", "backward_joint_velocities", "build_root_body_motion",
+    "VAEStatistics", "backward_joint_velocities", "build_root_body_motion",
     "derive_patched_local_root", "detect_foot_contacts", "matrix_to_rotation_6d",
     "humanml263_to_root_body_motion", "pack_body_motion", "rotate_root_body_yaw",
-    "rotate_root_yaw",
+    "rotate_root_yaw", "motion_artifact_manifest_sha256",
+    "deterministic_sample_yaw",
     "rotation_6d_to_matrix", "unpack_body_motion",
 ]

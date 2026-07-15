@@ -1,6 +1,6 @@
 # Floodcontrol 新版框架讨论索引
 
-状态：`LDF_BODY_VAE_AND_HUMANML_DATA_READY / TRAINING_AND_RUNTIME_OPEN`。Hybrid LDF、BodyVAE、HumanML263转换器、全量本地motion artifacts/statistics和合成张量stream核心已经落地；正式checkpoint/latent artifacts与Web runtime仍未接线。未标记为`LOCKED`的内容继续视为讨论项。
+状态：`LDF_AND_FIRST_EMA_BODY_TOKENIZER_READY / ONLINE_ENCODER_AND_RUNTIME_OPEN`。Hybrid LDF、BodyVAE、唯一`humanml265`转换器、全量本地motion artifacts/statistics、首个300k EMA tokenizer和合成张量stream核心已经落地；正式LDF训练冻结为在线EMA encode路径，其context sampler、latent statistics、hybrid batch与Web runtime仍未接线。未标记为`LOCKED`的内容继续视为讨论项。
 
 这个目录用于把新版 Floodcontrol 的设计讨论拆成可独立审阅的主题，避免把模型协议、数据语义、在线状态、训练目标和实验超参数混在同一份文档里。
 

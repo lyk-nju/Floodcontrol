@@ -18,7 +18,7 @@ root_motion + latent_motion
 - HumanML3D/BABEL的独立body265 artifact、联合statistics与同构multi-dataset训练入口；
 - 分主题架构文档和契约测试。
 
-旧的附加控制网络、外置轨迹编码器和外置root planner已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、HumanML263到body265的显式转换、合成张量流式decode和LDF heading bridge。第一版明确使用HumanML-style预处理提供的IK-derived rotations，并在artifact中标记来源；本地`HumanML3D_motion`、`BABEL_motion`以及两者联合train statistics已经构建完成，真实LDF训练与Web生成仍需正式VAE checkpoint、latent artifacts和commit-time decoder事务接线。
+旧的附加控制网络、外置轨迹编码器和外置root planner已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、唯一`humanml265`转换器、合成张量流式decode和LDF heading bridge。第一版HumanML-only VAE已完成300k steps并导出EMA encoder+EMA decoder tokenizer；本地`HumanML3D_motion`、`BABEL_motion`和VAE-owned statistics已升级为converter/FPS/source-manifest强校验。真实LDF训练采用冻结EMA encoder在线产生deterministic `mu`，仍需encoder context sampler、latent statistics和hybrid batch接线；Web生成仍需commit-time decoder事务接线。
 
 ## 当前可验证范围
 
@@ -26,7 +26,7 @@ root_motion + latent_motion
 python -m pytest tests -q
 ```
 
-测试覆盖typed condition、Root/Body forward、constraint CFG、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`在缺少motion artifact split TXT/statistics时fail-fast；`train_ldf.py`与Web模型加载继续明确抛出`BLOCKED_ON_BODY_VAE`，直到正式VAE/latent artifact接线完成。
+测试覆盖typed condition、Root/Body forward、constraint CFG、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`在缺少motion artifact split TXT/statistics时fail-fast；`train_ldf.py`与Web模型加载继续明确抛出`BLOCKED_ON_BODY_VAE`，直到在线EMA encoder与decoder runtime接线完成。
 
 本地数据、依赖和输出目录默认分别为`./data`、`./deps`和`./outputs`，也可以通过`FLOODCONTROL_DATA`、`FLOODCONTROL_DEPS`和`FLOODCONTROL_OUTPUTS`覆盖。
 

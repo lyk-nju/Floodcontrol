@@ -1,0 +1,29 @@
+device: cuda:0
+sample_count: 10
+output_dir: eval/vae/output/stream
+stream_parity_atol: 1.0e-4
+
+model:
+  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_022912_vae_body265/last.ckpt
+  motion_stats_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/motion_stats.npz
+  params:
+    latent_dim: 128
+    hidden_dim: 512
+    encoder_layers: 6
+    decoder_layers: 6
+    kernel_size: 3
+    dropout: 0.0
+    fps: 20.0
+
+datasets:
+  humanml3d:
+    val_meta_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/val.txt
+    artifact_path: artifacts
+  babel:
+    val_meta_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/BABEL_motion/val.txt
+    artifact_path: artifacts
+
+render:
+  enabled: true
+  fps: 20
+

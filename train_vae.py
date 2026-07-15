@@ -98,12 +98,16 @@ def main() -> None:
             train_dataloader,
             val_dataloaders=val_dataloader,
             ckpt_path=cfg.resume_ckpt,
+            # Project-generated training checkpoints contain trusted optimizer,
+            # scheduler and OmegaConf state in addition to tensors.
+            weights_only=False,
         )
     else:
         trainer.validate(
             lightning_module,
             dataloaders=val_dataloader,
             ckpt_path=cfg.test_ckpt,
+            weights_only=False,
         )
 
 

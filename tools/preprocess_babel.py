@@ -19,6 +19,7 @@ from utils.conditions.vae import CONTRACT_VERSION, FRAMES_PER_TOKEN
 from utils.motion_representation import (
     HUMANML_DIM,
     HUMANML_SOURCE_REPRESENTATION,
+    MOTION_CONVERTER_VERSION,
 )
 
 
@@ -48,19 +49,20 @@ def _read_split(path: Path) -> list[str]:
     return names
 
 
-def _usable_frames(path: Path) -> int:
+def _inspect_motion(path: Path) -> tuple[int, bool]:
     feature = np.load(path, mmap_mode="r", allow_pickle=False)
     if feature.ndim != 2 or feature.shape[-1] != HUMANML_DIM:
         raise ValueError(
             f"BABEL motion must be [F,{HUMANML_DIM}], got {feature.shape} at {path}"
         )
-    return int(feature.shape[0]) // FRAMES_PER_TOKEN * FRAMES_PER_TOKEN
+    usable = int(feature.shape[0]) // FRAMES_PER_TOKEN * FRAMES_PER_TOKEN
+    return usable, bool(np.isfinite(feature).all())
 
 
 def _convert_task(task: tuple[str, str, float]) -> tuple[str, int]:
     source_value, target_value, fps = task
     source, target = Path(source_value), Path(target_value)
-    if artifact_is_current(source, target):
+    if artifact_is_current(source, target, fps=fps):
         return "skipped", 0
     result = process_file(source, target, fps=fps)
     return "converted", int(result["frames"])
@@ -118,17 +120,27 @@ def build_dataset(
         source_split_names[split] = [name for name in names if name not in missing_set]
         missing_by_split[split] = missing
 
-    usable_frames: dict[str, int] = {}
+    motion_inspection: dict[str, tuple[int, bool]] = {}
     for names in source_split_names.values():
         for name in names:
-            if name not in usable_frames:
-                usable_frames[name] = _usable_frames(motion_root / f"{name}.npy")
+            if name not in motion_inspection:
+                motion_inspection[name] = _inspect_motion(motion_root / f"{name}.npy")
+    invalid_by_split = {
+        split: [name for name in names if not motion_inspection[name][1]]
+        for split, names in source_split_names.items()
+    }
     too_short_by_split = {
-        split: [name for name in names if usable_frames[name] < min_frames]
+        split: [
+            name for name in names
+            if motion_inspection[name][1] and motion_inspection[name][0] < min_frames
+        ]
         for split, names in source_split_names.items()
     }
     split_names = {
-        split: [name for name in names if usable_frames[name] >= min_frames]
+        split: [
+            name for name in names
+            if motion_inspection[name][1] and motion_inspection[name][0] >= min_frames
+        ]
         for split, names in source_split_names.items()
     }
     unique_names: dict[str, None] = {}
@@ -173,6 +185,7 @@ def build_dataset(
         atomic_write_text(output / f"{split}.txt", "".join(f"{name}\n" for name in names))
     summary = {
         "contract_version": CONTRACT_VERSION,
+        "converter_version": MOTION_CONVERTER_VERSION,
         "source_dataset": "BABEL_streamed",
         "source_representation": HUMANML_SOURCE_REPRESENTATION,
         "source_root": str(source_root.resolve()),
@@ -183,6 +196,9 @@ def build_dataset(
         "min_frames": min_frames,
         "splits": {name: len(values) for name, values in split_names.items()},
         "missing": {name: len(values) for name, values in missing_by_split.items()},
+        "invalid_nonfinite": {
+            name: len(values) for name, values in invalid_by_split.items()
+        },
         "too_short": {name: len(values) for name, values in too_short_by_split.items()},
         "unique_artifacts": len(tasks),
         "converted": converted,

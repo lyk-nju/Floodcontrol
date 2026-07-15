@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from models.vae_wan_1d import BodyVAE
 
@@ -33,8 +34,32 @@ def test_four_frame_shapes_and_deterministic_tokenize():
     assert decoded.contact_logits.shape == (2, 12, 4)
 
 
+def test_invalid_frames_are_zero_body_and_negative_contact_logits():
+    model = make_model()
+    latent = torch.randn(1, 2, 128)
+    local, valid = make_local(batch=1, tokens=2)
+    frame_valid = torch.tensor([[True, True, True, True, False, False, False, False]])
+    decoded = model.decode(latent, local, valid, frame_valid)
+    assert torch.count_nonzero(decoded.continuous_body[:, 4:]) == 0
+    assert torch.equal(decoded.contact_logits[:, 4:], torch.full((1, 4, 4), -20.0))
+
+
+@pytest.mark.parametrize("kernel_size", [1, 2, 4])
+def test_causal_vae_rejects_unsafe_kernel_sizes(kernel_size):
+    with pytest.raises(ValueError, match="odd and at least three"):
+        BodyVAE(
+            latent_dim=8,
+            hidden_dim=8,
+            encoder_layers=1,
+            decoder_layers=1,
+            kernel_size=kernel_size,
+            allow_identity_statistics=True,
+        )
+
+
 def test_encoder_is_token_causal():
     model = make_model()
+    assert model.encoder_context_tokens == 8
     body = torch.randn(1, 12, 265)
     mask = torch.ones(1, 12, dtype=torch.bool)
     before = model.encode(body, mask).mu

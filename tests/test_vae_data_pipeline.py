@@ -1,5 +1,6 @@
 import json
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,8 +9,10 @@ import torch
 from datasets.humanml3d import HumanML3DDataset, collate_humanml3d
 from tools.compute_vae_stats import main as compute_stats_main
 from tools.preprocess_humanml3d import build_dataset, process_file
+from utils.training.vae.data import validate_training_statistics
 from utils.motion_representation import (
     HUMANML_SOURCE_REPRESENTATION,
+    MOTION_CONVERTER_VERSION,
     derive_patched_local_root,
     humanml263_to_root_body_motion,
     rotate_root_body_yaw,
@@ -122,6 +125,25 @@ def test_training_random_yaw_rotates_every_world_space_feature(tmp_path, monkeyp
     assert torch.allclose(before[before_valid], after[after_valid], atol=1e-5)
 
 
+def test_validation_disables_random_yaw_even_when_config_enables_it(tmp_path, monkeypatch):
+    source = tmp_path / "sample.npy"
+    np.save(source, make_humanml263())
+    process_file(source, tmp_path / "artifacts" / "sample.npz", fps=20)
+    meta = tmp_path / "val.txt"
+    meta.write_text("sample\n")
+    monkeypatch.setattr(torch, "rand", lambda *args, **kwargs: torch.tensor([0.25]))
+    canonical = HumanML3DDataset(
+        meta_paths=[str(meta)], split="val", min_frames=8,
+        max_frames=8, random_yaw=False,
+    )[0]
+    configured = HumanML3DDataset(
+        meta_paths=[str(meta)], split="val", min_frames=8,
+        max_frames=8, random_yaw=True,
+    )[0]
+    assert torch.equal(configured["root_motion"], canonical["root_motion"])
+    assert torch.equal(configured["body_motion"], canonical["body_motion"])
+
+
 def test_dataset_missing_split_metadata_fails_without_online_conversion(tmp_path):
     try:
         HumanML3DDataset(meta_paths=[str(tmp_path / "missing.txt")], split="train")
@@ -212,13 +234,17 @@ def test_preprocess_and_statistics_use_humanml_split_contract(tmp_path, monkeypa
     motion_root.mkdir(parents=True)
     np.save(motion_root / "sample.npy", make_humanml263(frames=20))
     np.save(motion_root / "short.npy", make_humanml263(frames=8))
+    invalid = make_humanml263(frames=20)
+    invalid[0, 0] = np.nan
+    np.save(motion_root / "invalid.npy", invalid)
     for split in ("train", "val", "test"):
-        values = "sample\nshort\n" if split == "train" else "sample\n"
+        values = "sample\nshort\ninvalid\n" if split == "train" else "sample\n"
         (source_root / f"{split}.txt").write_text(values)
     output = tmp_path / "HumanML3D_motion"
     summary = build_dataset(source_root, output, workers=1)
     assert summary["splits"] == {"train": 1, "val": 1, "test": 1}
     assert summary["too_short"] == {"train": 1, "val": 0, "test": 0}
+    assert summary["invalid_nonfinite"] == {"train": 1, "val": 0, "test": 0}
     assert summary["converted"] == 1
     assert summary["skipped"] == 0
     resumed = build_dataset(source_root, output, workers=1)
@@ -229,6 +255,7 @@ def test_preprocess_and_statistics_use_humanml_split_contract(tmp_path, monkeypa
         assert (output / f"{split}.txt").read_text() == "sample\n"
     with np.load(output / "artifacts" / "sample.npz", allow_pickle=False) as data:
         assert str(data["contract_version"]) == "body265-v1"
+        assert str(data["converter_version"]) == "humanml265"
         assert str(data["source_representation"]) == "humanml3d-263-ik-v1"
 
     # A source change invalidates the cached artifact instead of silently
@@ -254,11 +281,34 @@ def test_preprocess_and_statistics_use_humanml_split_contract(tmp_path, monkeypa
     with np.load(stats_path, allow_pickle=False) as stats:
         assert stats["body_cont_mean"].shape == (261,)
         assert stats["local_root_mean"].shape == (4,)
-        assert torch.allclose(
-            torch.from_numpy(stats["global_root_mean"])[[0, 2, 3, 4]],
-            torch.zeros(4),
-            atol=1e-6,
-        )
+        assert "global_root_mean" not in stats
+        assert "global_root_std" not in stats
         metadata = json.loads(str(stats["metadata"]))
+        assert metadata["converter_version"] == MOTION_CONVERTER_VERSION
+        assert len(metadata["artifact_manifest_sha256"]) == 64
         assert metadata["source_representations"] == ["humanml3d-263-ik-v1"]
         assert metadata["yaw_statistics"] == "uniform-four-point-quadrature-v1"
+
+    dataset = HumanML3DDataset(
+        meta_paths=[str(output / "train.txt")],
+        split="train",
+        min_frames=20,
+        max_frames=20,
+    )
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            params=SimpleNamespace(
+                motion_stats_path=str(stats_path),
+                fps=20.0,
+            )
+        )
+    )
+    validate_training_statistics(cfg, dataset)
+
+    # Rebuilding one artifact after its source changes invalidates statistics
+    # even though train.txt itself is unchanged.
+    changed[:, 3] = 1.2
+    np.save(motion_root / "sample.npy", changed)
+    build_dataset(source_root, output, workers=1)
+    with pytest.raises(RuntimeError, match="VAE_STATISTICS_STALE"):
+        validate_training_statistics(cfg, dataset)

@@ -19,6 +19,7 @@ from utils.conditions.vae import (
 )
 from utils.motion_representation import (
     HUMANML_SOURCE_REPRESENTATION,
+    MOTION_CONVERTER_VERSION,
     rotate_root_body_yaw,
     rotate_root_yaw,
 )
@@ -147,6 +148,11 @@ class HumanML3DDataset(Dataset):
         with np.load(path, allow_pickle=False) as data:
             if str(_read_scalar(data, "contract_version", path)) != CONTRACT_VERSION:
                 raise ValueError(f"motion artifact contract version mismatch in {path}")
+            if (
+                str(_read_scalar(data, "converter_version", path))
+                != MOTION_CONVERTER_VERSION
+            ):
+                raise ValueError(f"motion artifact converter version mismatch in {path}")
             source_representation = str(
                 _read_scalar(data, "source_representation", path)
             )

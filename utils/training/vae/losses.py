@@ -132,11 +132,17 @@ class VAELoss(nn.Module):
             losses[name] = loss
             reconstruction = reconstruction + float(weight) * loss
         contacts = inputs.body_motion[..., BODY_CONTINUOUS_DIM:]
+        contact_mask = frame_mask.expand_as(contacts)
+        if inputs.body_feature_valid_mask is not None:
+            contact_mask = (
+                contact_mask
+                & inputs.body_feature_valid_mask[..., BODY_CONTINUOUS_DIM:]
+            )
         contact_loss = _masked_mean(
             F.binary_cross_entropy_with_logits(
                 prediction.body.contact_logits, contacts, reduction="none"
             ),
-            frame_mask.expand_as(contacts),
+            contact_mask,
         )
         losses["contact"] = contact_loss
         reconstruction = reconstruction + self.lambda_contact * contact_loss
@@ -147,9 +153,13 @@ class VAELoss(nn.Module):
         )
         foot_indices = torch.as_tensor(self.foot_joint_indices, device=predicted.device)
         foot_speed = velocities.index_select(-2, foot_indices).norm(dim=-1)
+        velocity_valid = feature_mask[..., velocity_start:].reshape(
+            *predicted.shape[:2], NUM_JOINTS, 3
+        ).all(dim=-1).index_select(-1, foot_indices)
+        skating_mask = contact_mask & velocity_valid
         skating = _masked_mean(
-            prediction.body.contact_logits.sigmoid() * foot_speed,
-            frame_mask.expand_as(prediction.body.contact_logits),
+            contacts * foot_speed,
+            skating_mask,
         )
         losses["skating"] = skating
 
@@ -225,6 +235,20 @@ class VAELoss(nn.Module):
         effective_beta = self.beta_kl * warmup
         losses["kl"] = kl
         losses["kl_beta"] = kl.new_tensor(effective_beta)
+        posterior_sigma = (0.5 * prediction.posterior.logvar).exp()
+        losses["posterior_sigma_mean"] = _masked_mean(
+            posterior_sigma, token_mask[..., None].expand_as(posterior_sigma)
+        )
+        losses["posterior_mu_rms"] = _masked_mean(
+            prediction.posterior.mu.square(),
+            token_mask[..., None].expand_as(prediction.posterior.mu),
+        ).sqrt()
+        flattened_mu = prediction.posterior.mu[token_mask]
+        if flattened_mu.shape[0] > 1:
+            active = flattened_mu.var(dim=0, unbiased=False) > 1e-2
+            losses["active_latent_fraction"] = active.float().mean()
+        else:
+            losses["active_latent_fraction"] = kl.new_zeros(())
         losses["reconstruction"] = reconstruction
         losses["total"] = (
             reconstruction

@@ -13,6 +13,7 @@ from utils.conditions.vae import CONTRACT_VERSION, FRAMES_PER_TOKEN
 from utils.motion_representation import (
     HUMANML_DIM,
     HUMANML_SOURCE_REPRESENTATION,
+    MOTION_CONVERTER_VERSION,
     humanml263_to_root_body_motion,
 )
 
@@ -32,17 +33,25 @@ def atomic_write_text(path: Path, value: str) -> None:
     temporary.replace(path)
 
 
-def artifact_is_current(source: Path, target: Path) -> bool:
+def artifact_is_current(source: Path, target: Path, *, fps: float) -> bool:
     if not target.is_file():
         return False
     try:
         with np.load(target, allow_pickle=False) as data:
             return (
                 str(np.asarray(data["contract_version"]).item()) == CONTRACT_VERSION
+                and str(np.asarray(data["converter_version"]).item())
+                == MOTION_CONVERTER_VERSION
                 and str(np.asarray(data["source_representation"]).item())
                 == HUMANML_SOURCE_REPRESENTATION
                 and str(np.asarray(data["source_sha256"]).item())
                 == sha256_file(source)
+                and np.isclose(
+                    float(np.asarray(data["fps"]).item()),
+                    float(fps),
+                    rtol=0.0,
+                    atol=1e-6,
+                )
             )
     except (KeyError, OSError, ValueError):
         return False
@@ -72,6 +81,7 @@ def process_file(source: Path, target: Path, *, fps: float = 20.0) -> dict:
             body_motion=body.numpy(),
             body_feature_valid_mask=feature_valid.numpy(),
             contract_version=CONTRACT_VERSION,
+            converter_version=MOTION_CONVERTER_VERSION,
             source_representation=HUMANML_SOURCE_REPRESENTATION,
             fps=np.float32(fps),
             source_sha256=source_sha256,
@@ -81,6 +91,7 @@ def process_file(source: Path, target: Path, *, fps: float = 20.0) -> dict:
         temporary.unlink(missing_ok=True)
     return {
         "frames": usable,
+        "converter_version": MOTION_CONVERTER_VERSION,
         "source_representation": HUMANML_SOURCE_REPRESENTATION,
         "source_sha256": source_sha256,
     }

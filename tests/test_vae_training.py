@@ -22,6 +22,7 @@ def test_train_vae_owns_runtime_assembly_but_not_model_implementation():
     assert "create_dataloaders" in source
     assert "VAELightningModule" in source
     assert "class VAELightningModule" not in source
+    assert source.count("weights_only=False") == 2
     assert not (ROOT / "utils" / "training" / "vae" / "runner.py").exists()
 
 

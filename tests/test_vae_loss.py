@@ -1,7 +1,7 @@
 import torch
 
 from models.vae_wan_1d import BodyVAE
-from utils.conditions.vae import VAEInput
+from utils.conditions.vae import BodyPrediction, VAEPrediction, VAEInput, VAEPosterior
 from utils.training.vae.losses import VAELoss
 
 
@@ -63,3 +63,35 @@ def test_fk_loss_requires_versioned_skeleton():
         assert "versioned skeleton" in str(error)
     else:
         raise AssertionError("FK loss accepted missing skeleton")
+
+
+def test_skating_uses_target_contacts_and_ignores_invalid_velocity():
+    body = torch.zeros(1, 4, 265)
+    body[..., 261] = 1.0
+    root = torch.zeros(1, 4, 5)
+    root[..., 3] = 1.0
+    feature_valid = torch.ones_like(body, dtype=torch.bool)
+    feature_valid[:, 0, 195:261] = False
+    inputs = VAEInput(
+        body,
+        root,
+        torch.ones(1, 4, dtype=torch.bool),
+        body_feature_valid_mask=feature_valid,
+    )
+    continuous = torch.zeros(1, 4, 261)
+    velocities = continuous[..., 195:].reshape(1, 4, 22, 3)
+    velocities[:, :, 7, 0] = 2.0
+    prediction = VAEPrediction(
+        BodyPrediction(continuous, torch.full((1, 4, 4), -100.0)),
+        VAEPosterior(torch.zeros(1, 1, 2), torch.zeros(1, 1, 2)),
+        torch.zeros(1, 1, 2),
+        torch.zeros(1, 1, 4, 4),
+        torch.ones(1, 1, 4, 4, dtype=torch.bool),
+    )
+    losses = VAELoss(
+        body_cont_mean=torch.zeros(261),
+        body_cont_std=torch.ones(261),
+    )(inputs, prediction)
+    # Frame zero is excluded by the velocity-validity mask; three remaining
+    # frames have target contact and 2 m/s predicted foot speed.
+    assert torch.allclose(losses["skating"], torch.tensor(0.5))
