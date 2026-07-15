@@ -553,11 +553,51 @@ def reconstruction_metrics(
         "reconstruction_skating_mps": float(reconstructed_skating),
         "stream_offline_max_abs": result.stream_offline_max_abs,
     }
+    if result.reference_stream_body is not None:
+        reference = result.reference_stream_body.continuous_body[0]
+        reference_position_error = (
+            predicted[:, :BODY_POSITION_DIM] - reference[:, :BODY_POSITION_DIM]
+        ).abs()
+        reference_velocity_error = (
+            predicted[:, velocity_start:] - reference[:, velocity_start:]
+        ).abs()
+        reference_rotation = rotation_6d_to_matrix(
+            reference[:, BODY_POSITION_DIM:velocity_start].reshape(
+                -1, NUM_JOINTS, 6
+            )
+        )
+        rolling_relative = pred_rotation.transpose(-1, -2) @ reference_rotation
+        rolling_cosine = (
+            (rolling_relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5
+        ).clamp(-1.0, 1.0)
+        rolling_rotation_error = torch.rad2deg(torch.acos(rolling_cosine))
+        reference_contacts = (
+            result.reference_stream_body.contact_logits[0].sigmoid() >= 0.5
+        )
+        metrics.update(
+            {
+                "rolling_stream_position_mae_m": _masked_mean(
+                    reference_position_error,
+                    feature_valid[:, :BODY_POSITION_DIM],
+                ),
+                "rolling_stream_velocity_mae_mps": _masked_mean(
+                    reference_velocity_error,
+                    feature_valid[:, velocity_start:BODY_CONTINUOUS_DIM],
+                ),
+                "rolling_stream_rotation_geodesic_deg": _masked_mean(
+                    rolling_rotation_error, rotation_valid
+                ),
+                "rolling_stream_contact_disagreement": float(
+                    (predicted_contact != reference_contacts).float().mean()
+                ),
+                "rolling_stream_max_abs": float(result.rolling_reference_max_abs),
+                "cache_window_offline_max_abs": result.stream_offline_max_abs,
+            }
+        )
     if result.rolling_trace is not None:
         metrics.update(
             {
                 "history_tokens": int(result.rolling_trace["history_tokens"]),
-                "future_tokens": int(result.rolling_trace["future_tokens"]),
                 "commit_tokens": int(result.rolling_trace["commit_tokens"]),
                 "rolling_steps": int(result.rolling_trace["commit_token"].shape[0]),
             }
@@ -630,6 +670,17 @@ def _save_sample_outputs(
                 for name, value in result.rolling_trace.items()
             }
         )
+    if result.reference_stream_body is not None:
+        reconstruction_payload.update(
+            {
+                "reference_stream_continuous_body": (
+                    result.reference_stream_body.continuous_body[0].numpy()
+                ),
+                "reference_stream_contact_logits": (
+                    result.reference_stream_body.contact_logits[0].numpy()
+                ),
+            }
+        )
     np.savez_compressed(paths["reconstruction_motion"], **reconstruction_payload)
     _write_json(paths["metrics"], metrics)
     if render_video:
@@ -648,8 +699,7 @@ def _save_sample_outputs(
 
 def _mean_metrics(sample_metrics: list[Mapping[str, object]]) -> dict[str, float]:
     structural = {
-        "frames", "tokens", "history_tokens", "future_tokens",
-        "commit_tokens", "rolling_steps",
+        "frames", "tokens", "history_tokens", "commit_tokens", "rolling_steps",
     }
     numeric_keys = sorted(
         key
@@ -702,7 +752,6 @@ def evaluate_dataset(
                 sample,
                 device=device,
                 history_tokens=int(window_config.history_tokens),
-                future_tokens=int(window_config.future_tokens),
                 commit_tokens=int(window_config.commit_tokens),
                 parity_atol=parity_atol,
             )

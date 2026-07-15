@@ -69,38 +69,33 @@ def test_body_to_global_joints_uses_explicit_root_xz_and_global_height():
     assert torch.equal(joints[0, 1], torch.tensor([2.5, 0.8, -3.25]))
 
 
-def test_rolling_window_has_fixed_10_history_10_future_contract():
+def test_rolling_window_has_fixed_history_and_current_contract():
     latent = torch.arange(23, dtype=torch.float32).reshape(1, 23, 1)
-    cold = create_rolling_window(
-        latent, commit_index=0, history_tokens=10, future_tokens=10
-    )
-    assert cold["values"].shape == (1, 20, 1)
+    cold = create_rolling_window(latent, commit_index=0, history_tokens=10)
+    assert cold["values"].shape == (1, 11, 1)
     assert not cold["history_mask"].any()
-    assert torch.equal(
-        cold["timeline_position_ids"][0, 10:], torch.arange(10)
-    )
+    assert cold["timeline_position_ids"][0, 10] == 0
+    assert cold["current_mask"].sum() == 1
 
-    middle = create_rolling_window(
-        latent, commit_index=10, history_tokens=10, future_tokens=10
-    )
-    assert torch.equal(
-        middle["timeline_position_ids"][0], torch.arange(20)
-    )
+    middle = create_rolling_window(latent, commit_index=10, history_tokens=10)
+    assert torch.equal(middle["timeline_position_ids"][0], torch.arange(11))
     assert middle["history_mask"][0, :10].all()
-    assert middle["future_mask"][0, 10:].all()
+    assert middle["current_mask"][0, 10]
 
-    tail = create_rolling_window(
-        latent, commit_index=22, history_tokens=10, future_tokens=10
-    )
-    assert torch.equal(
-        tail["timeline_position_ids"][0, :10], torch.arange(12, 22)
-    )
+    tail = create_rolling_window(latent, commit_index=22, history_tokens=10)
+    assert torch.equal(tail["timeline_position_ids"][0, :10], torch.arange(12, 22))
     assert tail["timeline_position_ids"][0, 10] == 22
-    assert torch.equal(tail["timeline_position_ids"][0, 11:], torch.full((9,), -1))
-    assert tail["future_mask"].sum() == 1
+
+    warmup = create_rolling_window(latent, commit_index=3, history_tokens=10)
+    assert torch.equal(
+        warmup["timeline_position_ids"][0, :7], torch.full((7,), -1)
+    )
+    assert torch.equal(warmup["timeline_position_ids"][0, 7:], torch.arange(4))
+    assert warmup["history_mask"].sum() == 3
+    assert warmup["current_mask"].sum() == 1
 
 
-def test_rolling_reconstruction_commits_each_token_once_and_matches_stream():
+def test_rolling_reconstruction_replays_finite_history_and_checks_cache_parity():
     model = _model()
     sample = _sample(frames=44)
     direct = stream_reconstruct(model, sample, device="cpu")
@@ -108,20 +103,25 @@ def test_rolling_reconstruction_commits_each_token_once_and_matches_stream():
         model,
         sample,
         device="cpu",
-        history_tokens=10,
-        future_tokens=10,
+        history_tokens=1,
         commit_tokens=1,
     )
-    assert torch.equal(
+    assert not torch.allclose(
         rolling.streamed_body.continuous_body,
         direct.streamed_body.continuous_body,
     )
+    assert rolling.rolling_reference_max_abs > 0
+    assert rolling.stream_offline_max_abs <= 1e-5
     assert torch.equal(rolling.rolling_trace["commit_token"], torch.arange(11))
-    assert rolling.rolling_trace["timeline_position_ids"].shape == (11, 20)
+    assert rolling.rolling_trace["timeline_position_ids"].shape == (11, 2)
+    assert rolling.rolling_trace["history_mask"][0].sum() == 0
+    assert rolling.rolling_trace["history_mask"][1:].all()
+    assert rolling.rolling_trace["current_mask"].all()
     metrics = reconstruction_metrics(sample, rolling)
-    assert metrics["history_tokens"] == 10
-    assert metrics["future_tokens"] == 10
+    assert metrics["history_tokens"] == 1
     assert metrics["rolling_steps"] == 11
+    assert metrics["rolling_stream_max_abs"] > 0
+    assert metrics["cache_window_offline_max_abs"] <= 1e-5
 
 
 def test_output_layout_separates_original_and_reconstruction(tmp_path):

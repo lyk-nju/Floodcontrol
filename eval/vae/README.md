@@ -3,7 +3,7 @@
 The VAE evaluation package exposes two separate tasks. Both use the first 10
 sample IDs from the HumanML3D and BABEL validation TXT files, the frozen EMA
 encoder/decoder, deterministic posterior means, and the source explicit root.
-They differ only in how body tokens are scheduled before the causal decoder.
+They differ only in how much causal decoder history is retained.
 
 ## 1. Direct stream task
 
@@ -19,20 +19,26 @@ Results are written below `eval/vae/output/stream/`.
 
 ## 2. Rolling-window task
 
-The default active view has 10 history slots and 10 future slots. History is
-right-aligned before the fixed commit boundary; future is left-aligned after
-it. Each step commits only the first future token (four frames) and then moves
-the window forward by one token. Missing history at cold start and missing
-future at sequence end remain invalid padded slots. History is read-only and is
-never replayed into the persistent decoder cache.
+This task models a finite-history runtime rather than an LDF denoising window.
+For each current token it creates a fresh `VAEDecoderState`, replays at most the
+previous 10 deterministic posterior-mean tokens together with their GT
+local-root patches, decodes the current token, and commits only its four output
+frames. There are no future tokens because the VAE decoder is causal.
+
+The same full causal encoder output is used by both tasks, so differences are
+caused only by truncating decoder history. A persistent full-history stream is
+saved as the reference. Each rolling window is also decoded offline from a
+fresh boundary; agreement between that result and token-by-token replay checks
+the cache implementation independently of the expected finite-history error.
 
 ```bash
 python -m eval.vae.rolling --config eval/vae/rolling.yaml
 ```
 
 Results are written below `eval/vae/output/rolling/`. Reconstruction NPZ files
-also contain the complete rolling trace: timeline position IDs, history/future
-masks, window origin, history/future ranges and committed token indices.
+also contain the complete rolling trace: timeline position IDs, history/current
+masks, window boundaries and committed token indices. They additionally retain
+the persistent-stream reference for direct numerical comparison.
 
 ## Smoke overrides
 
@@ -62,7 +68,7 @@ output/<task>/<dataset>/
 
 The reconstruction NPZ retains deterministic `posterior_mu`, derived
 local-root patches, validity masks, contact logits/probabilities and global
-joints. Offline decoding is executed internally and must match the submitted
-stream within the configured tolerance. The default `1e-4` tolerance accounts
-for floating-point accumulation-order differences between full-sequence and
-long token-by-token convolutions.
+joints. Direct stream must match full-sequence offline decode. Rolling replay
+must match offline decode of each identical truncated window. The default
+`1e-4` tolerance accounts for floating-point accumulation-order differences
+between full-sequence and token-by-token convolutions.
