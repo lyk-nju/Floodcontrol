@@ -39,6 +39,7 @@ def test_separated_cfg_combination_and_shared_root_boundary():
         timeline_position_ids=torch.arange(2)[None],
         rope_position_ids=torch.arange(2)[None],
         previous_root_frame=None,
+        previous_root_valid_mask=None,
         condition=condition,
     )
     seen_local = []

@@ -1,6 +1,8 @@
 #!/bin/bash
 # Server management script for web_demo
 
+set -u
+
 PID_FILE="server.pid"
 LOG_FILE="app.log"
 CONFIG_FILE="${2:-../configs/stream.yaml}"
@@ -8,7 +10,7 @@ PORT="${PORT:-5000}"
 
 # Allow overriding GPU via env, otherwise keep user's setting.
 # (Do not hardcode a single GPU index here.)
-if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
   export CUDA_VISIBLE_DEVICES
 fi
 
@@ -22,11 +24,11 @@ try_activate_conda() {
   fi
 }
 
-case "$1" in
+case "${1:-}" in
     start)
         if [ -f "$PID_FILE" ]; then
             PID=$(cat "$PID_FILE")
-            if ps -p $PID > /dev/null 2>&1; then
+            if ps -p "$PID" > /dev/null 2>&1; then
                 echo "Server is already running (PID: $PID)"
                 exit 1
             else
@@ -54,7 +56,7 @@ case "$1" in
         echo $! > "$PID_FILE"
         sleep 3
         
-        if ps -p $(cat "$PID_FILE") > /dev/null 2>&1; then
+        if ps -p "$(cat "$PID_FILE")" > /dev/null 2>&1; then
             echo "Server started successfully (PID: $(cat $PID_FILE))"
             curl -s "http://localhost:${PORT}/api/status"
         else
@@ -66,15 +68,24 @@ case "$1" in
         
     stop)
         if [ ! -f "$PID_FILE" ]; then
-            echo "No PID file found. Killing all python app.py processes..."
-            pkill -9 -f "python app.py"
+            echo "No PID file found; server is already stopped"
             exit 0
         fi
         
         PID=$(cat "$PID_FILE")
-        if ps -p $PID > /dev/null 2>&1; then
+        if ps -p "$PID" > /dev/null 2>&1; then
             echo "Stopping server (PID: $PID)..."
-            kill -9 $PID
+            kill "$PID"
+            for _ in $(seq 1 50); do
+                if ! ps -p "$PID" > /dev/null 2>&1; then
+                    break
+                fi
+                sleep 0.1
+            done
+            if ps -p "$PID" > /dev/null 2>&1; then
+                echo "Graceful stop timed out; terminating PID $PID"
+                kill -9 "$PID"
+            fi
             rm -f "$PID_FILE"
             echo "Server stopped"
         else
@@ -84,15 +95,15 @@ case "$1" in
         ;;
         
     restart)
-        $0 stop
+        "$0" stop
         sleep 2
-        $0 start "$2"
+        "$0" start "${2:-../configs/stream.yaml}"
         ;;
         
     status)
         if [ -f "$PID_FILE" ]; then
             PID=$(cat "$PID_FILE")
-            if ps -p $PID > /dev/null 2>&1; then
+            if ps -p "$PID" > /dev/null 2>&1; then
                 echo "Server is running (PID: $PID)"
                 curl -s "http://localhost:${PORT}/api/status"
             else

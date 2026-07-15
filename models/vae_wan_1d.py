@@ -22,6 +22,8 @@ from utils.motion_process import recover_local_root
 from utils.token_frame import (
     FRAMES_PER_TOKEN,
     frame_count_to_token_count,
+    frame_valid_to_token_valid,
+    prefix_valid_token_count,
     require_aligned_frame_count,
 )
 
@@ -186,27 +188,6 @@ class BodyVAE(nn.Module):
             raise ValueError("VAE posterior logvar contains non-finite values")
         return posterior
 
-    def encode_window(
-        self,
-        body_with_context: torch.Tensor,
-        frame_valid_mask: torch.Tensor,
-        context_token_count: int,
-    ) -> VAEPosterior:
-        """Encode raw posterior values for an active window after warm-up context."""
-
-        context_token_count = int(context_token_count)
-        if not 0 <= context_token_count <= self.encoder_context_tokens:
-            raise ValueError("context_token_count exceeds the encoder causal context")
-        frames = require_aligned_frame_count(body_with_context.shape[1])
-        total_tokens = frame_count_to_token_count(frames)
-        if context_token_count >= total_tokens:
-            raise ValueError("encode_window requires at least one active token")
-        posterior = self.encode(body_with_context, frame_valid_mask)
-        return VAEPosterior(
-            mu=posterior.mu[:, context_token_count:],
-            logvar=posterior.logvar[:, context_token_count:],
-        )
-
     def decode(
         self,
         latent_tokens: torch.Tensor,
@@ -276,12 +257,65 @@ class BodyVAE(nn.Module):
         self,
         body_with_context: torch.Tensor,
         frame_valid_mask: torch.Tensor,
-        context_token_count: int,
+        context_token_count: torch.Tensor,
     ) -> torch.Tensor:
-        posterior = self.encode_window(
-            body_with_context, frame_valid_mask, context_token_count
+        """Encode active motion as normalized deterministic tokens.
+
+        ``body_with_context`` is laid out as a valid left prefix followed by
+        right padding. ``context_token_count`` locates the first active token
+        independently for each sample.
+        """
+
+        if body_with_context.ndim != 3 or body_with_context.shape[-1] != BODY_DIM:
+            raise ValueError("body_with_context must be [B,F,265]")
+        if not torch.is_tensor(context_token_count):
+            raise TypeError("context_token_count must be a tensor")
+        if context_token_count.dtype != torch.long:
+            raise TypeError("context_token_count must be long [B]")
+        batch = body_with_context.shape[0]
+        if tuple(context_token_count.shape) != (batch,):
+            raise ValueError("context_token_count must be long [B]")
+        frames = require_aligned_frame_count(body_with_context.shape[1])
+        total_tokens = frame_count_to_token_count(frames)
+        if tuple(frame_valid_mask.shape) != tuple(body_with_context.shape[:2]):
+            raise ValueError("frame_valid_mask must match body_with_context [B,F]")
+        if frame_valid_mask.dtype != torch.bool:
+            raise TypeError("frame_valid_mask must be bool [B,F]")
+
+        frame_patches = frame_valid_mask.reshape(
+            batch, total_tokens, FRAMES_PER_TOKEN
         )
-        return self.normalize_latent(posterior.mu)
+        if not bool((frame_patches == frame_patches[..., :1]).all()):
+            raise ValueError(
+                "frame validity must be constant within each four-frame token"
+            )
+        token_valid = frame_valid_to_token_valid(frame_valid_mask)
+        valid_token_count = prefix_valid_token_count(token_valid)
+        context_token_count = context_token_count.to(device=body_with_context.device)
+        if bool((context_token_count < 0).any()) or bool(
+            (context_token_count > self.encoder_context_tokens).any()
+        ):
+            raise ValueError("context_token_count exceeds the encoder causal context")
+        if bool((context_token_count >= valid_token_count).any()):
+            raise ValueError("tokenize_window requires at least one active token per sample")
+
+        active_token_count = valid_token_count - context_token_count
+        max_active_tokens = int(active_token_count.max().item())
+        active_offsets = torch.arange(
+            max_active_tokens, device=body_with_context.device
+        )
+        gather_index = context_token_count[:, None] + active_offsets[None]
+        active_valid = active_offsets[None] < active_token_count[:, None]
+        safe_index = gather_index.clamp(max=total_tokens - 1)
+
+        posterior = self.encode(body_with_context, frame_valid_mask)
+        latent_index = safe_index[..., None].expand(
+            batch, max_active_tokens, posterior.mu.shape[-1]
+        )
+        normalized = self.normalize_latent(posterior.mu.gather(1, latent_index))
+        return torch.where(
+            active_valid[..., None], normalized, torch.zeros_like(normalized)
+        )
 
     @torch.no_grad()
     def detokenize(

@@ -1,1 +1,1 @@
-"""Floodcontrol web package, blocked until the body-VAE runtime is connected."""
+"""Web transport and session adapters for Floodcontrol Hybrid inference."""

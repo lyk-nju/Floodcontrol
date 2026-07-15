@@ -111,6 +111,21 @@ class LDFCondition:
             self.text_null_context, list
         ):
             raise TypeError("text_context and text_null_context must be lists")
+        text_features = self.text_context + self.text_null_context
+        text_dim = None
+        for index, value in enumerate(text_features):
+            if not torch.is_tensor(value) or value.ndim != 2:
+                raise ValueError(
+                    f"text context {index} must be a rank-2 tensor [L,C]"
+                )
+            if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+                raise ValueError("text contexts must contain finite floating-point values")
+            if value.shape[0] <= 0 or value.shape[1] <= 0:
+                raise ValueError("text contexts must have positive sequence and feature sizes")
+            if text_dim is None:
+                text_dim = int(value.shape[1])
+            elif value.shape[1] != text_dim:
+                raise ValueError("all text contexts must share one feature dimension")
         if batch_size is not None:
             valid_text_lengths = {batch_size}
             if token_length is not None:
@@ -225,6 +240,7 @@ class LDFInput:
     timeline_position_ids: torch.Tensor
     rope_position_ids: torch.Tensor
     previous_root_frame: torch.Tensor | None
+    previous_root_valid_mask: torch.Tensor | None
     condition: LDFCondition
 
     def validate(self) -> None:
@@ -274,10 +290,23 @@ class LDFInput:
             ).squeeze(1)
             if bool((first_generation_rope[has_generation] != 0).any()):
                 raise ValueError("the first generation token must have RoPE position 0")
+        if (self.previous_root_frame is None) != (
+            self.previous_root_valid_mask is None
+        ):
+            raise ValueError(
+                "previous_root_frame and previous_root_valid_mask must both be set or both be None"
+            )
         if self.previous_root_frame is not None:
             _require_tensor("previous_root_frame", self.previous_root_frame, 2)
             if tuple(self.previous_root_frame.shape) != (batch, ROOT_DIM):
                 raise ValueError("previous_root_frame must be [B,5]")
+            _require_tensor(
+                "previous_root_valid_mask", self.previous_root_valid_mask, 1
+            )
+            if tuple(self.previous_root_valid_mask.shape) != (batch,):
+                raise ValueError("previous_root_valid_mask must be [B]")
+            if self.previous_root_valid_mask.dtype != torch.bool:
+                raise TypeError("previous_root_valid_mask must be bool")
         self.condition.validate(
             batch_size=batch,
             token_length=tokens,
@@ -396,8 +425,25 @@ def create_window_condition(
     frame_count = token_count_to_frame_count(window_tokens)
     future_start = frame_start + frame_count
     future_count = token_count_to_frame_count(future_tokens)
+    window_text = list(text_context)
+    batch_size = len(text_null_context)
+    if batch_size and len(window_text) != batch_size:
+        if len(window_text) % batch_size:
+            raise ValueError("token text timeline length must be divisible by batch size")
+        absolute_tokens = len(window_text) // batch_size
+        sliced_text: list[torch.Tensor] = []
+        for batch_index in range(batch_size):
+            row = window_text[
+                batch_index * absolute_tokens : (batch_index + 1) * absolute_tokens
+            ]
+            selected = row[window_origin : window_origin + window_tokens]
+            selected.extend(
+                [text_null_context[batch_index]] * (window_tokens - len(selected))
+            )
+            sliced_text.extend(selected)
+        window_text = sliced_text
     return {
-        "text_context": list(text_context),
+        "text_context": window_text,
         "text_null_context": list(text_null_context),
         "root_condition_value": _slice_and_pad(
             root_condition_value, frame_start, frame_count

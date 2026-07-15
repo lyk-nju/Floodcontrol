@@ -40,6 +40,7 @@ def make_input(batch=2, tokens=6):
         timeline_position_ids=torch.arange(tokens)[None].expand(batch, -1),
         rope_position_ids=torch.arange(tokens)[None].expand(batch, -1),
         previous_root_frame=None,
+        previous_root_valid_mask=None,
         condition=condition,
     )
 
@@ -113,6 +114,7 @@ def test_future_root_uses_generation_centered_rope_without_extending_body():
         timeline_position_ids=torch.tensor([[5, 6, 7, 8]]),
         rope_position_ids=torch.tensor([[-1, 0, 1, 2]]),
         previous_root_frame=None,
+        previous_root_valid_mask=None,
         condition=condition,
     )
     captured = {}
@@ -130,3 +132,67 @@ def test_future_root_uses_generation_centered_rope_without_extending_body():
     assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 2, 3, 4]]
     assert output.velocity.root_motion.shape[1] == 4
     assert output.velocity.latent_motion.shape[1] == 4
+
+
+def test_future_root_is_packed_after_the_visible_motion_prefix():
+    model = make_model().eval()
+    condition = LDFCondition(
+        text_context=[torch.randn(2, 8) for _ in range(4)],
+        text_null_context=[torch.zeros(1, 8)],
+        future_root_condition_value=torch.zeros(1, 2, 4, 5),
+        future_root_condition_mask=torch.ones(1, 2, 4, 5, dtype=torch.bool),
+        future_timeline_position_ids=torch.tensor([[9, 10]]),
+        future_valid_mask=torch.tensor([[True, True]]),
+    )
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(
+            torch.randn(1, 4, 4, 5), torch.randn(1, 4, 8)
+        ),
+        beta=torch.tensor([[0.0, 0.5, 0.75, 1.0]]),
+        history_mask=torch.tensor([[True, False, False, False]]),
+        generation_mask=torch.tensor([[False, True, True, False]]),
+        timeline_position_ids=torch.tensor([[5, 6, 7, 8]]),
+        rope_position_ids=torch.tensor([[-1, 0, 1, 2]]),
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=condition,
+    )
+    captured = {}
+
+    def capture_root_blocks(self, tokens, **kwargs):
+        captured["input_length"] = tokens.shape[1]
+        captured["rope_position_ids"] = kwargs["rope_position_ids"].clone()
+        captured["text_query_indices"] = kwargs["text_query_indices"].clone()
+        return tokens.new_zeros(tokens.shape[0], tokens.shape[1], self.root_patch_dim)
+
+    model.root_transformer._run_blocks = types.MethodType(
+        capture_root_blocks, model.root_transformer
+    )
+    output = model(inputs)
+
+    assert captured["input_length"] == 5
+    assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 3, 4]]
+    assert captured["text_query_indices"].tolist() == [[0, 1, 2, -1, -1]]
+    assert not output.velocity.root_motion[:, 3].any()
+
+
+def test_local_root_uses_per_sample_previous_root_validity():
+    model = make_model()
+    clean_root = torch.zeros(2, 1, 4, 5)
+    clean_root[..., 3] = 1.0
+    clean_root[:, 0, :, 0] = torch.arange(4, dtype=torch.float32)
+    previous = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    local, valid, _ = model._local_root(
+        clean_root,
+        previous,
+        torch.tensor([False, True]),
+    )
+    assert torch.equal(valid[0, 0, 0], torch.tensor([False, False, False, True]))
+    assert valid[1, 0, 0].all()
+    assert torch.allclose(local[0, 0, 0, :3], torch.zeros(3))
+    assert torch.allclose(local[1, 0, 0, 1], torch.tensor(20.0))

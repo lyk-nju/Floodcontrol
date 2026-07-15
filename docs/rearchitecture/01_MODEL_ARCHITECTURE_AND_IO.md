@@ -1,6 +1,6 @@
 # 01 模型结构与输入输出
 
-状态：`LDF_AND_BODY_VAE_CORE_IMPLEMENTED / DATA_AND_RUNTIME_OPEN`
+状态：`LDF_BODY_VAE_AND_WEB_RUNTIME_IMPLEMENTED / LDF_TRAINING_OPEN`
 
 ## 设计顺序与文档顺序
 
@@ -91,11 +91,11 @@ coordinate/value types
 - `models/diffusion_forcing_wan.py` 已公开 `RootTransformer/BodyTransformer/LDF`，两阶段不出现在公共文件名或类名中。
 - `generate/stream_generate/stream_generate_step` 已迁移为显式 `HybridMotion/LDFStreamState`，并通过合成张量的commit、rolling和snapshot/restore测试。
 - 旧附加控制网络、专用轨迹编码器、专用attention、tiny模型和外置root planner已经物理删除；constraint CFG由主干接管。
-- body VAE核心、唯一`humanml265`转换、全量本地motion artifacts/VAE statistics、首个300k EMA tokenizer、`body265 -> latent_motion`和显式`VAEDecoderState`已经实现；真实LDF训练改为冻结EMA encoder在线产生deterministic `mu`，其context sampler、latent statistics和hybrid batch尚未接线，Web decoder事务也尚未完成，因此真实LDF训练与Web生成仍明确阻断。
+- body VAE核心、唯一`humanml265`转换、全量本地motion artifacts/VAE statistics、首个300k EMA tokenizer、`body265 -> latent_motion`和显式`VAEDecoderState`已经实现；真实LDF训练改为冻结EMA encoder在线产生deterministic `mu`，其context sampler、latent statistics和hybrid batch已经落地。Web通过`InferenceSession`完成LDF commit、causal decode、四帧chunk与session锁接线；真实LDF训练仍等待正式H/G/F/C、noise/beta、condition与v-predict loss，Web模型加载则等待由该训练冻结的checkpoint合同。
 
 ### 删除状态
 
-上述旧模块删除门槛已经由新版forward、CFG、Hybrid stream与全仓残留搜索满足。VAE/data尚未满足端到端门槛，因此训练和Web使用fail-fast；HumanML263只作为离线物理表示来源，不作为新版VAE或LDF的运行时接口。
+上述旧模块删除门槛已经由新版forward、CFG、Hybrid stream与全仓残留搜索满足。真实LDF teacher-training已接入冻结EMA VAE、冻结UMT5、逐token prompt、flow-v loss、optimizer和EMA；Web runtime结构已经完成，但模型加载在正式LDF checkpoint冻结前以`BLOCKED_ON_LDF_CHECKPOINT` fail-fast。HumanML263只作为离线物理表示来源，不作为新版VAE或LDF的运行时接口。
 
 ## 在线因果性不等于 LDF causal attention
 
@@ -216,6 +216,7 @@ LDFInput
   timeline_position_ids: int64 [B,T]
   rope_position_ids:     int64 [B,T]
   previous_root_frame: float [B,5] | None
+  previous_root_valid_mask: bool [B] | None
   condition:           LDFCondition
 ```
 
@@ -225,8 +226,8 @@ LDFInput
 - `noisy_motion.latent_motion` 是同一 token 的 normalized body-latent diffusion state；
 - `beta` 使用 FloodDiffusion 的方向：`0=clean, 1=pure noise`；
 - history 区域满足 `beta=0`，其中 root/body 是 clean committed state；
-- generation 区域包含 partially noisy active band 和 pure-noise frontier；
-- frontier 是 `generation_mask & (beta == 1)` 的派生语义，不增加独立结构类型；
+- generation 区域只包含当前denoiser forward已经可见或本步即将更新的active band；它可以包含刚进入调度、当前`beta=1`但`next_beta<1`的边界token；
+- pure-noise frontier继续存在于固定shape的`noisy_motion`中，但满足`~history_mask & ~generation_mask & beta==1`，不进入本步attention，也不增加独立结构类型；
 - history/generation 在有效区域内互斥，future constraints 不属于 `HybridMotion`；
 - `timeline_position_ids`是runtime absolute timeline坐标，服务于三角调度、commit、rolling和condition slicing；
 - `rope_position_ids`只服务于Transformer，并以当前first-generation token为0；history为负、generation从0开始、future为正；
@@ -251,7 +252,7 @@ LDFCondition
 - root/body observation 使用 typed value + mask；进入 LDF 前已完成坐标变换、normalization 和 active-window 裁剪；
 - observation projector 在模型内部产生 in-window observation features 与 constraint-only future-goal tokens；
 - future timeline IDs使用absolute坐标并严格位于当前motion window之后；Root Stage根据`rope_origin`派生future RoPE IDs，future token数量不得改变motion、beta或Body Stage长度；
-- `previous_root_frame` 由 `LDFInput` 直接携带，只供 backward local-root codec 使用，不伪装成 noisy generation token或 CFG 条件；
+- `previous_root_frame/previous_root_valid_mask`由`LDFInput`成对携带，只供backward local-root codec使用，不伪装成noisy generation token或CFG条件；全batch cold start时两者均为`None`，随机crop混合batch则使用physical `[B,5]`与逐样本bool `[B]`；
 - condition dropout 与 CFG 分支由 `utils/conditions/ldf.py` 的 `create_window_condition/create_ldf_condition/create_cfg_condition` 纯函数创建，不增加公共 wrapper dataclass；
 - 不存在 `controlnet_condition`、`root_refiner_plan` 或 post-decode feedback 输入。
 
@@ -578,7 +579,7 @@ LocalRootMotionBatch
   feature_valid: bool  [B,F,4]
 ```
 
-正常连续生成或随机crop `s>0` 使用真实 `root_motion[s-1]` 作为 `previous_root_frame`，四个feature均有效。完整clip/cold start没有真实previous pose时，在clean root预测后复制frame 0的XZ/heading，使第一条速度数值为零，但标记：
+正常连续生成或随机crop `s>0` 使用真实 `root_motion[s-1]` 作为 `previous_root_frame`，四个feature均有效。混合batch通过`previous_root_valid_mask [B]`逐样本表达该边界；完整clip/cold start没有真实previous pose时，在clean root预测后复制frame 0的XZ/heading，使第一条速度数值为零，但标记：
 
 ```text
 feature_valid[:,0] = [False, False, False, True]

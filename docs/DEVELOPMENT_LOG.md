@@ -1545,6 +1545,44 @@
 - 若后续评测需要original/reconstruction横向拼接，应在`eval/vae`内新增任务级comparison工具和明确的FFmpeg依赖测试，不恢复通用visualization中的旧250行composite实现。
 - 全仓测试需要等待Dataset/collate并行重构稳定后重跑；当前visualization自身与其VAE eval调用链已经独立验证。
 
+## 2026-07-15 · 删除旧多阶段step semantics
+
+类型：旧训练模块物理删除 / checkpoint步数修正 / 公共导出清理
+
+实际改动内容：
+
+- 删除`utils/training/step_semantics.py`与`utils/training/module_step.py`，移除`StepSemantics`、`CheckpointStepInfo`、resume offset、runtime max-step重写、scheduler step重写和Lightning module adapter。
+- 清理`utils/training/__init__.py`中的全部旧step API导出，不保留兼容别名。
+- `BasicLightningModule.training_step()`直接使用Lightning `global_step + 1`记录`ckpt_absolute_step`，语义固定为当前batch完成后累计的optimizer steps。
+- 增加migration guard，固定两个文件和旧API不得回归；训练测试同时断言checkpoint metric不再经过`ckpt_step_info()`且明确包含completed-step修正。
+
+改动理由：
+
+- 旧实现服务于FloodNet中“resume后重新计数的self-forcing第二阶段”，依赖未在Floodcontrol赋值的`_resume_step_offset`和当前配置不存在的`self_forcing.enabled`。
+- 当前唯一活动调用最终只把`global_step`包装成checkpoint metric，其他resume/runtime/scheduler函数均无调用和专项测试；Lightning已经负责恢复global step、optimizer、scheduler与loop state。
+- metric在`training_step()`读取的是本batch执行前的global step；旧逻辑导致完成300000步的历史checkpoint文件名为`step_299999.ckpt`。直接记录`global_step + 1`后，未来300000步run将保存为`step_300000.ckpt`。
+- 后续LDF self-forcing应由global-step驱动的显式schedule实现；若最终采用独立第二阶段Trainer，再设计写入配置/checkpoint的`TrainingPhase`，而不是恢复隐藏offset推断。
+
+验证：
+
+- training与migration定向回归：`29 passed`。
+- 修改文件`py_compile`通过，`git diff --check`通过；残留搜索仅在反回归测试中出现旧模块/API名称。
+- 全仓`pytest -q`完成执行：`110 passed, 4 failed`。四项失败均位于本轮未修改的并行LDF/VAE encoder-window重构：三项`tests/test_ldf_data.py`期望旧`body_with_context/context_frame_valid_mask`合同，一项`tests/test_vae_model.py`仍以Python int调用当前要求tensor的`context_token_count`；本轮未越界修改这些并行问题。
+
+涉及文件：
+
+- `utils/training/step_semantics.py`（删除）
+- `utils/training/module_step.py`（删除）
+- `utils/training/lightning_module.py`
+- `utils/training/__init__.py`
+- `tests/test_migration_guards.py`
+- `tests/test_vae_training.py`
+
+尚未完成的后续事项：
+
+- 当前checkpoint callback仍使用`ckpt_absolute_step`作为monitor以保留最近20个checkpoint；后续若切换到Lightning内建`{step}`命名，应同时验证`save_top_k`排序和resume命名，不能只替换filename模板。
+- 上述四项全仓失败需要在正在进行的LDF context-window协议重构中统一测试与实现，和本次step模块删除无依赖关系。
+
 ## 2026-07-15 · 简化BodyVAE模型、checkpoint与显式cache边界
 
 类型：VAE架构简化 / 强协议删除 / checkpoint与runtime迁移 / 测试与文档
@@ -1906,3 +1944,337 @@
 
 - `train_ldf.py`仍保持migration guard；未来LDF配置应为HumanML和BABEL都显式设置`text_path: texts`并接入现有`LDFWindowCollator`，本轮没有提前恢复trainer。
 - 旧评估artifact中的`HumanML3D_motion/BABEL_motion`标签不会迁移；比较新旧评估时应将其视为历史metadata名称差异，而不是数据或模型变化。
+
+## 2026-07-15 · LDF真实causal context与逐样本window encode
+
+类型：LDF数据合同修正 / VAE在线编码接口 / 因果数值回归
+
+实际改动内容：
+
+- `LDFWindowCollator`删除cold-start假左零context与冗余`context_frame_valid_mask`。每个样本只携带`min(window_start_token, encoder_context_tokens)`个真实历史token，批内统一排列为`[真实context | active window | 右padding]`。
+- `context_token_count`由全batch共享标量改为`long [B]`，逐样本记录active window在encoder输入中的真实offset；active root/body及其frame/feature mask继续作为独立右padding张量，不引入第二套motion mask或Root命名。
+- `BodyVAE.encode_window()`与`tokenize_window()`改为接受逐样本context count。接口验证四帧patch内frame validity一致、有效encoder token为连续左前缀、context不超过encoder感受野和样本有效长度，并保证每个样本至少保留一个active token。
+- encoder仍只执行一次batch前向；随后按各样本context offset gather active `mu/logvar`，统一右补零。`tokenize_window()`在latent归一化后再次清零active padding，避免非零latent mean将padding变成数值非零。
+- `train_ldf.py`的migration guard更新为已完成real-context collator与window encode边界；真实训练仍明确阻塞在frozen EMA online encode调用和HybridMotion Lightning batch尚未接线。
+- 数据与VAE设计文档同步冻结真实历史、逐样本offset和右侧batch padding协议。
+
+改动理由：
+
+- 显式补在序列左侧的零token不是causal convolution的“不存在历史”。这些token会经过input projection、bias、normalization和残差块，产生非零隐藏状态并污染active posterior；真实序列起点必须直接由网络自身的causal左边界处理。
+- batch内样本的window起点不同，真实可用历史长度天然不同。共享固定offset无法同时表达cold start、partial context和full context，必须使用逐样本count提取active posterior。
+- latent padding在归一化后可能因非零mean/std变为非零，因此padding语义必须在normalized tokenizer出口再次显式恢复。
+
+验证：
+
+- LDF collator覆盖cold start无假前缀、partial/full真实历史、混合context与active长度、逐样本count、右侧唯一padding、previous root和文本裁剪语义。
+- VAE encoder新增cold-start、partial-context和full-context三类数值parity；window active `mu/logvar`均与full-clip对应token在`atol=1e-6`内一致。
+- 混合context batch验证逐样本gather、posterior右padding为零，以及使用非identity latent statistics后normalized `mu` padding仍为零。
+- LDF/VAE/migration/training定向回归：`46 passed`；最终全仓`pytest tests -q`：`117 passed`。
+- 相关Python文件`py_compile`通过，`git diff --check`通过；活动代码中不再输出独立`context_frame_valid_mask`或使用标量`context_token_count`。
+
+涉及文件：
+
+- `models/vae_wan_1d.py`
+- `utils/training/ldf/data.py`
+- `tests/{test_ldf_data,test_vae_model,test_migration_guards}.py`
+- `train_ldf.py`
+- `docs/rearchitecture/{02_DATA_PIPELINE,02_VAE_AND_BODY_REPRESENTATION}.md`
+
+尚未完成的后续事项：
+
+- 本轮只完成LDF data batch与VAE tokenizer边界；frozen EMA encoder的`no_grad`在线调用、HybridMotion组装、root/latent noise与真实LDF Lightning module仍未实现，训练入口继续fail-fast。
+
+## 2026-07-15 · 新版Hybrid inference核心与原子commit事务
+
+类型：在线推理架构重构 / 条件编译 / LDF流式接口 / VAE commit接线 / 测试与文档
+
+实际改动内容：
+
+- 物理删除没有真实LDF编译能力的`ConditionManager`、混合旧reference语义的`route_condition.py`、宽松`text_condition.py`以及从body recovery反推world root的`RootTimeline`。
+- 将`utils/inference/geometry.py`重写为严格、无状态的world XZ route几何；新增`route.py`，以time-parameterized `RoutePlan`明确区分world/relative输入参考与hold/release终点行为。relative route只在update时解析一次，正式状态只保存world事实。
+- 新增`TextTimeline`和CPU派生`TextEmbeddingCache`；文本区间使用absolute token半开区间，允许token-aligned prompt update且不把embedding cache纳入persistent generation state。
+- 新增feature-masked `RootObservationTimeline`和`InferenceConditionCompiler`：每step按当前`window_origin/commit_index`重新采样20 FPS route、执行world到model translation、feature-wise observation覆盖、root statistics归一化、committed mask清空和future constraint packing；`CompiledCondition`记录window与三类revision，拒绝rolling后复用时间错位条件。
+- 新增batch-1 `InferenceSession`、`InferenceConfig`、session级`GuidanceConfig`、`GeneratedMotionChunk`与`InferenceSnapshot`。一次step先获得candidate LDF state与committed Hybrid token，再从physical world root派生backward local-root并调用`BodyVAE.detokenize_step()`；所有候选结果、heading和shape通过后才一次性交换LDF/VAE/origin/boundary state。
+- LDF公开`normalize_root()/denormalize_root()`，所有generate/stream入口显式接收per-call CFG scales，避免共享模型被某个session修改；新增scheduler-aware `rebase_stream_state()`，window roll后分别按`1-beta`平移clean/partial noisy root，pure noise、latent和RNG保持不变。
+- 修复LDF此前只投影`LDFPrediction.clean_root_motion`、却可能提交非单位heading state的问题：offline generate结束时投影全部clean root，stream在每个commit边界投影新clean token并将同一值写入persistent history。inference只验证root5 manifold，不进行模型外root replacement。
+- `03_STREAMING_ACTIVE_WINDOW.md`从开放问题改为当前已实现合同，明确状态所有权、时间/坐标协议、route/text update、future约束、原子commit、snapshot、control latency和Web未完成边界。
+
+改动理由：
+
+- 新版LDF已经唯一拥有Hybrid active window、三角调度和rolling，BodyVAE唯一拥有causal decoder cache；继续保留旧root recovery、第二套timeline或未执行的delay/blend字段会重新制造FloodNet式重复状态所有权。
+- world route必须在origin变化后重新编译，future constraint长度必须与motion RoPE/beta/VAE长度解耦，condition必须携带window stamp才能避免shape相同但absolute timeline错位。
+- LDF与VAE都是out-of-place state transition，runtime可以在不预先复制整个state的情况下实现失败不提交；per-session CFG和独立decoder state允许多个Web session安全共享eval模型。
+- root5的cos/sin单位圆是生成状态合同，不应只存在于Body Stage的临时clean-root view，也不能留给inference在commit后偷偷修正。
+
+验证：
+
+- inference/LDF/VAE/migration定向回归：`59 passed`；新增测试覆盖严格route时间、relative route一次性world解析、text cache、route/root observation编译、past mask、future position、scheduler-aware rebase、四帧commit、snapshot确定性、decoder失败回滚、roll后origin更新和session CFG不修改共享模型。
+- 使用未patch的真实tiny Root/Body Transformer和tiny BodyVAE执行CPU端到端一步session smoke：成功输出root `[1,4,5]`、continuous body `[1,4,261]`，committed heading norm约`0.9999999`。
+- 最终全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`134 passed`。
+- inference与LDF相关Python文件`py_compile`通过；`git diff --check`通过；活动Python不存在旧`ConditionManager/RootTimeline/route_condition/text_condition`引用。
+
+涉及文件：
+
+- `models/diffusion_forcing_wan.py`
+- `utils/inference/{__init__,geometry,route,text,condition,session}.py`
+- 删除`utils/inference/{condition_manager,route_condition,text_condition,timeline}.py`
+- `tests/{test_inference,test_ldf_stream,test_migration_guards}.py`
+- `docs/rearchitecture/03_STREAMING_ACTIVE_WINDOW.md`
+
+尚未完成的后续事项：
+
+- 正式LDF checkpoint、UMT5 encoder loader、Web session锁/队列、输出收集与视频编码尚未接线；现有Web fail-fast保持不变。
+- route update首版只在当前commit立即生效；如果实验需要scheduled route，必须实现真正的route timeline及分段feature compilation，不恢复旧的占位delay/blend协议。
+- active band中途改变route/text的质量仍需要真实checkpoint评测，并与后续scheduled training/self-forcing共同验证control latency。
+- 当前snapshot是同一已加载模型上的in-memory协议；跨进程持久化和checkpoint identity绑定留给部署阶段。
+
+## 2026-07-15 · 统一VAE→LDF训练合同与正式128D配置
+
+类型：LDF输入合同 / EMA tokenizer桥接 / statistics工具 / 正式配置 / 测试与文档
+
+实际改动内容：
+
+- `LDFInput`新增与`previous_root_frame`成对的`previous_root_valid_mask [B]`。全batch cold start使用`None/None`，随机crop混合batch使用physical boundary tensor与逐样本bool mask；Root Stage派生local-root时将mask直接传给统一backward codec。
+- LDF forward、CFG和stream step input全部贯通boundary validity。同步stream在boundary存在时构造全true mask；训练batch可以同时正确表达cold-start与真实preceding-root样本。
+- 新增`utils/training/ldf/lightning_module.py`。`LDFLightningModule`从正式训练checkpoint加载并冻结EMA BodyVAE，在`no_grad`下调用`tokenize_window()`生成normalized deterministic μ；physical active root按LDF root statistics归一化并reshape为`[B,T,4,5]`，两者共享active token mask后构造`HybridMotion`。
+- LDF的`latent_dim`与`local_root_mean/std`直接由VAE实例注入，不在LDF配置维护第二份数值；初始化时验证latent statistics已加载、local-root statistics一致且VAE始终保持eval/frozen。normalized root与latent padding均显式清零。
+- `BasicLightningModule`增加可选prebuilt model入口，使LDF训练模块能够先解析VAE/statistics再构造LDF；既有VAE自动实例化路径保持不变，optimizer与EMA仍只跟踪LDF可训练参数。
+- 新增`tools/compute_ldf_root_stats.py`，按照20–200帧四帧对齐random window、首帧XZ rebase、随机全局yaw和显式seed计算train-split physical root5 mean/std。工具只拥有global-root statistics，local-root继续复用VAE motion statistics。
+- 使用HumanML3D正式train split 23240条样本、每样本一个seeded window生成`HumanML3D_motion/root_stats.npz`。得到`root_mean=[-0.0016468, 0.9169331, -0.0018975, -0.0002812, -0.0030483]`、`root_std=[0.6728486, 0.1535048, 0.6822162, 0.7087607, 0.7054423]`。
+- `configs/ldf.yaml`由8D identity-statistics model-core配置切换为正式128D合同配置：引用300k VAE EMA checkpoint、latent/motion/root statistics、24-token encoder context与8+8层Root/Body模型。注入字段不再出现在`model.params`。
+- `train_ldf.py`的守卫更新为`BLOCKED_ON_LDF_TRAINING`：VAE/LDF合同已闭合，但noise/beta、text/constraint condition和root/latent v-predict loss尚未连接，因此真实训练仍不会误启动。
+- README与三份重构文档同步记录逐样本boundary、唯一EMA bridge、root statistics policy和新的实际阻塞位置。
+
+改动理由：
+
+- `previous_root_frame`只有batch级optional无法表达同一batch中不同crop起点；没有逐样本mask会把cold-start占位boundary误当作真实历史，导致第一帧local yaw/velocity有效性错误。
+- physical body到normalized latent的转换只属于LDF训练层。将EMA加载、deterministic μ和root normalization集中在一个Lightning边界，可以避免Dataset依赖模型，也避免LDF模型读取physical body265。
+- latent维度和local-root statistics由decoder/tokenizer共同定义，必须以VAE为单一事实来源；global root则是LDF独有生成变量，应按其实际window/rebase/yaw分布独立统计。
+- root与latent normalization会把数值零变成非零，故所有batch padding必须在normalization后再次由同一个token mask清零。
+
+验证：
+
+- LDF合同、data、forward、CFG、stream、training bridge、statistics和migration定向测试：`48 passed`。
+- 最终工作区全仓`PY=... ./scripts/run_pytest.sh tests -q`：`134 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+- 相关Python文件`py_compile`通过，`git diff --check`通过。
+- 正式`configs/ldf.yaml`成功加载真实300k EMA checkpoint、motion/latent/root statistics并构造`LDF`：trainable参数`227,929,079`、latent维度128、encoder context 24、latent statistics ready。
+- 两条真实HumanML3D train sample经random crop/yaw、真实context collator和正式EMA bridge得到root `[2,10,4,5]`与latent `[2,10,128]`，有效token数分别为7和10；`HybridMotion.validate()`通过。
+- 单元测试覆盖mixed boundary validity、VAE/LDF local statistics共享、EMA frozen/eval、root/latent token对齐、非identity normalization、右padding归零以及active partial-token拒绝。
+
+涉及文件与数据：
+
+- `utils/conditions/ldf.py`
+- `models/diffusion_forcing_wan.py`
+- `utils/training/{lightning_module,ldf/lightning_module,ldf/__init__}.py`
+- `tools/compute_ldf_root_stats.py`
+- `configs/ldf.yaml`
+- `train_ldf.py`
+- `tests/{test_ldf_conditions,test_ldf_forward,test_ldf_cfg,test_ldf_training,test_ldf_statistics,test_migration_guards}.py`
+- `README.md`
+- `docs/rearchitecture/{01_MODEL_ARCHITECTURE_AND_IO,02_DATA_PIPELINE,02_VAE_AND_BODY_REPRESENTATION}.md`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/root_stats.npz`
+
+尚未完成的后续事项：
+
+- `LDFLightningModule._step()`仍明确失败；下一阶段需要设计并实现root/latent v-predict noise target、history/generation beta、文本/约束condition编译、loss与optimizer step后才能解除`train_ldf.py`守卫。
+- Web/runtime尚未接入commit-time VAE decoder，继续保持自身的`BLOCKED_ON_BODY_VAE`守卫。
+
+## 2026-07-15 · 收紧VAE→LDF tokenizer contract
+
+改动类型：模型公共接口 / 训练bridge / 配置单一事实来源 / statistics状态校正 / 测试与文档
+
+实际改动内容：
+
+- `BodyVAE`删除LDF侧不需要的公共`encode_window()`及其一次性私有包装，只保留`tokenize_window()`作为context+active body到normalized deterministic μ的唯一窗口接口。该接口直接验证逐样本long context count、四帧patch内一致的frame validity、有效token左前缀、encoder causal context上限和至少一个active token，并按逐样本offset gather后清零active padding。
+- `LDFLightningModule._create_clean_motion()`除批内最大shape外，新增逐样本token计数校验：`encoder有效token数 - context token数`必须逐项等于active root有效token数，拒绝最大长度相同但样本间root/body有效长度交叉错位的batch。
+- bridge不再直接调用通用`normalize_features()`，统一通过LDF公共`normalize_root()`进入global-root归一化合同。
+- `configs/ldf.yaml`删除手写`data.encoder_context_tokens: 24`；encoder context长度只由已加载VAE的只读属性提供。当前`root_stats.npz`在配置、工具说明、README与数据/VAE文档中明确标为provisional，而非正式训练分布资产。
+- contract文档将raw posterior入口限定为完整VAE训练`encode()`，LDF窗口入口限定为`tokenize_window()`；同时记录正式H/G/F/C窗口与rebase冻结后必须通过共享训练sampler重新生成root statistics。
+- 新增/改写回归测试，覆盖cold-start、partial/full context、mixed batch gather、窗口padding归零、partial encoder token拒绝、公共接口收敛、配置无context重复值，以及逐样本root/body token错位拒绝。
+
+改动理由：
+
+- LDF只消费normalized deterministic μ，公开窗口posterior既扩大接口又会让零填充的`logvar`具有可采样歧义；单一`tokenize_window()`更符合实际所有权。
+- tensor的批内最大shape不能证明逐样本时间轴一致。若两个样本有效长度互换，原bridge会静默把错误latent mask套到root上，因此必须比较每个样本的active token数。
+- encoder context由VAE架构决定，配置复制固定数值会在VAE层数或kernel变化后悄悄失配。
+- root statistics依赖尚未冻结的训练窗口、OriginEpoch和rebase策略；当前简单crop统计只能验证bridge，不能提前声明为正式训练统计。
+
+验证：
+
+- 相关Python文件`py_compile`通过。
+- VAE tokenizer、LDF bridge/data、migration和frame/token定向回归：`49 passed, 1 warning`。
+- 全仓`PY=/home/yuankai/.conda/envs/flooddiffusion/bin/python ./scripts/run_pytest.sh tests -q`：`136 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+- `rg`确认活动代码与设计文档不再调用`encode_window()`，正式LDF配置不再保存`encoder_context_tokens`副本；`git diff --check`通过。
+
+涉及文件：
+
+- `models/vae_wan_1d.py`
+- `utils/training/ldf/lightning_module.py`
+- `configs/ldf.yaml`
+- `tools/compute_ldf_root_stats.py`
+- `tests/{test_vae_model,test_ldf_training,test_migration_guards}.py`
+- `README.md`
+- `docs/rearchitecture/{02_DATA_PIPELINE,02_VAE_AND_BODY_REPRESENTATION}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 正式H/G/F/C训练窗口、OriginEpoch、history/generation状态与self-forcing尚未实现；下一阶段应先冻结共享window contract，再让collator与root-statistics共同消费它。
+- 正式窗口/rebase/yaw分布冻结后必须重新生成`root_stats.npz`，当前provisional资产不得作为最终训练统计结论。
+- `LDFLightningModule._step()`与`train_ldf.py`守卫保持不变；noise/beta、condition、v-predict loss和optimizer训练接线仍未完成。
+
+## 2026-07-15 · Web runtime迁移到Hybrid InferenceSession与四帧chunk
+
+改动类型：Web推理runtime / HTTP协议 / 前端播放 / 并发与生命周期 / 迁移清理 / 测试与文档
+
+实际改动内容：
+
+- 将Web生成的唯一权威状态切换为每会话一个`InferenceSession`。新增`WebSession`，使用同一把session锁串行化`generate_step()`、text/route/CFG更新，并使用进程级execution lock保护共享eval-mode LDF/BodyVAE执行。
+- 新增`WebMotionChunk`与bounded `MotionChunkBuffer`。每个队列元素严格对应一个latent token和四帧world root/body/joints/contact probability；队列满时对producer施加backpressure，不再使用`deque(maxlen=...)`静默丢帧。
+- 新增完整`WebRuntime` facade，负责lazy `ModelBundle`、单活跃浏览器会话、force takeover、pause/resume/reset、消费超时回收和worker异常状态。接管时先停止旧worker再更换session；停止超时不会释放活跃所有权或启动第二个共享模型worker。
+- `ModelBundle`只保存共享LDF、BodyVAE、text encoder和device，不再保存per-session runtime或旧stream kernel。模型加载守卫从过时的`BLOCKED_ON_BODY_VAE`推进为`BLOCKED_ON_LDF_CHECKPOINT`，准确说明当前只缺正式LDF checkpoint/root statistics/checkpoint loader合同。
+- 重写Flask app factory、typed Web配置、请求schema与REST API。route统一为typed XZ、world/relative-to-actor、hold/release；初始route在worker启动前写入session，因此从token 0生效。route更新不再携带horizon/delay/blend或`replace_future`，future constraint tokens只属于session config。
+- HTTP传输由20 FPS单帧轮询改为每次长轮询一个四帧chunk；浏览器收到后在本地按20 FPS播放，并通过`session_epoch/token_index/frame_index`拒绝跨reset旧数据。
+- 重构前端为`api_client.js`、`renderer.js`、`route_editor.js`和精简`main.js`。保留22-joint Three.js骨架、相机跟随、root trail、Shift拖拽world route、text/route在线更新、pause/resume和force takeover；删除root feedback、smoothing、route delay、旧Root proposal/LDF payload诊断等重复架构控件。
+- 修复`skeleton.js`单个trail点时透明度除零以及bone geometry未释放；重写CSS并删除原文件中的重复/失效规则。
+- 物理删除`ModelManager`、旧bootstrap、`TrajectoryController`、单帧`FrameBuffer`、generic `GenerationWorker`、重复`GenerationState`和分离`SessionService`。有价值的后台生产、单活跃会话与消费监控能力已迁入新所有权结构，而非简单丢弃。
+- `server.sh`改为PID范围内的graceful SIGTERM，超时才终止该PID；Flask退出时显式调用`WebRuntime.shutdown()`，不再无PID时强杀所有`python app.py`进程。
+- README、stream配置及模型/VAE/active-window/LDF实现文档同步更新为“Web runtime已接线、正式模型加载等待LDF checkpoint”的实际状态。
+
+改动理由：
+
+- LDF active window、route/text revision和BodyVAE decoder state已经由`InferenceSession`统一拥有；Web继续维护第二套trajectory/pending/root-feedback状态会重新产生旧FloodNet的状态分裂和竞态。
+- 新版最小提交事务是`1 token = 4 frames`。按单帧排队和HTTP传输会拆散commit边界，且bounded deque静默淘汰会造成不可诊断的动画跳帧；chunk级backpressure才能保持模型与展示时间轴一致。
+- `InferenceSession`明确不是线程安全对象。生成worker、HTTP route/text更新和force takeover必须在Web边界串行化，同时多个会话共享模型时还需要独立于session状态的GPU execution lock。
+- window、future horizon和denoise schedule属于模型/session创建合同；让每次route update修改这些值会再次把motion length、condition horizon和runtime控制混为同一接口。
+
+验证：
+
+- `bash -n web_demo/server.sh web_demo/start.sh`通过。
+- 所有`web_demo/static/js/*.js`均通过`node --check`。
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m compileall -q web_demo`通过。
+- Web runtime与migration定向回归：`27 passed`。覆盖严格四帧payload、chunk backpressure无丢弃、text/route更新、relative route一次性world解析、pause/resume/reset、单活跃冲突、初始route从token 0生效、REST chunk协议及真实loader HTTP 503守卫。
+- 最终全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`142 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+- `git diff --check`通过；活动Web代码不再引用旧`ModelManager/TrajectoryController/FrameBuffer/SessionService`或root-feedback/delay/replace-future协议。
+
+涉及文件：
+
+- `web_demo/{app.py,config.py,README.md,__init__.py}`
+- `web_demo/api/{routes,schemas,responses}.py`
+- `web_demo/runtime/{contracts,chunk_buffer,model_bundle,model_loader,web_session,web_runtime}.py`
+- 删除`web_demo/{bootstrap,model_manager}.py`、`web_demo/runtime/{frame_buffer,generation_worker,state,trajectory_controller}.py`与`web_demo/services/`
+- `web_demo/static/{css/style.css,js/api_client.js,js/main.js,js/renderer.js,js/route_editor.js,js/skeleton.js}`
+- `web_demo/templates/index.html`
+- `web_demo/server.sh`
+- `configs/stream.yaml`
+- `tests/{test_web_runtime,test_migration_guards}.py`
+- `README.md`与`docs/rearchitecture/{README,01_MODEL_ARCHITECTURE_AND_IO,02_VAE_AND_BODY_REPRESENTATION,03_STREAMING_ACTIVE_WINDOW,06_LDF_IMPLEMENTATION_DESIGN}.md`
+
+尚未完成的后续事项：
+
+- 正式LDF训练、冻结root statistics、UMT5 text encoder加载与LDF checkpoint schema尚未完成，因此真实`POST /api/sessions`当前按设计返回`BLOCKED_ON_LDF_CHECKPOINT` HTTP 503；本轮未伪装真实动作生成已经可用。
+- 正式checkpoint冻结后需要实现`load_model_bundle()`，校验LDF/VAE FPS、latent维度、statistics与checkpoint identity，再进行真实GPU长时stream、route/text突变质量和浏览器人工可视化测试。
+- 跨进程snapshot、生成视频持久化和多活跃用户调度不在第一版Web runtime范围内；当前明确采用单活跃会话与进程内状态。
+
+## 2026-07-15 · LDF固定噪声Active Band与Detached Self-Forcing内核
+
+改动类型：LDF训练数据边界 / flow代数 / self-forcing策略 / statistics / 配置 / 测试与文档
+
+实际改动内容：
+
+- 将`LDFWindowCollator`收敛为`LDFSpanCollator`。它只选择batch共享的40–200帧physical source span、各样本独立crop、真实causal VAE context、previous root、source token坐标、cold-start标志和token prompt timeline，不再做translation rebase、H/A/frontier划分、noise或rollout。
+- true cold start按batch以10%概率采样并强制`H=0/source_start=0/context=0/previous invalid`；continuation要求`H>=1`且允许mid-clip crop。random yaw仍同步作用于root/body/context/previous root。
+- 新增`flow.py`，以一个连续公式构造完整span的history beta=0、5-token active beta和frontier beta=1；新增fixed absolute-token noise混合、`v*=x0-epsilon`、self-forcing低误差clean recovery与full-gradient auxiliary recovery的明确分离接口。
+- 新增`batch.py`，始终构造固定S的`LDFInput`。history与active+pure-noise frontier共同组成完整有效attention前缀，`generation_mask`覆盖active和frontier，独立`loss_mask`只覆盖5-token active band；timeline使用source absolute token坐标，RoPE以当前active首token为0。
+- 新增`self_forcing.py`的immutable`LDFWindowPlan`与mutable`SelfForcingState`。每个rollout一次性冻结per-sample phase、root/body Gaussian noise和初始H translation anchor；前K-1步保持model train mode但关闭autograd，只用projected clean root与`x_beta+beta*v` body替换最左active token，最终一步保留梯度。
+- 实现K=2/3/5（0%/40%/70%）curriculum和可配置K=1 replay，默认概率为20%/10%/10%；K=1 teacher baseline和pure-SF消融均可由调用方显式选择。
+- `tools/compute_ldf_root_stats.py`改为复用10% true cold start、随机初始H和rollout固定anchor分布；CLI最短span改为40帧，但不会自动覆盖已有root statistics资产。
+- `configs/ldf.yaml`加入cold-start与self-forcing实验默认值，最短span改为40帧。`train_ldf.py`继续fail-fast，但错误信息已推进为“active-band kernel ready，text/condition与Lightning optimization未接线”。
+- 数据、训练方法、训练配置、LDF实现和README文档同步记录physical span、fixed noise、active/frontier、固定坐标frame与剩余trainer边界。
+
+改动理由：
+
+- 同一absolute token若在K步间重采Gaussian noise，会跳到另一条diffusion path；固定noise后active右移只改变beta，才能匹配persistent noisy frontier。
+- pure-noise frontier属于当前LDF motion state并必须参与self-attention，不能与span外condition-only future goal混为一类，也不能被generation validity mask裁掉。
+- mid-clip `H=0`会让EMA causal VAE target隐含不可见历史，并让Root/Body boundary信息不对称；第一版cold start因此只表示真实sample起点。
+- self-forcing只需要模拟已提交history误差，无需把完整runtime commit/roll/rebase状态机复制到训练；固定初始anchor也避免把OriginEpoch事务混入K-step kernel。
+- `x_beta+beta*v_pred`把最左active token的replacement误差从`delta`缩小到`beta*delta`，比`v_pred+epsilon`更适合低beta stage boundary。
+
+验证：
+
+- 相关Python文件`py_compile`通过。
+- Dataset/span/flow/self-forcing/VAE bridge/statistics/migration定向测试：`41 passed`。
+- 真实集成覆盖`HumanML3DDataset fixture -> LDFSpanCollator -> frozen EMA VAE -> K-step kernel -> loss.backward()`；验证VAE无梯度、前序replacement无`grad_fn`、最终Root/Body Transformer均有梯度。
+- 全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`155 passed`。
+- `git diff --check`通过；`rg`确认无活动`LDFWindowCollator`引用，且训练contract明确以`generation_mask = ~history_mask`包含frontier。
+
+涉及文件：
+
+- `utils/training/ldf/{data,flow,batch,self_forcing,__init__}.py`
+- `utils/training/ldf/lightning_module.py`
+- `tools/compute_ldf_root_stats.py`
+- `configs/ldf.yaml`
+- `train_ldf.py`
+- `tests/{test_ldf_data,test_ldf_self_forcing,test_ldf_training,test_ldf_statistics,test_migration_guards}.py`
+- `README.md`
+- `docs/rearchitecture/{02_DATA_PIPELINE,04_TRAINING_METHOD,05_TRAINING_CONFIG,06_LDF_IMPLEMENTATION_DESIGN}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- `LDFLightningModule._step()`与`train_ldf.py`守卫仍保留；下一阶段需要接入UMT5/token prompt embedding、span内root/body condition与dropout、root/body loss权重、optimizer/EMA和validation loop。
+- 当前root statistics工具语义已正确，但正式`root_stats.npz`尚未重算或覆盖；启动真实训练前必须显式生成并校验统计资产。
+- span外`F_goal`、空间约束采样、decoded/FK/contact auxiliary loss与history corruption不在本轮范围。
+## 2026-07-15 · FloodDiffusion局部文本条件与LDF teacher-training接线
+
+改动类型：LDF文本协议 / Transformer attention / 三角可见窗口 / future-root packing / Lightning训练 / 配置与测试
+
+实际改动内容：
+
+- `LDFSpanCollator`把Dataset的caption区间编译为固定长度`prompt_timeline[B][S]`。HumanML3D从覆盖当前span的caption备选中选择一条并在所有token重复；BABEL按四帧对齐区间为每个token分配prompt，并对未对齐或重叠区间fail-fast。
+- LDF data loader新增任务局部`MinimumFrameDataset`，在组batch前排除短于最小source span的样本。实际扫描`BABEL_motion`的14087个artifact发现2282个少于40帧，因此不能依赖collator在长训中随机遇到后才失败。
+- 修复true cold-start window plan在未显式指定H时仍可能随机采到`H>0`的问题；cold-start现在无条件固定`H=0`，continuation才采样正history。
+- 删除Transformer中“先把每条T5 sequence求均值，再让所有motion token共同注意整条prompt timeline”的实现。Root/Body现在使用严格token-aligned cross-attention：每个motion query只读取自己的T5 sequence；sample-aligned空文本仍可广播用于CFG。
+- 文本padding改为batch内实际最大长度（上限128），重复prompt的T5 tensor在projection前按identity去重；runtime `TextEmbeddingCache`对同一device上的重复文本复用同一个tensor。
+- 三角scheduler的persistent state继续保存固定pure-noise frontier，但`LDFInput.generation_mask`只标记本步可见/更新的active前缀。尚未触及的beta=1 tail不进入self-attention，也不会因预先编译future prompt而泄漏条件。
+- Root Stage将`[visible motion prefix | valid future-root tokens]`逐样本紧凑打包；future token不再要求整个固定motion window都有效，文本query只映射回visible motion，future-root query不读取文本。
+- `time_embedding_scale`正式作用于beta sinusoidal embedding；LDF默认T5长度由512收敛为论文设置的128。
+- `LDFLightningModule`完成冻结EMA VAE在线`tokenize_window()`、冻结UMT5 batch唯一文本编码、sample级text dropout、固定噪声window plan、可选detached self-forcing和root/body flow-v loss接线。VAE与T5不进入LDF optimizer、EMA或checkpoint。
+- `train_ldf.py`由迁移守卫改为薄Lightning入口，并在root/motion/latent statistics、VAE/T5 checkpoint或tokenizer缺失时fail-fast。由于现有root statistics早于当前fixed-span anchor sampler，HumanML和mixed配置均保持`root_statistics_required`状态；只有显式重算并切换为`training_ready`后入口才允许长训。新增`configs/ldf_multi.yaml`描述HumanML+BABEL从头训练设置。
+- `tools/compute_ldf_root_stats.py`新增`--config`入口，可直接复用HumanML或HumanML+BABEL配置的数据mixture、短样本过滤、span、chunk和cold-start参数，并默认写入该配置声明的`root_stats_path`。
+- 公共`create_window_condition()`可以把sample-major absolute token text timeline切到当前window并用对应null prompt右填充。
+
+改动理由：
+
+- FloodDiffusion的流式局部性要求当前motion只依赖当前可见motion前缀和对应时刻的prompt。把future caption合并成共享文本序列，或用pure-noise tail扩大有效`seq_len`，都会产生训练时不明显、在线prompt切换时暴露的条件泄漏。
+- future-root是只读condition token，不是latent motion。把它紧接visible prefix打包，可以同时保留non-causal Root Transformer和明确token contract，而不重新引入FlexTraj专用mask。
+- HumanML的重复caption与BABEL的分段caption最终都归一成同一个`B*T`模型接口，使Root/Body、训练与runtime不需要数据集特判。
+- VAE deterministic μ、text encoding、diffusion noise和loss分别保留在各自所有者，LDF checkpoint只携带实际需要优化和部署的LDF权重。
+
+验证：
+
+- 新增token-aligned cross-attention隔离测试：只修改token 1 prompt不会改变token 0的cross-attention输出，非motion query输出严格为零。
+- 新增HumanML prompt重复、BABEL区间编译、pure-noise frontier隐藏、partial-visible future-root紧凑打包和完整在线VAE→LDF loss/backward smoke test。
+- 真实`configs/ldf_multi.yaml` train Dataset构造通过：保留31184条满足40帧source span的样本，在组batch前排除2498条短样本；其中BABEL短样本为2282条。
+- 相关Python文件`py_compile`通过，`git diff --check`通过。
+- 全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`159 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+
+涉及文件：
+
+- `models/diffusion_forcing_wan.py`
+- `models/tools/wan_model.py`
+- `utils/conditions/ldf.py`
+- `utils/inference/text.py`
+- `utils/training/ldf/{data,batch,self_forcing,lightning_module,__init__}.py`
+- `train_ldf.py`
+- `tools/compute_ldf_root_stats.py`
+- `configs/{ldf,ldf_multi}.yaml`
+- `tests/{test_ldf_data,test_ldf_forward,test_ldf_stream,test_ldf_self_forcing,test_ldf_training,test_wan_model,test_migration_guards}.py`
+- `README.md`
+- `docs/rearchitecture/{01_MODEL_ARCHITECTURE_AND_IO,02_DATA_PIPELINE,03_STREAMING_ACTIVE_WINDOW,04_TRAINING_METHOD,05_TRAINING_CONFIG,06_LDF_IMPLEMENTATION_DESIGN}.md`
+
+尚未完成的后续事项：
+
+- 当前teacher baseline只训练文本条件与结构化root/body生成；span内root observation、span外future-root constraint的训练采样/dropout和constraint-CFG校准仍需单独设计，不应由本轮静默假设。
+- `configs/ldf_multi.yaml`需要先基于实际HumanML+BABEL训练mixture生成`HumanML3D_BABEL_root_stats.npz`；本轮没有伪造该statistics，也没有启动正式长训。
+- Web继续等待首个正式LDF checkpoint与loader合同；本轮未解除`BLOCKED_ON_LDF_CHECKPOINT`。

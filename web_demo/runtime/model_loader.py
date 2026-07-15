@@ -1,35 +1,36 @@
-"""Fail-fast model loader pending body-VAE/runtime integration."""
+"""Model loading boundary for the new hybrid Web runtime."""
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
-from web_demo.model_manager import WEB_MIGRATION_ERROR
+from .model_bundle import ModelBundle
 
 
-def resolve_repo_path(path):
-    if not path:
+WEB_RUNTIME_BLOCKER = (
+    "BLOCKED_ON_LDF_CHECKPOINT: the strict four-frame BodyVAE and atomic "
+    "InferenceSession runtime are ready, but no formally trained hybrid LDF "
+    "checkpoint/loader contract exists yet. Finish LDF training, freeze its "
+    "root statistics and checkpoint schema, then configure Web model paths."
+)
+
+
+def resolve_repo_path(path: str | Path | None) -> Path | None:
+    """Resolve a configured path relative to the Floodcontrol repository."""
+
+    if path is None or not str(path).strip():
         return None
-    path = os.path.expanduser(str(path))
-    if os.path.isabs(path):
-        return path
-    root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    return os.path.abspath(os.path.join(root, path))
+    value = Path(path).expanduser()
+    if value.is_absolute():
+        return value.resolve()
+    root = Path(__file__).resolve().parents[2]
+    return (root / value).resolve()
 
 
-def _blocked(*args, **kwargs):
-    del args, kwargs
-    raise RuntimeError(WEB_MIGRATION_ERROR)
+def load_model_bundle(_config) -> ModelBundle:
+    """Fail explicitly until the formal LDF checkpoint contract is frozen."""
+
+    raise RuntimeError(WEB_RUNTIME_BLOCKER)
 
 
-load_ldf_models = _blocked
-load_model_bundle = _blocked
-build_runtime_session = _blocked
-
-
-__all__ = [
-    "build_runtime_session",
-    "load_ldf_models",
-    "load_model_bundle",
-    "resolve_repo_path",
-]
+__all__ = ["WEB_RUNTIME_BLOCKER", "load_model_bundle", "resolve_repo_path"]

@@ -34,6 +34,25 @@ def constant_prediction(self, inputs, **kwargs):
     return LDFPrediction(HybridMotion(root, latent), root, local, valid)
 
 
+def test_step_input_excludes_the_untouched_pure_noise_frontier():
+    model = make_model()
+    motion = HybridMotion(torch.zeros(1, 6, 4, 5), torch.zeros(1, 6, 3))
+    positions = torch.arange(6)[None]
+    condition = LDFCondition([torch.ones(1, 4)], [torch.zeros(1, 4)])
+    inputs = model._create_step_input(
+        motion,
+        beta=torch.ones(1, 6),
+        next_beta=torch.tensor([[0.75, 1.0, 1.0, 1.0, 1.0, 1.0]]),
+        timeline_position_ids=positions,
+        commit_index=0,
+        condition=condition,
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+    )
+    assert inputs.generation_mask.tolist() == [[True, False, False, False, False, False]]
+    inputs.validate()
+
+
 def test_stream_updates_both_fields_and_snapshot_restore_is_deterministic():
     model = make_model()
     model.predict_with_cfg = types.MethodType(constant_prediction, model)
@@ -48,7 +67,14 @@ def test_stream_updates_both_fields_and_snapshot_restore_is_deterministic():
     )
     state, committed = model.stream_generate_step(state, condition)
     assert state.commit_index == 1
-    assert torch.allclose(committed.root_motion, torch.ones_like(committed.root_motion))
+    assert torch.allclose(
+        committed.root_motion[..., :3],
+        torch.ones_like(committed.root_motion[..., :3]),
+    )
+    assert torch.allclose(
+        committed.root_motion[..., 3:5].norm(dim=-1),
+        torch.ones_like(committed.root_motion[..., 3]),
+    )
     assert torch.allclose(committed.latent_motion, torch.ones_like(committed.latent_motion))
 
     snapshot = model.create_stream_snapshot(state)

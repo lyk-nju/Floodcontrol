@@ -203,7 +203,7 @@ class Skeleton3D {
                 positions[i * 3 + 2] = point.z;
                 
                 // Gradient: older points (lower index) are more transparent
-                const alpha = i / (numPoints - 1);  // 0 (oldest) to 1 (newest)
+                const alpha = numPoints === 1 ? 1 : i / (numPoints - 1);
                 const opacity = Math.pow(alpha, 1.5) * 0.8;  // Fade out older points
                 
                 // Use cyan color (matching joint color)
@@ -267,10 +267,8 @@ class Skeleton3D {
         });
         
         this.bones.forEach(bone => {
-            bone.children.forEach(child => {
-                if (child.geometry) child.geometry.dispose();
-            });
             this.scene.remove(bone);
+            bone.geometry.dispose();
         });
         
         if (this.trailLine) {

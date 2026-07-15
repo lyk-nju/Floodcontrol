@@ -1,4 +1,4 @@
-"""Response helpers for the staged web demo API refactor."""
+"""Small JSON response helpers for the Web API boundary."""
 
 from __future__ import annotations
 
@@ -12,4 +12,3 @@ def error(message: str, **payload):
 
 
 __all__ = ["error", "success"]
-

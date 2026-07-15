@@ -155,8 +155,54 @@ class WanCrossAttention(nn.Module):
         context: torch.Tensor,
         context_lens: torch.Tensor,
         query_lens: torch.Tensor,
+        query_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, length, _ = value.shape
+        if context.ndim == 4:
+            if tuple(context.shape[:2]) != (batch, length):
+                raise ValueError(
+                    "token-aligned context must share the query [B,T] axis"
+                )
+            if tuple(context_lens.shape) != (batch, length):
+                raise ValueError("token-aligned context_lens must be [B,T]")
+            if query_mask is None:
+                query_mask = (
+                    torch.arange(length, device=value.device)[None]
+                    < query_lens[:, None]
+                )
+            if tuple(query_mask.shape) != (batch, length):
+                raise ValueError("query_mask must be [B,T]")
+            flat_batch = batch * length
+            q = self.norm_q(self.q(value)).view(
+                flat_batch, 1, self.num_heads, self.head_dim
+            )
+            context_length = context.shape[2]
+            flat_context = context.reshape(flat_batch, context_length, -1)
+            k = self.norm_k(self.k(flat_context)).view(
+                flat_batch, context_length, self.num_heads, self.head_dim
+            )
+            v = self.v(flat_context).view(
+                flat_batch, context_length, self.num_heads, self.head_dim
+            )
+            # Invalid motion/future queries still receive a one-token dummy
+            # context so both FlashAttention and SDPA remain numerically
+            # defined; their projected outputs are then removed exactly.
+            flat_context_lens = context_lens.reshape(-1).clamp_min(1)
+            flat_query_lens = torch.ones(
+                flat_batch, device=value.device, dtype=torch.long
+            )
+            out = attention(
+                q,
+                k,
+                v,
+                q_lens=flat_query_lens,
+                k_lens=flat_context_lens,
+            )
+            out = self.o(out.flatten(2)).reshape(batch, length, -1)
+            return out.to(value.dtype) * query_mask[..., None].to(value.dtype)
+
+        if context.ndim != 3:
+            raise ValueError("context must be [B,L,D] or token-aligned [B,T,L,D]")
         q = self.norm_q(self.q(value)).view(
             batch, length, self.num_heads, self.head_dim
         )
@@ -167,7 +213,12 @@ class WanCrossAttention(nn.Module):
             batch, context.shape[1], self.num_heads, self.head_dim
         )
         out = attention(q, k, v, q_lens=query_lens, k_lens=context_lens)
-        return self.o(out.flatten(2)).to(value.dtype)
+        out = self.o(out.flatten(2)).to(value.dtype)
+        if query_mask is not None:
+            if tuple(query_mask.shape) != (batch, length):
+                raise ValueError("query_mask must be [B,T]")
+            out = out * query_mask[..., None].to(out.dtype)
+        return out
 
 
 class WanTransformerBlock(nn.Module):
@@ -214,6 +265,7 @@ class WanTransformerBlock(nn.Module):
         rope_position_ids: torch.Tensor,
         context: torch.Tensor,
         context_lens: torch.Tensor,
+        text_query_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if modulation.shape != (*value.shape[:2], 6, value.shape[-1]):
             raise ValueError("modulation must be [B,L,6,D]")
@@ -226,7 +278,11 @@ class WanTransformerBlock(nn.Module):
             rope_position_ids=rope_position_ids,
         ) * pieces[2].squeeze(2).to(value.dtype)
         value = value + self.cross_attn(
-            self.norm3(value), context, context_lens, seq_lens
+            self.norm3(value),
+            context,
+            context_lens,
+            seq_lens,
+            query_mask=text_query_mask,
         )
         normalized = self.norm2(value).float() * (1 + pieces[4].squeeze(2))
         normalized = normalized + pieces[3].squeeze(2)
@@ -246,27 +302,41 @@ def embed_text_context(
     """Pad and project one text feature sequence per sample."""
     if not context:
         raise ValueError("text context cannot be empty")
+    unique: list[torch.Tensor] = []
+    unique_by_identity: dict[int, int] = {}
+    gather_indices: list[int] = []
+    for item in context:
+        identity = id(item)
+        if identity not in unique_by_identity:
+            unique_by_identity[identity] = len(unique)
+            unique.append(item)
+        gather_indices.append(unique_by_identity[identity])
     lengths = torch.tensor(
         [min(int(item.shape[0]), int(text_len)) for item in context],
         device=device,
         dtype=torch.long,
     )
-    padded = torch.stack(
+    padded_length = max(1, int(lengths.max().item()))
+    padded_unique = torch.stack(
         [
             torch.cat(
                 [
-                    item[:text_len].to(device),
-                    item.new_zeros(max(0, text_len - item.shape[0]), item.shape[-1]).to(
+                    item[:padded_length].to(device),
+                    item.new_zeros(
+                        max(0, padded_length - item.shape[0]), item.shape[-1]
+                    ).to(
                         device
                     ),
                 ],
                 dim=0,
             )
-            for item in context
+            for item in unique
         ],
         dim=0,
     )
-    return projection(padded), lengths
+    projected_unique = projection(padded_unique)
+    indices = torch.tensor(gather_indices, device=device, dtype=torch.long)
+    return projected_unique.index_select(0, indices), lengths
 
 
 __all__ = [

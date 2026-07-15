@@ -1,6 +1,6 @@
 # LDF 模型层实现设计
 
-状态：`MODEL_CORE_IMPLEMENTED`。公共合同、Root/Body主干、CFG和Hybrid流式状态已经落地；Body VAE、真实数据、训练与Web runtime仍待后续接线。具体正式网络规模、loss权重和训练schedule仍由实验决定。
+状态：`MODEL_RUNTIME_AND_TEACHER_TRAINING_IMPLEMENTED`。公共合同、Root/Body主干、CFG、Hybrid流式状态、BodyVAE、四帧Web runtime、固定噪声self-forcing内核和Lightning teacher-training入口已经落地；Web仍等待正式LDF checkpoint loader。
 
 ## 0. 2026-07-14模型核心里程碑
 
@@ -9,7 +9,7 @@
 - CFG先组合唯一root velocity，再从唯一clean root派生local root，最后运行共享该root的Body CFG branches。
 - Body Stage不直接读取raw current/future root constraints；root constraint只通过Root Stage的clean/local root影响body。
 - 已物理删除ControlNet、专用轨迹编码器、FlexTraj、tiny专用模型、外置root planner和RootPlan runtime闭环。
-- 真实训练与Web入口在Body VAE/data/runtime接入前明确fail-fast。
+- 真实训练从独立checkpoint加载冻结EMA VAE与冻结UMT5，在线构造deterministic latent、逐token文本条件和root/body flow-v loss；Web模型加载在正式checkpoint合同冻结前仍以`BLOCKED_ON_LDF_CHECKPOINT` fail-fast。
 
 本文只回答新版 LDF 在代码层怎样组织，以及怎样在不丢失 FloodDiffusion 流式状态机的前提下，用 Root/Body 两阶段主干接管旧 FloodNet ControlNet 路径。物理 root 定义、VAE 协议、数据构造、active-window 坐标事务和训练超参数分别由其他文档负责。
 
@@ -42,9 +42,17 @@ models/
 └── vae_wan_1d.py
 
 utils/
-└── conditions/
-    └── ldf.py
+├── conditions/
+│   └── ldf.py
+└── training/ldf/
+    ├── data.py
+    ├── flow.py
+    ├── batch.py
+    ├── self_forcing.py
+    └── lightning_module.py
 ```
+
+training目录不增加模型参数：`data.py`只产出physical span，`flow.py`保存固定噪声代数，`batch.py`构造完整S的`LDFInput/loss_mask`，`self_forcing.py`维护immutable plan与只替换clean history的mutable state。正式stream runtime不被导入训练内核。
 
 ### `models/diffusion_forcing_wan.py`
 
@@ -98,7 +106,7 @@ attention / SDPA fallback
 non-causal self-attention
 有效 token lengths/padding
 显式 position IDs
-sample-aligned 或 token-aligned text context
+sample-aligned 或严格token-aligned text context
 ```
 
 它不再支持 `traj_emb`、`traj_seq_lens`、`traj_token_mask`、`latent_pad_len`、`traj_pad_len` 或 `controlnet_residuals`。
@@ -430,11 +438,11 @@ future constraints 需要通用的 explicit-position RoPE：
 apply_rope_with_position_ids(q_or_k, rope_position_ids)
 ```
 
-模型将 `[history | generation | packed future constraints]` 作为普通有效 token 序列送入 non-causal Transformer。future token 的输出被忽略，不被 scheduler 更新或 commit；不再需要 trajectory-query/latent-key 的专用非对称 mask。
+模型将 `[visible history/generation prefix | packed future constraints]` 作为普通有效 token 序列送入 non-causal Transformer。pure-noise且本步尚未更新的motion frontier保留在persistent state中，但不会被假装成有效attention token；future condition紧接当前可见motion前缀打包，不受固定window尾部padding影响。future token 的输出被忽略，不被 scheduler 更新或 commit；不再需要 trajectory-query/latent-key 的专用非对称 mask。
 
 `create_window_condition()`从`window_origin + window_tokens`开始生成absolute future timeline IDs，不能在rolling后重新从`window_tokens`起算。future horizon不得反向扩大`HybridMotion`、`beta`、history/generation mask或Body Stage长度。
 
-token-aligned text context 与 text embedding dedup 属于在线文本能力，不是 FlexTraj，应保留并去除其中仅服务 trajectory token 的分支。
+token-aligned text context 与 text embedding dedup 属于在线文本能力，不是 FlexTraj。`text_context`按sample-major的`B*T`排列，每个motion query只cross-attend自己的T5 sequence；future-root query不读取文本。相同prompt的T5输出和projection输入按tensor identity复用，避免HumanML重复caption造成重复编码。
 
 ## 9. 已执行的迁移顺序
 
@@ -470,7 +478,7 @@ FlexTraj attention
 外置root planner/post-decode projection正式路径
 ```
 
-训练与Web入口同步改为`BLOCKED_ON_BODY_VAE`，因此不会回退到旧VAE或留下伪兼容路径。后续恢复端到端能力时直接围绕新合同建设。
+历史阶段曾将训练与Web入口同步阻断在BodyVAE边界。当前BodyVAE、token prompt timeline、UMT5条件、flow-v loss、optimizer/EMA与原子`InferenceSession`已经落地，因此`train_ldf.py`已解除架构迁移守卫；但配置仍以`root_statistics_required`阻止使用早于当前anchor sampler的旧统计启动长训，显式重算后才切换为`training_ready`。Web模型加载继续以`BLOCKED_ON_LDF_CHECKPOINT`等待首个正式LDF checkpoint。两者都不会回退到旧VAE或留下伪兼容路径。
 
 ## 10. 最低验收测试
 
@@ -497,5 +505,5 @@ VAE full decode 与 cached decode_step parity
 - `latent_motion` width、VAE/AE/FSQ 选择和 tokenizer loss。
 - body observation projector 的最终 feature layout，以及何时扩展 root-only future schema。
 - separated additive 是否作为最终训练/评测默认，或只作为 regular/joint 的补充模式。
-- condition dropout 概率、root/latent loss 权重、self-forcing 和 scheduled training。
+- condition dropout 概率、root/latent loss权重与何时从teacher baseline开启self-forcing/scheduled training。
 - runtime translation-anchor epoch 的切换策略。

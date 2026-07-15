@@ -6,18 +6,46 @@ import pytest
 from models.diffusion_forcing_wan import LDF
 from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import make_vae
-from train_ldf import TRAINING_MIGRATION_ERROR, main as train_main
+from train_ldf import _validate_training_config, main as train_main
 from utils.initialize import instantiate_target, load_config
-from web_demo.model_manager import WEB_MIGRATION_ERROR, get_model_manager
+from web_demo.runtime.model_loader import WEB_RUNTIME_BLOCKER, load_model_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_tiny_core_config_instantiates_public_ldf():
+def test_formal_ldf_config_uses_the_vae_as_contract_source():
     cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
-    model = instantiate_target(cfg.model.target, cfg=None, **cfg.model.params)
-    assert isinstance(model, LDF)
+    assert cfg.status == "root_statistics_required"
+    assert cfg.model.target == "models.diffusion_forcing_wan.LDF"
+    assert cfg.vae.target == "models.vae_wan_1d.BodyVAE"
+    assert cfg.vae.params.latent_dim == 128
+    assert "encoder_context_tokens" not in cfg.data
+    assert cfg.data.min_frames == 40
+    assert cfg.data.max_frames == 200
+    assert cfg.data.cold_start_probability == 0.1
+    assert list(cfg.self_forcing.k_schedule) == [[0.0, 2], [0.4, 3], [0.7, 5]]
+    assert cfg.self_forcing.teacher_replay[2] == 0.2
+    for injected_name in (
+        "latent_dim",
+        "root_mean",
+        "root_std",
+        "local_root_mean",
+        "local_root_std",
+    ):
+        assert injected_name not in cfg.model.params
+
+
+def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
+    cfg = load_config(str(ROOT / "configs" / "ldf_multi.yaml"))
+    assert cfg.data.target == "datasets.multi.MultiDataset"
+    assert [item.target for item in cfg.data.datasets] == [
+        "datasets.humanml3d.HumanML3DDataset",
+        "datasets.babel.BABELDataset",
+    ]
+    assert all(item.text_path == "texts" for item in cfg.data.datasets)
+    assert cfg.model.params.text_len == cfg.text_encoder.text_len == 128
+    assert cfg.self_forcing.enabled is False
 
 
 def test_tiny_vae_config_instantiates_public_body_vae():
@@ -38,6 +66,7 @@ def test_body_vae_lifecycle_boundaries_are_explicit():
     assert "allow_identity_statistics" not in parameters
     assert "require_latent_statistics" not in parameters
     assert not hasattr(BodyVAE, "bind_tokenizer_identity")
+    assert not hasattr(BodyVAE, "encode_window")
     assert not hasattr(BodyVAE, "stream_decode_step")
     assert not hasattr(BodyVAE, "snapshot_decoder_state")
     assert "normalized_latent" not in inspect.signature(
@@ -134,17 +163,35 @@ def test_coordinate_transform_is_the_only_runtime_coordinate_module():
         assert not hasattr(coordinate_transform, name)
 
 
-def test_training_entry_is_explicitly_blocked():
-    with pytest.raises(RuntimeError, match="BLOCKED_ON_BODY_VAE"):
-        train_main()
-    assert "verified latent statistics" in TRAINING_MIGRATION_ERROR
-    assert "BodyVAE.encode_window" in TRAINING_MIGRATION_ERROR
+def test_training_entry_uses_the_public_ldf_training_stack():
+    assert callable(train_main)
+    source = inspect.getsource(train_main)
+    assert "LDFLightningModule" in source
+    assert "create_dataloaders" in source
+    assert "BLOCKED_ON_LDF_TRAINING" not in source
+    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    with pytest.raises(RuntimeError, match="LDF_ROOT_STATISTICS_REQUIRED"):
+        _validate_training_config(cfg)
 
 
 def test_web_entry_is_explicitly_blocked():
-    with pytest.raises(RuntimeError, match="BLOCKED_ON_BODY_VAE"):
-        get_model_manager()
-    assert "four-frame body VAE" in WEB_MIGRATION_ERROR
+    with pytest.raises(RuntimeError, match="BLOCKED_ON_LDF_CHECKPOINT"):
+        load_model_bundle(None)
+    assert "InferenceSession" in WEB_RUNTIME_BLOCKER
+    assert "hybrid LDF" in WEB_RUNTIME_BLOCKER
+
+
+def test_web_runtime_removed_duplicate_legacy_state_owners():
+    for relative_path in (
+        "web_demo/model_manager.py",
+        "web_demo/bootstrap.py",
+        "web_demo/runtime/frame_buffer.py",
+        "web_demo/runtime/generation_worker.py",
+        "web_demo/runtime/state.py",
+        "web_demo/runtime/trajectory_controller.py",
+        "web_demo/services/session_service.py",
+    ):
+        assert not (ROOT / relative_path).exists()
 
 
 @pytest.mark.parametrize(
@@ -161,6 +208,33 @@ def test_web_entry_is_explicitly_blocked():
 )
 def test_removed_architecture_files_are_physically_absent(relative_path):
     assert not (ROOT / relative_path).exists()
+
+
+def test_inference_uses_hybrid_session_without_legacy_root_recovery():
+    import utils.inference as inference
+
+    for relative_path in (
+        "utils/inference/condition_manager.py",
+        "utils/inference/route_condition.py",
+        "utils/inference/text_condition.py",
+        "utils/inference/timeline.py",
+    ):
+        assert not (ROOT / relative_path).exists()
+    for public_name in (
+        "InferenceSession",
+        "InferenceConditionCompiler",
+        "RoutePlan",
+        "TextTimeline",
+        "RootObservation",
+    ):
+        assert hasattr(inference, public_name)
+    for legacy_name in (
+        "ConditionManager",
+        "RootTimeline",
+        "RouteConditionState",
+        "TextConditionState",
+    ):
+        assert not hasattr(inference, legacy_name)
 
 
 def test_initialize_uses_explicit_public_names_only():
@@ -186,3 +260,21 @@ def test_initialize_uses_explicit_public_names_only():
         "get_shared_run_timestamp",
     ):
         assert hasattr(initialize, public_name)
+
+
+def test_legacy_training_step_semantics_are_removed():
+    import utils.training as training
+
+    assert not (ROOT / "utils" / "training" / "step_semantics.py").exists()
+    assert not (ROOT / "utils" / "training" / "module_step.py").exists()
+    for old_name in (
+        "StepSemantics",
+        "CheckpointStepInfo",
+        "build_step_semantics",
+        "compute_step_semantics",
+        "ckpt_step_info",
+        "load_resume_step_offset",
+        "resolve_runtime_max_steps",
+        "resolve_scheduler_steps",
+    ):
+        assert not hasattr(training, old_name)

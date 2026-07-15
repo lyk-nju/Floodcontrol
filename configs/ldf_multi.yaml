@@ -1,0 +1,123 @@
+status: root_statistics_required
+exp_name: ldf_hybrid_humanml3d_babel
+seed: 1234
+debug: false
+train: true
+save_dir: /data1/yuankai/text2Motion/Floodcontrol/ldf
+resume_ckpt: null
+test_ckpt: null
+
+trainer:
+  max_steps: 300000
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  precision: bf16-mixed
+  log_every_n_steps: 50
+
+validation:
+  validation_steps: 1000
+  save_every_n_steps: 10000
+  save_top_k: 20
+
+# Compute this from the exact HumanML3D+BABEL training mixture before launch.
+root_stats_path: ${dirs.raw_data}/HumanML3D_BABEL_root_stats.npz
+
+vae:
+  target: models.vae_wan_1d.BodyVAE
+  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_022912_vae_body265/step_299999.ckpt
+  params:
+    latent_dim: 128
+    hidden_dim: 512
+    encoder_layers: 6
+    decoder_layers: 6
+    kernel_size: 3
+    dropout: 0.0
+    fps: 20.0
+    motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
+    latent_stats_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_022912_vae_body265/latent_stats.npz
+
+data:
+  target: datasets.multi.MultiDataset
+  datasets:
+    - target: datasets.humanml3d.HumanML3DDataset
+      train_meta_paths:
+        - ${dirs.raw_data}/HumanML3D_motion/train.txt
+      val_meta_paths:
+        - ${dirs.raw_data}/HumanML3D_motion/val.txt
+      artifact_path: artifacts
+      text_path: texts
+    - target: datasets.babel.BABELDataset
+      train_meta_paths:
+        - ${dirs.raw_data}/BABEL_motion/train.txt
+      val_meta_paths:
+        - ${dirs.raw_data}/BABEL_motion/val.txt
+      artifact_path: artifacts
+      text_path: texts
+  min_frames: 40
+  max_frames: 200
+  random_yaw: true
+  cold_start_probability: 0.1
+  train_batch_size: 16
+  val_batch_size: 16
+  num_workers: 16
+  pin_memory: true
+
+text_encoder:
+  checkpoint_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth
+  tokenizer_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl
+  text_len: 128
+  dtype: bfloat16
+
+training:
+  text_dropout_probability: 0.1
+
+loss:
+  root_weight: 1.0
+  body_weight: 1.0
+
+self_forcing:
+  enabled: false
+  k_schedule:
+    - [0.0, 2]
+    - [0.4, 3]
+    - [0.7, 5]
+  teacher_replay:
+    2: 0.2
+    3: 0.1
+    5: 0.1
+
+model:
+  target: models.diffusion_forcing_wan.LDF
+  ema_decay: 0.99
+  params:
+    hidden_dim: 1024
+    ffn_dim: 2048
+    freq_dim: 256
+    text_dim: 4096
+    text_len: 128
+    num_heads: 8
+    root_num_layers: 8
+    body_num_layers: 8
+    chunk_size: 5
+    noise_steps: 10
+    fps: 20.0
+    time_embedding_scale: 1.0
+    cfg_mode: separated
+    cfg_scale_text: 1.0
+    cfg_scale_constraint: 1.0
+    cfg_scale_joint: 1.0
+    prediction_type: vel
+
+optimizer:
+  target: AdamW
+  params:
+    lr: 2.0e-4
+    betas: [0.9, 0.99]
+    weight_decay: 0.0
+    eps: 1.0e-8
+
+lr_scheduler:
+  target: diffusers.optimization.get_constant_schedule_with_warmup
+  params:
+    num_warmup_steps: 1000

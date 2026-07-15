@@ -1,6 +1,6 @@
 # 02 离线数据处理与加载
 
-状态：`FULL_CLIP_DATASETS_AND_TASK_COLLATORS_READY / LDF_TRAINER_PENDING`
+状态：`FULL_CLIP_DATASETS_AND_LDF_SPAN_READY / LDF_TRAINER_PENDING`
 
 ## 本文只回答什么
 
@@ -38,9 +38,11 @@ HumanML3D root deltas + RIC positions + IK local rotations
 
 `HumanML3DDataset`与`BABELDataset`分别解析自己的split和`caption#tokens#start#end`文本，且不互相继承；统一返回完整未裁剪sample：`dataset/name/root_motion/body_motion/body_feature_valid_mask/text_data`。处理后的dataset root自包含split、`artifacts/`和`texts/`；需要文本的任务使用相对目录`text_path: texts`，纯VAE训练可显式设置`text_path: null`，避免读取未消费的caption。motion NPZ只保存三组tensor，文本保持独立TXT，不把字符串复制进每个NPZ。公开source identity固定为`HumanML3D`和`BABEL`，不从数据目录名推导，因此目录移动或重命名不会改变batch metadata。`MultiDataset`只实例化并concat子Dataset，不拥有collate。
 
-任务相关处理下沉到training data层：`utils/training/vae/data.py`负责VAE随机/确定性crop、translation rebase、同步yaw、previous-root和padding；`utils/training/ldf/data.py`负责active window、固定`encoder_context_tokens × 4`左历史、cold-start左零填充、context mask以及相对token文本。LDF同区间多caption在train随机选一个、validation取第一个。当前LDF data contract已实现，但OriginEpoch、future observation、history/generation noise和trainer接线仍未实现。
+任务相关处理下沉到training data层：`utils/training/vae/data.py`负责VAE crop、translation rebase、同步yaw、previous-root和padding；LDF的`MinimumFrameDataset`先排除不足source-span最短长度的样本，避免短BABEL clip在随机batch中延迟报错。`LDFSpanCollator`再选择batch共享的40–200帧physical source span、真实VAE左context、previous root、source crop坐标和token prompt timeline。HumanML3D从覆盖当前span的caption备选中选择一条并重复到每个token；BABEL把四帧对齐的半开区间直接编译为每token一个prompt，区间重叠或未对齐会fail-fast。它不再决定H/active/frontier，也不做translation anchor、noise或self-forcing。10% true cold-start batch强制从sample起点开始、context为空且previous-root无效；普通continuation允许mid-clip crop并携带真实边界。
 
 statistics和VAE reconstruction evaluation直接消费Dataset full sample，不读取artifact manifest。physical statistics仍用四个quarter-turn quadrature点匹配均匀yaw的一阶和逐维二阶矩；latent statistics改用显式seed的普通随机生成器，不再用sample hash决定yaw。
+
+`tools/compute_ldf_root_stats.py`已经复用40–200帧source span、10% true cold start、随机初始H和rollout固定anchor：`H>0`取第`4H-1`帧，`H=0`取第0帧。产物仍只保存`root_mean/root_std [5]`；现有NPZ不会自动覆盖，必须在正式训练前显式重算。local-root statistics继续来自EMA VAE的`motion_stats.npz`。
 
 当前可执行数据构建入口使用模块形式，避免依赖隐式`PYTHONPATH`：
 
@@ -73,6 +75,14 @@ python -m tools.compute_vae_latent_stats \
   --train-meta-paths ${RAW_DATA}/HumanML3D_motion/train.txt \
   --output ${VAE_RUN}/latent_stats.npz
 
+python -m tools.compute_ldf_root_stats \
+  --train-meta-paths ${RAW_DATA}/HumanML3D_motion/train.txt \
+  --output ${RAW_DATA}/HumanML3D_motion/root_stats.npz \
+  --min-frames 40 \
+  --max-frames 200 \
+  --windows-per-sample 1 \
+  --seed 1234
+
 # 正式LDF训练直接从checkpoint加载EMA encoder并在线产生deterministic mu。
 ```
 
@@ -98,24 +108,25 @@ VAETrainingBatch
   synchronized yaw / translation rebase
   frame/feature masks and batch padding
 
-LDFDataBatch
-  active root/body window + previous root
-  fixed left body encoder context and masks
-  relative token text intervals
+LDFSpanBatch
+  batch-shared physical source span + independent source crop index
+  all available real left context within the encoder receptive field
+  true-cold/continuation boundary + previous root validity
+  per-token prompt timeline; no beta/noise/rollout fields
 ```
 
 ## 当前待讨论问题
 
 - 全局 yaw augmentation 冻结为train split每次采样`Uniform(0,2π)`；cold-start heading、previous-root boundary和全部world-space body feature同步变换。
 - VAE训练clip在1–10秒范围内按完整四帧patch裁剪；crop中间位置必须携带真实preceding frame。
-- LDF target固定由冻结EMA encoder在线产生deterministic `mu`；active crop前必须携带完整encoder感受野，encode后丢弃warm-up context输出。
-- root statistics 在哪一种 epoch/window sampling policy 下统计。
-- LDF的OriginEpoch、future observation与history/generation noise如何在当前简单window contract之上扩展。
+- LDF target固定由冻结EMA encoder在线产生deterministic `mu`；active crop前携带感受野内全部真实可用历史，encode后按逐样本offset丢弃warm-up context输出。只有真实序列起点附近允许少于完整感受野，且不插入假历史token。
+- 正式root statistics需要使用已实现的固定anchor sampler重新生成并写入训练资产。
+- span内current observation与span外future goal的采样/dropout仍待后续condition阶段接入。
 - 尾部不足四帧在artifact构建时显式丢弃；batch padding只允许完整四帧patch并携带frame/token mask。
 
 ## 冻结条件
 
-- 同一完整motion token无论被哪个LDF window采到，都通过相同历史context得到同一个deterministic `mu`。
+- 同一完整motion token通过其感受野内全部真实历史得到唯一deterministic `mu`；序列起点不足的历史由encoder自身的causal边界处理，而不是由collator显式补token。
 - full recover 后的 slice 不会被 window-local recovery 重置 yaw。
 - 所有随机变换发生在物理空间且同步作用于对应的世界约束。
-- online EMA encoder与HybridMotion trainer bridge接入后，必须保持context mask与active slice一致。
+- online EMA encoder与HybridMotion trainer bridge必须保持context mask与active slice一致；当前实现已由真实checkpoint/data smoke验证。

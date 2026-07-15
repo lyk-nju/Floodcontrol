@@ -11,18 +11,21 @@ from utils.initialize import (
     log_model_parameters,
     log_state_dict_summary,
 )
-from utils.training.module_step import ckpt_step_info
 
 
 class BasicLightningModule(LightningModule):
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, model=None):
         super().__init__()
         self.cfg = cfg
-        self.model = instantiate_target(
-            target=cfg.model.target,
-            cfg=None,
-            hfstyle=False,
-            **cfg.model.params,
+        self.model = (
+            instantiate_target(
+                target=cfg.model.target,
+                cfg=None,
+                hfstyle=False,
+                **cfg.model.params,
+            )
+            if model is None
+            else model
         )
 
         self._trainable_parameters = tuple(
@@ -137,7 +140,7 @@ class BasicLightningModule(LightningModule):
         )
         self.log(
             "ckpt_absolute_step",
-            float(ckpt_step_info(self).metric_value),
+            float(self.global_step + 1),
             on_step=True,
             prog_bar=False,
             batch_size=batch_size,

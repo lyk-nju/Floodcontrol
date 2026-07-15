@@ -98,6 +98,8 @@ def test_basic_training_module_has_no_legacy_eval_or_hash_side_effects():
     assert "TOKENIZERS_PARALLELISM" not in source
     assert "def test_step" not in source
     assert "initialize_metrics" not in source
+    assert "ckpt_step_info" not in source
+    assert "float(self.global_step + 1)" in source
 
 
 def test_vae_dataset_builder_requires_preprocessed_motion_artifacts(tmp_path):

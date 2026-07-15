@@ -44,20 +44,93 @@ def test_causal_vae_rejects_unsafe_kernel_sizes(kernel_size):
         )
 
 
-def test_encoder_window_matches_full_clip_after_complete_warmup():
+@pytest.mark.parametrize(
+    ("start", "context"),
+    [
+        pytest.param(0, 0, id="cold-start"),
+        pytest.param(3, 3, id="partial-context"),
+        pytest.param(12, 8, id="full-context"),
+    ],
+)
+def test_tokenize_window_matches_full_clip_for_real_context(start, context):
     model = make_model()
-    tokens = 16
+    assert model.encoder_context_tokens == 8
+    tokens = 20
     body = torch.randn(1, tokens * 4, 265)
     mask = torch.ones(1, tokens * 4, dtype=torch.bool)
     full = model.encode(body, mask)
-    start, active_tokens = 10, 3
-    context = model.encoder_context_tokens
-    local = model.encode_window(
+    active_tokens = 3
+    local = model.tokenize_window(
         body[:, (start - context) * 4 : (start + active_tokens) * 4],
         mask[:, (start - context) * 4 : (start + active_tokens) * 4],
-        context_token_count=context,
+        context_token_count=torch.tensor([context], dtype=torch.long),
     )
-    assert torch.allclose(local.mu, full.mu[:, start : start + active_tokens], atol=1e-6)
+    expected = model.normalize_latent(full.mu[:, start : start + active_tokens])
+    assert torch.allclose(local, expected, atol=1e-6)
+
+
+def test_tokenize_window_rejects_partial_encoder_token():
+    model = make_model()
+    body = torch.zeros(1, 4, 265)
+    mask = torch.tensor([[True, True, False, False]])
+    with pytest.raises(ValueError, match="constant within each four-frame token"):
+        model.tokenize_window(
+            body,
+            mask,
+            context_token_count=torch.zeros(1, dtype=torch.long),
+        )
+
+
+def test_tokenize_window_mixed_batch_gathers_active_tokens_and_zeros_padding(tmp_path):
+    motion_stats, latent_stats = write_statistics(
+        tmp_path, latent_dim=128, latent_mean=2.0, latent_std=3.0
+    )
+    model = BodyVAE(
+        motion_stats_path=motion_stats,
+        latent_stats_path=latent_stats,
+        latent_dim=128,
+        hidden_dim=32,
+        encoder_layers=2,
+        decoder_layers=2,
+    ).eval()
+    specs = (
+        # start, real context, active tokens
+        (0, 0, 3),
+        (3, 3, 2),
+        (12, model.encoder_context_tokens, 4),
+    )
+    full_body = torch.randn(len(specs), 20 * 4, 265)
+    full_mask = torch.ones(len(specs), 20 * 4, dtype=torch.bool)
+    full_posterior = model.encode(full_body, full_mask)
+
+    window_tokens = [context + active for _, context, active in specs]
+    max_window_tokens = max(window_tokens)
+    body_with_context = torch.zeros(len(specs), max_window_tokens * 4, 265)
+    window_mask = torch.zeros(len(specs), max_window_tokens * 4, dtype=torch.bool)
+    for batch_index, (start, context, active) in enumerate(specs):
+        source = full_body[
+            batch_index,
+            (start - context) * 4 : (start + active) * 4,
+        ]
+        body_with_context[batch_index, : source.shape[0]] = source
+        window_mask[batch_index, : source.shape[0]] = True
+
+    context_count = torch.tensor([item[1] for item in specs], dtype=torch.long)
+    normalized_mu = model.tokenize_window(
+        body_with_context, window_mask, context_count
+    )
+
+    max_active = max(item[2] for item in specs)
+    assert normalized_mu.shape == (len(specs), max_active, 128)
+    for batch_index, (start, _, active) in enumerate(specs):
+        expected = model.normalize_latent(
+            full_posterior.mu[batch_index, start : start + active]
+        )
+        assert torch.allclose(
+            normalized_mu[batch_index, :active], expected, atol=1e-6
+        )
+        if active < max_active:
+            assert not normalized_mu[batch_index, active:].any()
 
 
 def test_offline_and_explicit_state_decode_match():

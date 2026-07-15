@@ -18,7 +18,7 @@ root_motion + latent_motion
 - HumanML3D/BABEL的独立body265 artifact、联合statistics与同构multi-dataset训练入口；
 - 分主题架构文档和契约测试。
 
-旧的附加控制网络、外置轨迹编码器、外置root planner以及263D/trajectory7 runtime已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、唯一`humanml265`离线转换器、root5/body265运行时motion API、合成张量流式decode和LDF heading bridge。HumanML3D/BABEL Dataset现在只返回统一完整sample，VAE与LDF各自在training data层构造crop、context与mask。第一版HumanML-only VAE已完成300k steps；训练、评测与后续LDF通过同一个公共函数从训练checkpoint加载EMA encoder+decoder。motion与latent statistics使用普通NPZ数组。LDF encoder context sampler已落地，真实训练仍需frozen online encoder与HybridMotion batch接线；Web生成仍需commit-time decoder接线。
+旧的附加控制网络、外置轨迹编码器、外置root planner以及263D/trajectory7 runtime已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、唯一`humanml265`离线转换器、root5/body265运行时motion API、合成张量流式decode和LDF heading bridge。HumanML3D/BABEL Dataset只返回统一完整sample，VAE与LDF各自在training data层构造任务视图。第一版HumanML-only VAE已完成300k steps；训练、评测与LDF通过同一个公共函数加载EMA encoder+decoder。LDF训练入口已接入冻结EMA VAE在线确定性编码、冻结UMT5、逐token prompt timeline、固定噪声active band、root/body flow-v loss、EMA与可选detached self-forcing。HumanML caption在整段token上重复，BABEL区间被编译为token prompt timeline；每个motion token只cross-attend自身prompt。Web已经使用同一个`InferenceSession`完成commit-time decoder、四帧chunk、会话锁和route/text更新接线，只等待正式LDF checkpoint loader。
 
 ## 当前可验证范围
 
@@ -26,7 +26,7 @@ root_motion + latent_motion
 python -m pytest tests -q
 ```
 
-测试覆盖typed condition、Root/Body forward、constraint CFG、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`在缺少motion artifact split TXT/statistics时fail-fast；`train_ldf.py`与Web模型加载继续明确抛出`BLOCKED_ON_BODY_VAE`，直到在线EMA encoder与decoder runtime接线完成。
+测试覆盖typed condition、Root/Body forward、constraint CFG、逐token文本隔离、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`与`train_ldf.py`都会在所需statistics/checkpoint/data缺失时fail-fast；现有root statistics早于当前fixed-span anchor sampler，因此`configs/ldf.yaml`保持`root_statistics_required`，显式重算并确认后才能切换为`training_ready`。Web的四帧chunk runtime已经接入`InferenceSession`，模型加载在正式LDF checkpoint冻结前明确抛出`BLOCKED_ON_LDF_CHECKPOINT`。
 
 本地数据、依赖和输出目录默认分别为`./data`、`./deps`和`./outputs`，也可以通过`FLOODCONTROL_DATA`、`FLOODCONTROL_DEPS`和`FLOODCONTROL_OUTPUTS`覆盖。
 

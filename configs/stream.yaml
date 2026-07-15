@@ -1,10 +1,31 @@
-status: BLOCKED_ON_BODY_VAE
+status: BLOCKED_ON_LDF_CHECKPOINT
 message: >-
-  The legacy full-motion stream runtime was removed. Re-enable this entry only
-  after the four-frame body VAE, create_window_condition route compiler,
-  and commit-time decoder transaction are implemented.
+  The strict four-frame BodyVAE and atomic Hybrid inference runtime are ready.
+  Web model loading remains blocked until a formally trained LDF checkpoint,
+  frozen root statistics and checkpoint loader contract are available.
 
-traj_mask:
-  route_mode: relative_to_actor
-  token_dt: 0.20
-  horizon_tokens: 20
+web:
+  target_fps: 20.0
+
+  inference:
+    window_tokens: 30
+    future_constraint_tokens: 10
+    num_denoise_steps: 10
+    rebase_on_roll: true
+
+  guidance:
+    mode: separated
+    scale_text: 1.0
+    scale_constraint: 1.0
+    scale_joint: 1.0
+
+  buffer:
+    # One chunk is one model commit and always contains four frames.
+    target_chunks: 2
+    capacity_chunks: 8
+    chunk_wait_timeout_seconds: 0.5
+
+  session:
+    consumption_timeout_seconds: 5.0
+    monitor_interval_seconds: 1.0
+    worker_stop_timeout_seconds: 5.0

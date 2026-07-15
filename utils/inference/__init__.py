@@ -1,33 +1,37 @@
-"""Model-independent inference timeline utilities.
+"""Public streaming inference contracts for hybrid LDF and BodyVAE."""
 
-End-to-end generation is intentionally unavailable until a trained body VAE
-VAE, verified latent artifacts, and the commit-time decoder transaction are
-connected to the hybrid LDF.
-"""
-
-from .condition_manager import ConditionManager
-from .route_condition import (
-    RouteConditionState,
-    RoutePlan,
-    RouteReferenceMode,
-    RouteUpdate,
-    reanchor_route_to_xz,
-    sample_route_future,
+from .condition import (
+    CompiledCondition,
+    InferenceConditionCompiler,
+    RootObservation,
+    RootObservationTimeline,
 )
-from .text_condition import TextConditionBundle, TextConditionState, TextSegment
-from .timeline import RootFrameState, RootTimeline
+from .route import RouteEndBehavior, RoutePlan, RouteReference
+from .session import (
+    GeneratedMotionChunk,
+    GuidanceConfig,
+    InferenceConfig,
+    InferenceSession,
+    InferenceSnapshot,
+    InferenceStepTrace,
+)
+from .text import TextEmbeddingCache, TextInterval, TextTimeline
 
 __all__ = [
-    "ConditionManager",
-    "RootFrameState",
-    "RootTimeline",
-    "RouteConditionState",
+    "CompiledCondition",
+    "GeneratedMotionChunk",
+    "GuidanceConfig",
+    "InferenceConditionCompiler",
+    "InferenceConfig",
+    "InferenceSession",
+    "InferenceSnapshot",
+    "InferenceStepTrace",
+    "RootObservation",
+    "RootObservationTimeline",
+    "RouteEndBehavior",
     "RoutePlan",
-    "RouteReferenceMode",
-    "RouteUpdate",
-    "TextConditionBundle",
-    "TextConditionState",
-    "TextSegment",
-    "reanchor_route_to_xz",
-    "sample_route_future",
+    "RouteReference",
+    "TextEmbeddingCache",
+    "TextInterval",
+    "TextTimeline",
 ]

@@ -1,17 +1,33 @@
 # Floodcontrol Web Runtime
 
-状态：`BLOCKED_ON_BODY_VAE`。
+状态：`BLOCKED_ON_LDF_CHECKPOINT`。
 
-当前仓库已经发布Hybrid LDF与strict `4 frames / token` BodyVAE模型核心。旧的full-motion VAE、ControlNet和外置root planner已经删除；本地全量HumanML motion artifacts/statistics已经就绪，正式VAE/latent artifacts、commit-time decoder事务与Web runtime尚未接线。
+Web 层已经迁移到新版 Hybrid 推理协议：每个浏览器会话只持有一个
+`utils.inference.InferenceSession`，LDF commit、BodyVAE causal decode、窗口
+rolling 与 route/text revision 不再由 Web 重复维护。后台生产与 HTTP 传输都以
+一个 latent token 对应的四帧 `WebMotionChunk` 为原子单位。
 
-因此本目录保留HTTP/UI边界和显式迁移守卫，但不能启动真实动作生成。`web_demo.model_manager.ModelManager`会在加载legacy checkpoint之前抛出带有`BLOCKED_ON_BODY_VAE`的错误。
+## 当前已经完成
 
-恢复Web生成需要依次完成：
+- `WebRuntime` 管理共享只读模型、单活跃会话和进程级 GPU execution lock；
+- `WebSession` 串行化生成、text/route/CFG 更新、pause/resume/reset；
+- bounded chunk buffer 使用 backpressure，禁止静默丢帧；
+- API 直接接受 typed XZ route，并支持 world/relative-to-actor 与 hold/release；
+- 浏览器一次拉取四帧 chunk，再本地按 20 FPS 播放；
+- 旧 `ModelManager`、`TrajectoryController`、root feedback、route delay/blend 已删除。
 
-1. 从HumanML3D 263D生成explicit root/body265与真实statistics；
-2. 训练BodyVAE并生成带checkpoint hash的latent artifacts；
-3. runtime condition compiler与`LDF.stream_generate_step()`接线；
-4. Hybrid commit与VAE decoder state的原子snapshot/restore；
-5. full/cached decode parity和端到端stream测试。
+## 当前阻塞项
 
-在这些条件满足前，不应把静态前端或旧server脚本视为可用生成demo。
+正式 Hybrid LDF 尚未完成训练，因此仓库还没有可以冻结的 LDF checkpoint、
+root statistics identity 和 checkpoint loader contract。`model_loader.load_model_bundle()`
+会在尝试加载任何 legacy checkpoint 前明确抛出 `BLOCKED_ON_LDF_CHECKPOINT`。
+
+完成正式 LDF 训练后，需要实现唯一的 `ModelBundle` loader，加载并校验：
+
+1. LDF checkpoint 与冻结 global/local root statistics；
+2. 已训练 BodyVAE checkpoint 与 latent statistics；
+3. UMT5 text encoder/tokenizer；
+4. FPS、latent dimension 和 contract/checkpoint identity。
+
+静态服务器可以启动并通过 `/api/status` 报告阻塞原因；在 loader 完成前，
+`POST /api/sessions` 会返回 HTTP 503，而不会回退到旧推理路径。

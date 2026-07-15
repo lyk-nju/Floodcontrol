@@ -75,12 +75,14 @@ class TransformerStage(nn.Module):
         text_len: int,
         num_heads: int,
         num_layers: int,
+        time_embedding_scale: float,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.freq_dim = int(freq_dim)
         self.text_dim = int(text_dim)
         self.text_len = int(text_len)
+        self.time_embedding_scale = float(time_embedding_scale)
         self.input_projection = nn.Linear(input_dim, hidden_dim)
         self.region_embedding = nn.Embedding(3, hidden_dim)
         self.text_projection = nn.Sequential(
@@ -118,31 +120,61 @@ class TransformerStage(nn.Module):
         *,
         batch_size: int,
         token_length: int,
+        query_token_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if tuple(query_token_indices.shape[:1]) != (batch_size,):
+            raise ValueError("query_token_indices must have shape [B,L]")
+        if query_token_indices.dtype != torch.long:
+            raise TypeError("query_token_indices must be int64")
+
         if len(text_context) == batch_size * token_length:
-            # Preserve token-aligned prompt changes as a per-sample sequence of
-            # prompt summaries.  All motion tokens can cross-attend this known
-            # prompt timeline without introducing a trajectory-specific mask.
-            summarized = []
-            for batch_idx in range(batch_size):
-                rows = text_context[
-                    batch_idx * token_length : (batch_idx + 1) * token_length
-                ]
-                summarized.append(
-                    torch.stack([row.float().mean(dim=0) for row in rows], dim=0)
-                )
-            text_context = summarized
-        if len(text_context) != batch_size:
+            projected, lengths = embed_text_context(
+                self.text_projection,
+                text_context,
+                text_len=self.text_len,
+                device=device,
+            )
+            projected = projected.reshape(
+                batch_size, token_length, projected.shape[1], projected.shape[2]
+            )
+            lengths = lengths.reshape(batch_size, token_length)
+        elif len(text_context) == batch_size:
+            projected, lengths = embed_text_context(
+                self.text_projection,
+                text_context,
+                text_len=self.text_len,
+                device=device,
+            )
+            projected = projected[:, None].expand(
+                -1, token_length, -1, -1
+            )
+            lengths = lengths[:, None].expand(-1, token_length)
+        else:
             raise ValueError(
                 f"text_context must contain B or B*T entries, got {len(text_context)}"
             )
-        return embed_text_context(
-            self.text_projection,
-            text_context,
-            text_len=self.text_len,
-            device=device,
+
+        query_length = query_token_indices.shape[1]
+        valid_index = (query_token_indices >= 0) & (
+            query_token_indices < token_length
         )
+        valid_query = (
+            torch.arange(query_length, device=device)[None] < seq_lens[:, None]
+        )
+        text_query_mask = valid_index & valid_query
+        indices = query_token_indices.clamp(min=0, max=max(token_length - 1, 0))
+        batch_indices = torch.arange(batch_size, device=device)[:, None]
+        gathered = projected[batch_indices, indices]
+        gathered_lengths = lengths[batch_indices, indices]
+        gathered = torch.where(
+            text_query_mask[..., None, None], gathered, torch.zeros_like(gathered)
+        )
+        gathered_lengths = torch.where(
+            text_query_mask, gathered_lengths, torch.zeros_like(gathered_lengths)
+        )
+        return gathered, gathered_lengths, text_query_mask
 
     def _run_blocks(
         self,
@@ -154,19 +186,28 @@ class TransformerStage(nn.Module):
         rope_position_ids: torch.Tensor,
         text_context: list[torch.Tensor],
         motion_token_length: int,
+        text_query_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, length = tokens.shape[:2]
+        if text_query_indices is None:
+            text_query_indices = torch.arange(
+                length, device=tokens.device, dtype=torch.long
+            )[None].expand(batch, -1)
         hidden = self.input_projection(tokens) + self.region_embedding(region_ids)
         time = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, beta).float()
+            sinusoidal_embedding_1d(
+                self.freq_dim, beta * self.time_embedding_scale
+            ).float()
         )
         modulation = self.time_projection(time).reshape(
             batch, length, 6, self.hidden_dim
         )
-        context, context_lens = self._prepare_text(
+        context, context_lens, text_query_mask = self._prepare_text(
             text_context,
             batch_size=batch,
             token_length=motion_token_length,
+            query_token_indices=text_query_indices,
+            seq_lens=seq_lens,
             device=tokens.device,
         )
         for block in self.blocks:
@@ -177,6 +218,7 @@ class TransformerStage(nn.Module):
                 rope_position_ids=rope_position_ids,
                 context=context,
                 context_lens=context_lens,
+                text_query_mask=text_query_mask,
             )
         return self.output_projection(self.output_norm(hidden))
 
@@ -195,6 +237,7 @@ class RootTransformer(TransformerStage):
         text_len: int,
         num_heads: int,
         num_layers: int,
+        time_embedding_scale: float,
     ):
         root_patch_dim = FRAMES_PER_TOKEN * ROOT_DIM
         input_dim = root_patch_dim + latent_dim + root_patch_dim + 3
@@ -208,6 +251,7 @@ class RootTransformer(TransformerStage):
             text_len=text_len,
             num_heads=num_heads,
             num_layers=num_layers,
+            time_embedding_scale=time_embedding_scale,
         )
         self.root_patch_dim = root_patch_dim
         self.future_projection = nn.Linear(root_patch_dim * 2, input_dim)
@@ -244,10 +288,12 @@ class RootTransformer(TransformerStage):
         all_rope_positions = inputs.rope_position_ids
         all_regions = region_ids
         seq_lens = valid_lengths
+        text_query_indices = torch.arange(
+            tokens, device=current.device, dtype=torch.long
+        )[None].expand(batch, -1)
+        scatter_lengths = valid_lengths
 
         if condition.future_root_condition_value is not None:
-            if bool((valid_lengths != tokens).any()):
-                raise ValueError("future tokens require a fully valid current motion window")
             future_value = condition.future_root_condition_value.to(noisy.root_motion)
             future_mask = condition.future_root_condition_mask.to(
                 device=noisy.root_motion.device, dtype=torch.bool
@@ -255,40 +301,54 @@ class RootTransformer(TransformerStage):
             future = self.future_projection(
                 torch.cat([future_value.flatten(2), future_mask.flatten(2).float()], dim=-1)
             )
-            # future_projection maps directly to the stage input width; current
-            # remains in that same pre-projection feature space.
-            all_tokens = torch.cat([current, future], dim=1)
-            future_count = future.shape[1]
-            all_beta = torch.cat(
-                [inputs.beta, inputs.beta.new_zeros(batch, future_count)], dim=1
-            )
+            future_count = condition.future_valid_mask.sum(
+                dim=1, dtype=torch.long
+            ).to(valid_lengths.device)
             future_rope_positions = inputs.timeline_to_rope(
                 condition.future_timeline_position_ids.to(
                     inputs.timeline_position_ids.device
                 )
             )
-            all_rope_positions = torch.cat(
-                [
-                    inputs.rope_position_ids,
-                    future_rope_positions,
-                ],
-                dim=1,
+            seq_lens = valid_lengths + future_count
+            packed_length = int(seq_lens.max().item())
+            all_tokens = current.new_zeros(batch, packed_length, current.shape[-1])
+            all_beta = inputs.beta.new_zeros(batch, packed_length)
+            all_rope_positions = inputs.rope_position_ids.new_zeros(
+                batch, packed_length
             )
-            all_regions = torch.cat(
-                [
-                    region_ids,
-                    torch.full(
-                        (batch, future_count),
-                        2,
-                        device=region_ids.device,
-                        dtype=torch.long,
-                    ),
-                ],
-                dim=1,
+            all_regions = region_ids.new_zeros(batch, packed_length)
+            text_query_indices = region_ids.new_full(
+                (batch, packed_length), -1
             )
-            seq_lens = valid_lengths + condition.future_valid_mask.sum(
-                dim=1, dtype=torch.long
-            ).to(valid_lengths.device)
+            for batch_index in range(batch):
+                motion_count = int(valid_lengths[batch_index].item())
+                constraint_count = int(future_count[batch_index].item())
+                all_tokens[batch_index, :motion_count] = current[
+                    batch_index, :motion_count
+                ]
+                all_beta[batch_index, :motion_count] = inputs.beta[
+                    batch_index, :motion_count
+                ]
+                all_rope_positions[batch_index, :motion_count] = (
+                    inputs.rope_position_ids[batch_index, :motion_count]
+                )
+                all_regions[batch_index, :motion_count] = region_ids[
+                    batch_index, :motion_count
+                ]
+                text_query_indices[batch_index, :motion_count] = torch.arange(
+                    motion_count, device=current.device
+                )
+                if constraint_count:
+                    constraint_slice = slice(
+                        motion_count, motion_count + constraint_count
+                    )
+                    all_tokens[batch_index, constraint_slice] = future[
+                        batch_index, :constraint_count
+                    ]
+                    all_rope_positions[batch_index, constraint_slice] = (
+                        future_rope_positions[batch_index, :constraint_count]
+                    )
+                    all_regions[batch_index, constraint_slice] = 2
 
         output = self._run_blocks(
             all_tokens,
@@ -298,8 +358,14 @@ class RootTransformer(TransformerStage):
             rope_position_ids=all_rope_positions,
             text_context=condition.text_context,
             motion_token_length=tokens,
+            text_query_indices=text_query_indices,
         )
-        return output[:, :tokens].reshape(batch, tokens, FRAMES_PER_TOKEN, ROOT_DIM)
+        root_output = output.new_zeros(batch, tokens, self.root_patch_dim)
+        for batch_index, motion_count in enumerate(scatter_lengths.tolist()):
+            root_output[batch_index, :motion_count] = output[
+                batch_index, :motion_count
+            ]
+        return root_output.reshape(batch, tokens, FRAMES_PER_TOKEN, ROOT_DIM)
 
 
 class BodyTransformer(TransformerStage):
@@ -316,6 +382,7 @@ class BodyTransformer(TransformerStage):
         text_len: int,
         num_heads: int,
         num_layers: int,
+        time_embedding_scale: float,
     ):
         local_patch_dim = FRAMES_PER_TOKEN * LOCAL_ROOT_DIM
         input_dim = latent_dim + local_patch_dim + LOCAL_ROOT_DIM * FRAMES_PER_TOKEN + 2 + 3
@@ -329,6 +396,7 @@ class BodyTransformer(TransformerStage):
             text_len=text_len,
             num_heads=num_heads,
             num_layers=num_layers,
+            time_embedding_scale=time_embedding_scale,
         )
         self.latent_dim = int(latent_dim)
 
@@ -374,6 +442,9 @@ class BodyTransformer(TransformerStage):
             rope_position_ids=inputs.rope_position_ids,
             text_context=condition.text_context,
             motion_token_length=latent.shape[1],
+            text_query_indices=torch.arange(
+                latent.shape[1], device=latent.device, dtype=torch.long
+            )[None].expand(latent.shape[0], -1),
         )
 
 
@@ -392,7 +463,7 @@ class LDF(nn.Module):
         ffn_dim: int = 2048,
         freq_dim: int = 256,
         text_dim: int = 4096,
-        text_len: int = 512,
+        text_len: int = 128,
         num_heads: int = 8,
         root_num_layers: int = 8,
         body_num_layers: int = 8,
@@ -440,6 +511,7 @@ class LDF(nn.Module):
             text_dim=text_dim,
             text_len=text_len,
             num_heads=num_heads,
+            time_embedding_scale=time_embedding_scale,
         )
         self.root_transformer = RootTransformer(
             **common, num_layers=root_num_layers
@@ -456,12 +528,44 @@ class LDF(nn.Module):
         physical = project_root_heading(physical)
         return normalize_features(physical, self.root_mean, self.root_std)
 
+    def normalize_root(self, physical_root: torch.Tensor) -> torch.Tensor:
+        """Normalize physical root5 values with this LDF's frozen statistics."""
+
+        if not torch.is_tensor(physical_root) or physical_root.shape[-1] != ROOT_DIM:
+            raise ValueError("physical_root must be a tensor ending in root5")
+        if not physical_root.is_floating_point() or not bool(
+            torch.isfinite(physical_root).all()
+        ):
+            raise ValueError("physical_root must contain finite floating-point values")
+        return normalize_features(physical_root, self.root_mean, self.root_std)
+
+    def denormalize_root(self, normalized_root: torch.Tensor) -> torch.Tensor:
+        """Restore normalized root5 values to physical model coordinates."""
+
+        if not torch.is_tensor(normalized_root) or normalized_root.shape[-1] != ROOT_DIM:
+            raise ValueError("normalized_root must be a tensor ending in root5")
+        if not normalized_root.is_floating_point() or not bool(
+            torch.isfinite(normalized_root).all()
+        ):
+            raise ValueError("normalized_root must contain finite floating-point values")
+        return unnormalize_features(normalized_root, self.root_mean, self.root_std)
+
+    def _project_normalized_root(self, normalized_root: torch.Tensor) -> torch.Tensor:
+        physical = self.denormalize_root(normalized_root)
+        return self.normalize_root(project_root_heading(physical))
+
     def _local_root(
-        self, clean_root: torch.Tensor, previous_root_frame: torch.Tensor | None
+        self,
+        clean_root: torch.Tensor,
+        previous_root_frame: torch.Tensor | None,
+        previous_root_valid_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         physical = unnormalize_features(clean_root, self.root_mean, self.root_std)
         local, valid = recover_local_root(
-            physical.flatten(1, 2), previous_root_frame, fps=self.fps
+            physical.flatten(1, 2),
+            previous_root_frame,
+            fps=self.fps,
+            previous_root_valid_mask=previous_root_valid_mask,
         )
         normalized = normalize_features(
             local, self.local_root_mean, self.local_root_std
@@ -513,7 +617,9 @@ class LDF(nn.Module):
             inputs.noisy_motion.root_motion, inputs.beta, root_velocity
         )
         local, local_valid, normalized_local = self._local_root(
-            clean_root, inputs.previous_root_frame
+            clean_root,
+            inputs.previous_root_frame,
+            inputs.previous_root_valid_mask,
         )
         heading = self._body_heading_condition(clean_root, inputs)
         latent_velocity = self._predict_body(
@@ -586,7 +692,9 @@ class LDF(nn.Module):
             inputs.noisy_motion.root_motion, inputs.beta, root_velocity
         )
         local, local_valid, normalized_local = self._local_root(
-            clean_root, inputs.previous_root_frame
+            clean_root,
+            inputs.previous_root_frame,
+            inputs.previous_root_valid_mask,
         )
         heading = self._body_heading_condition(clean_root, inputs)
 
@@ -647,13 +755,20 @@ class LDF(nn.Module):
         motion: HybridMotion,
         *,
         beta: torch.Tensor,
+        next_beta: torch.Tensor | None,
         timeline_position_ids: torch.Tensor,
         commit_index: int,
         condition: LDFCondition,
         previous_root_frame: torch.Tensor | None,
+        previous_root_valid_mask: torch.Tensor | None,
     ) -> LDFInput:
         history = timeline_position_ids < int(commit_index)
-        generation = ~history
+        visible = beta < 1.0 - 1e-7
+        if next_beta is not None:
+            if tuple(next_beta.shape) != tuple(beta.shape):
+                raise ValueError("next_beta must match beta [B,T]")
+            visible |= next_beta < beta - 1e-7
+        generation = (~history) & visible
         beta = torch.where(history, torch.zeros_like(beta), beta)
         rope_position_ids = timeline_position_ids - int(commit_index)
         return LDFInput(
@@ -664,6 +779,7 @@ class LDF(nn.Module):
             timeline_position_ids=timeline_position_ids,
             rope_position_ids=rope_position_ids,
             previous_root_frame=previous_root_frame,
+            previous_root_valid_mask=previous_root_valid_mask,
             condition=condition,
         )
 
@@ -675,6 +791,9 @@ class LDF(nn.Module):
         *,
         num_denoise_steps: int | None = None,
         cfg_mode: str | None = None,
+        cfg_scale_text: float | None = None,
+        cfg_scale_constraint: float | None = None,
+        cfg_scale_joint: float | None = None,
     ) -> HybridMotion:
         """Denoise a finite hybrid sequence with the triangular flow schedule."""
         initial_noise.validate()
@@ -704,19 +823,30 @@ class LDF(nn.Module):
             inputs = self._create_step_input(
                 motion,
                 beta=beta,
+                next_beta=next_beta,
                 timeline_position_ids=timeline_positions,
                 commit_index=int((beta <= 1e-7).sum(dim=1).min().item()),
                 condition=condition,
                 previous_root_frame=None,
+                previous_root_valid_mask=None,
             )
-            prediction = self.predict_with_cfg(inputs, mode=cfg_mode)
+            prediction = self.predict_with_cfg(
+                inputs,
+                mode=cfg_mode,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_constraint=cfg_scale_constraint,
+                cfg_scale_joint=cfg_scale_joint,
+            )
             motion = HybridMotion(
                 motion.root_motion
                 + prediction.velocity.root_motion * delta[..., None, None],
                 motion.latent_motion
                 + prediction.velocity.latent_motion * delta[..., None],
             )
-        return motion
+        return HybridMotion(
+            self._project_normalized_root(motion.root_motion),
+            motion.latent_motion,
+        )
 
     def init_stream_state(
         self,
@@ -819,6 +949,62 @@ class LDF(nn.Module):
             rng_state=generator.get_state().clone(),
         )
 
+    def rebase_stream_state(
+        self,
+        state: LDFStreamState,
+        translation_xz: torch.Tensor,
+    ) -> LDFStreamState:
+        """Translate one noisy root window while preserving its flow state.
+
+        ``translation_xz`` is a physical model-space offset which becomes part
+        of the runtime world origin. Clean tokens move by the full normalized
+        offset, partially noisy tokens by ``1-beta``, and pure noise is left
+        unchanged. Body latent and RNG state are invariant to XZ translation.
+        """
+
+        state.validate()
+        translation = torch.as_tensor(
+            translation_xz,
+            device=state.noisy_motion.root_motion.device,
+            dtype=state.noisy_motion.root_motion.dtype,
+        )
+        if translation.ndim == 1:
+            translation = translation[None]
+        batch = state.noisy_motion.batch_size
+        if tuple(translation.shape) != (batch, 2):
+            raise ValueError("translation_xz must have shape [2] or [B,2]")
+        if not bool(torch.isfinite(translation).all()):
+            raise ValueError("translation_xz must contain only finite values")
+
+        root = state.noisy_motion.root_motion.clone()
+        positions = torch.arange(
+            state.window_origin,
+            state.window_origin + state.noisy_motion.token_length,
+            device=root.device,
+            dtype=torch.long,
+        )[None].expand(batch, -1)
+        beta = self.triangular_beta(
+            timeline_position_ids=positions,
+            diffusion_time=state.current_step / float(state.num_denoise_steps),
+        ).to(dtype=root.dtype)
+        normalized_translation = translation / self.root_std[[0, 2]].to(root)
+        root[..., [0, 2]] -= (
+            (1.0 - beta)[..., None, None]
+            * normalized_translation[:, None, None, :]
+        )
+
+        previous = state.previous_root_frame
+        if previous is not None:
+            previous = previous.clone()
+            previous[..., [0, 2]] -= translation.to(previous)
+        rebased = replace(
+            state,
+            noisy_motion=HybridMotion(root, state.noisy_motion.latent_motion.clone()),
+            previous_root_frame=previous,
+        )
+        rebased.validate()
+        return rebased
+
     @torch.no_grad()
     def stream_generate_step(
         self,
@@ -826,6 +1012,9 @@ class LDF(nn.Module):
         condition: LDFCondition,
         *,
         cfg_mode: str | None = None,
+        cfg_scale_text: float | None = None,
+        cfg_scale_constraint: float | None = None,
+        cfg_scale_joint: float | None = None,
     ) -> tuple[LDFStreamState, HybridMotion]:
         """Advance until one token is clean, commit it, then roll if needed."""
         state.validate()
@@ -862,12 +1051,26 @@ class LDF(nn.Module):
             inputs = self._create_step_input(
                 motion,
                 beta=beta,
+                next_beta=next_beta,
                 timeline_position_ids=timeline_positions,
                 commit_index=state.commit_index,
                 condition=condition,
                 previous_root_frame=state.previous_root_frame,
+                previous_root_valid_mask=(
+                    None
+                    if state.previous_root_frame is None
+                    else torch.ones(
+                        batch, device=motion.root_motion.device, dtype=torch.bool
+                    )
+                ),
             )
-            prediction = self.predict_with_cfg(inputs, mode=cfg_mode)
+            prediction = self.predict_with_cfg(
+                inputs,
+                mode=cfg_mode,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_constraint=cfg_scale_constraint,
+                cfg_scale_joint=cfg_scale_joint,
+            )
             motion = HybridMotion(
                 motion.root_motion
                 + prediction.velocity.root_motion * delta[..., None, None],
@@ -880,6 +1083,11 @@ class LDF(nn.Module):
         local_end = local_start + 1
         if local_end > length:
             raise RuntimeError("stream buffer exhausted before rolling")
+        projected_root = motion.root_motion.clone()
+        projected_root[:, local_start:local_end] = self._project_normalized_root(
+            projected_root[:, local_start:local_end]
+        )
+        motion = HybridMotion(projected_root, motion.latent_motion)
         committed = HybridMotion(
             motion.root_motion[:, local_start:local_end].clone(),
             motion.latent_motion[:, local_start:local_end].clone(),
@@ -900,6 +1108,9 @@ class LDF(nn.Module):
         *,
         num_chunks: int,
         cfg_mode: str | None = None,
+        cfg_scale_text: float | None = None,
+        cfg_scale_constraint: float | None = None,
+        cfg_scale_joint: float | None = None,
     ) -> Iterator[HybridMotion]:
         current = state
         for _ in range(int(num_chunks)):
@@ -909,7 +1120,12 @@ class LDF(nn.Module):
                 else condition_provider
             )
             current, committed = self.stream_generate_step(
-                current, condition, cfg_mode=cfg_mode
+                current,
+                condition,
+                cfg_mode=cfg_mode,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_constraint=cfg_scale_constraint,
+                cfg_scale_joint=cfg_scale_joint,
             )
             yield committed
 

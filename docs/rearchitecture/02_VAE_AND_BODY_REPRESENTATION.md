@@ -1,6 +1,6 @@
 # 02 Body VAE 与显式动作表示
 
-状态：`EMA_CHECKPOINT_AND_LATENT_STATISTICS_READY / LDF_TRAINING_BRIDGE_PENDING`
+状态：`TOKENIZER_AND_RUNTIME_READY / LDF_TRAINING_PENDING`
 
 ## 目标
 
@@ -40,9 +40,10 @@ positions只从x/z减去planar root，y保留世界高度。rotations和velociti
 公共方法按latent空间固定语义，不使用布尔参数切换输入解释：
 
 ```text
-encode / encode_window       physical body -> raw posterior
+encode                       physical body -> raw posterior（VAE训练）
 decode / decode_step         raw latent -> physical body
-tokenize / tokenize_window   physical body -> normalized deterministic mu
+tokenize                     full physical body -> normalized deterministic mu
+tokenize_window              context + active body -> normalized active mu（LDF训练）
 detokenize / detokenize_step normalized latent -> physical body
 forward                      只接受VAEInput
 ```
@@ -94,7 +95,9 @@ load deterministic root5/body265
 
 LDF训练不得采样posterior，也不得通过VAE encoder反传。一个training batch只执行一次encoder；scheduled training或self-forcing的多次LDF update复用同一份detached target。当前data contract使用普通worker RNG执行train crop/可选yaw，validation固定取前缀且关闭随机增强；更强的epoch/DDP可复现策略待真实trainer恢复时确定，不在Dataset中加入hash协议。
 
-由于encoder是token-causal，同一个active token不能因LDF crop起点不同而得到不同target。在线encode输入必须包含该token之前完整的encoder有效感受野；当前每个residual block含两个kernel为`k`的causal convolution，因此所需历史为`encoder_layers * 2 * (k - 1)`个token。encoder对`[warm-up context | active crop]`一次前向后只保留active `mu`。真实序列起点历史不足时才使用零边界。context、active crop与previous-root boundary必须共享同一个yaw。
+`utils/training/ldf/lightning_module.py`是唯一VAE→LDF训练边界：从正式checkpoint加载并冻结EMA VAE，以`tokenize_window()`在线产生normalized deterministic μ；同时通过LDF自己的`normalize_root()`归一化physical active root并reshape为`[B,T,4,5]`，最终构造共享token mask的`HybridMotion`。LDF latent维度、local-root statistics和collator需要的encoder context长度都直接来自VAE实例，不在配置中维护第二份数值。bridge必须逐样本验证active root token数等于去除context后的body token数，不能只比较批内最大tensor shape。root/latent在normalization后都重新清零padding。
+
+由于encoder是token-causal，同一个active token不能因LDF crop起点不同而得到不同target。每个样本在线encode时携带`min(window_start_token, encoder_context_tokens)`个真实历史token；当前每个residual block含两个kernel为`k`的causal convolution，因此最大历史为`encoder_layers * 2 * (k - 1)`个token。批内输入固定为`[真实context | active crop | 右padding]`，`context_token_count [B]`给出逐样本active offset；`tokenize_window()`一次batch前向后逐样本gather active deterministic μ并将active padding置零。窗口接口不返回padding posterior，从而不存在对伪造logvar采样的歧义。真实序列起点历史不足由causal convolution自身的左边界处理，collator不得插入假零token。context、active crop与previous-root boundary必须共享同一个yaw。
 
 latent statistics仍是必需的独立小型文件，但不保存逐样本latent。VAE冻结后使用同一EMA encoder、相同context协议和确定性均匀yaw扫描train split，得到`mean/std [128]`。正式LDF训练始终在线编码，不提供逐样本latent cache工具。
 
@@ -112,4 +115,4 @@ HumanML预训练movement/motion evaluator固定消费标准263D特征，因此FI
 
 ## 当前阻塞
 
-HumanML3D-only VAE已完成300k steps。`step_299999.ckpt`中的EMA encoder+decoder可由公共checkpoint loader直接加载；历史`latent_stats.npz`仍可作为现有实验资产使用，新统计工具则用显式seed普通随机生成器扫描Dataset full sample。完整EMA validation的deterministic-mu total为`0.0051869`，sample total为`0.0051965`；posterior sigma mean为`0.00341`。LDF context-aware crop/collate已经实现，真实LDF训练仍继续fail-fast，直到frozen online encoder调用和HybridMotion batch接入训练模块；Web仍等待commit-time decode接线。现有300k权重是在position-derived skating启用前训练的，重新加载不会让该checkpoint获得新的loss收益。
+HumanML3D-only VAE已完成300k steps。`step_299999.ckpt`中的EMA encoder+decoder可由公共checkpoint loader直接加载；历史`latent_stats.npz`仍可作为现有实验资产使用，新统计工具则用显式seed普通随机生成器扫描Dataset full sample。完整EMA validation的deterministic-mu total为`0.0051869`，sample total为`0.0051965`；posterior sigma mean为`0.00341`。LDF real-context collator、逐样本window tokenization、正式128D EMA在线编码和normalized HybridMotion bridge均已实现；正式H/G/F/C训练窗口、self-forcing、noise/beta、condition与root/latent v-predict loss仍未接入，因此真实LDF训练继续fail-fast。当前`root_stats.npz`只匹配临时简单crop/rebase策略，正式窗口冻结后必须通过共享sampler重新计算。Web已通过`InferenceSession`在每个LDF commit后原子执行`detokenize_step()`，并将结果作为严格四帧chunk传输；模型加载仍等待正式LDF checkpoint合同。现有300k权重是在position-derived skating启用前训练的，重新加载不会让该checkpoint获得新的loss收益。

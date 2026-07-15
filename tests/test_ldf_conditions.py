@@ -107,6 +107,7 @@ def test_timeline_and_rope_positions_remain_distinct_after_window_roll():
         timeline_position_ids=torch.tensor([[3, 4, 5, 6]]),
         rope_position_ids=torch.tensor([[-1, 0, 1, 2]]),
         previous_root_frame=None,
+        previous_root_valid_mask=None,
         condition=condition,
     )
     inputs.validate()
@@ -136,7 +137,27 @@ def test_future_timeline_positions_cannot_overlap_current_window():
         timeline_position_ids=torch.arange(4)[None],
         rope_position_ids=torch.arange(4)[None],
         previous_root_frame=None,
+        previous_root_valid_mask=None,
         condition=condition,
     )
     with pytest.raises(ValueError, match="after the current motion window"):
+        inputs.validate()
+
+
+def test_previous_root_frame_and_validity_mask_are_paired():
+    text, null = _text()
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(
+            torch.zeros(1, 1, 4, 5), torch.zeros(1, 1, 8)
+        ),
+        beta=torch.ones(1, 1),
+        history_mask=torch.zeros(1, 1, dtype=torch.bool),
+        generation_mask=torch.ones(1, 1, dtype=torch.bool),
+        timeline_position_ids=torch.zeros(1, 1, dtype=torch.long),
+        rope_position_ids=torch.zeros(1, 1, dtype=torch.long),
+        previous_root_frame=torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0]]),
+        previous_root_valid_mask=None,
+        condition=LDFCondition(text, null),
+    )
+    with pytest.raises(ValueError, match="must both be set"):
         inputs.validate()
