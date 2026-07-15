@@ -1868,3 +1868,41 @@
 
 - `train_vae.py`的`train: false`分支仍沿用`test_ckpt`命名并允许空checkpoint；若继续保留该入口，应改成明确的validation checkpoint接口并在为空时失败，或完全交给`eval/vae/`。
 - `configs/paths_default.yaml`中的WandB凭据管理不属于本次两个改动项，仍应另行迁移为环境变量并轮换现有key。
+
+## 2026-07-15 · BABEL文本自包含与Dataset固定source identity
+
+类型：Dataset公共metadata修正 / BABEL共享数据迁移 / 配置与测试
+
+实际改动内容：
+
+- `HumanML3DDataset`和`BABELDataset`不再以split文件父目录名构造`sample["dataset"]`，分别固定返回`HumanML3D`和`BABEL`；duplicate identity同步使用固定source名称，同一source通过多个split路径重复提供相同sample ID时继续fail-fast。
+- `configs/vae_multi.yaml`中的BABEL `text_path`改为相对目录`texts`，不再引用`BABEL_streamed/texts`；保留HumanML在纯VAE配置中的`text_path: null`，需要caption的LDF数据入口可对两个source显式使用`texts`。
+- 使用现有resumable `tools.preprocess_babel`重新发布共享`BABEL_motion`：现有14087个root5/body265 artifact全部通过检查并跳过重算，将正式train/val涉及的14087个caption原子复制到`BABEL_motion/texts/`，重新写出相同过滤规则下的train/val split；未删除或修改原始`BABEL_streamed/texts`。
+- 测试增加任意目录名下HumanML/BABEL仍返回固定source identity的回归，更新Multi/VAE batch与reconstruction sample的metadata期望，并验证BABEL预处理产物包含自有text。
+- 数据架构文档明确两个处理后dataset root均可自包含split、artifacts和texts，且公开source identity不随目录移动或重命名变化。已有`eval/vae/output`历史JSON未重写，其中旧目录派生标签作为历史运行结果保留。
+
+改动理由：
+
+- 数据目录名是部署路径，不是数据源语义；将它写入batch会使同一数据在复制、挂载或重命名后获得不同metadata，影响Multi source分组和评估记录的稳定性。
+- `BABEL_motion`已经拥有正式motion与split，却跨目录读取caption，不便整体移动或发布；复制对应文本后，其结构与`HumanML3D_motion`同构，LDF可以仅通过一个dataset root获得motion和文本。
+
+数据迁移与验证：
+
+- BABEL迁移结果：`converted=0`、`skipped=14087`、`copied_texts=14087`；train `10442`、val `3645`，不足20帧过滤train `178`、val `81`，missing与nonfinite均为0。
+- 逐项检查train/val：重复ID 0、缺失artifact 0、缺失text 0；两split合计14087个唯一ID，磁盘上artifact与text均为14087个。
+- 真实val smoke：HumanML首样本返回`HumanML3D`、root/body `[192,5]/[192,265]`和3条caption；BABEL首样本返回`BABEL`、`[52,5]/[52,265]`和2条caption。两者均通过VAE 40-frame collator和LDF `96 context + 40 active` collator，batch identity保持固定。
+- Dataset/VAE/LDF定向测试：`35 passed`；最终全仓`pytest -q`：`113 passed, 1 warning`，warning仅为测试环境无法初始化NVML。
+- 相关Python文件`py_compile`通过，活动代码/配置/测试中不存在目录名推导source identity或`BABEL_streamed/texts`引用，`git diff --check`通过。
+
+涉及文件与数据：
+
+- `datasets/{humanml3d,babel}.py`
+- `configs/vae_multi.yaml`
+- `tests/{test_vae_data_pipeline,test_multi_dataset,test_vae_eval,test_vae_training}.py`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/BABEL_motion/{texts,train.txt,val.txt}`
+
+尚未完成的后续事项：
+
+- `train_ldf.py`仍保持migration guard；未来LDF配置应为HumanML和BABEL都显式设置`text_path: texts`并接入现有`LDFWindowCollator`，本轮没有提前恢复trainer。
+- 旧评估artifact中的`HumanML3D_motion/BABEL_motion`标签不会迁移；比较新旧评估时应将其视为历史metadata名称差异，而不是数据或模型变化。

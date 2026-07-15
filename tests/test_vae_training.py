@@ -81,7 +81,7 @@ def test_multi_vae_config_keeps_source_datasets_explicit():
         "datasets.humanml3d.HumanML3DDataset",
         "datasets.babel.BABELDataset",
     ]
-    assert [entry.text_path for entry in cfg.data.datasets] == [None, None]
+    assert [entry.text_path for entry in cfg.data.datasets] == [None, "texts"]
     assert cfg.model.params.motion_stats_path == (
         f"{cfg.dirs.raw_data}/HumanML3D_BABEL_motion_stats.npz"
     )
