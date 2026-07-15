@@ -8,7 +8,8 @@ window:
   commit_tokens: 1
 
 model:
-  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_022912_vae_body265/last.ckpt
+  model_id: vae_body265_20260715_164325
+  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/last.ckpt
   motion_stats_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/motion_stats.npz
   params:
     latent_dim: 128

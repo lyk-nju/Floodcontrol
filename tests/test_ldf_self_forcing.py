@@ -4,10 +4,8 @@ import torch
 import torch.nn as nn
 
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
-from utils.training.ldf.batch import (
-    build_ldf_training_step,
-    compute_velocity_loss,
-)
+from utils.training.ldf.batch import build_ldf_training_step
+from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.flow import (
     build_span_beta,
     recover_clean_for_full_gradient_auxiliary,

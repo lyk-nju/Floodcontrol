@@ -1,4 +1,5 @@
 import torch
+from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
@@ -6,6 +7,8 @@ from utils.training.ldf.data import (
     LDFSpanCollator,
     LengthBucketBatchSampler,
     MinimumFrameDataset,
+    ResumableDataLoader,
+    _mix_seed,
     create_dataloaders,
 )
 
@@ -29,7 +32,7 @@ def make_sample(frames=40, name="sample"):
 
 class VariableLengthDataset(Dataset):
     def __init__(self):
-        self.samples = [make_sample(20, "short"), make_sample(40, "valid")]
+        self.samples = [make_sample(20, "short"), make_sample(56, "valid")]
 
     def __len__(self):
         return len(self.samples)
@@ -221,6 +224,28 @@ def test_length_bucket_sampler_does_not_mix_short_and_long_clips():
     )
 
 
+def test_length_bucket_sampler_epoch_is_owned_by_set_epoch():
+    dataset = MinimumFrameDataset(VariableLengthDataset(), min_frames=40)
+    sampler = LengthBucketBatchSampler(
+        dataset,
+        batch_size=1,
+        bucket_width_frames=20,
+        max_frames=200,
+        seed=3,
+    )
+    sampler.set_epoch(7)
+    first = list(sampler)
+    second = list(sampler)
+    assert first == second
+    assert sampler.epoch == 7
+
+
+def test_ordered_seed_mixer_avoids_previous_weighted_sum_collision():
+    # Both pairs produced 50 under sum((index + 1) * seed).
+    assert _mix_seed([10, 20]) != _mix_seed([12, 19])
+    assert _mix_seed([10, 20]) != _mix_seed([20, 10])
+
+
 def test_seeded_training_batch_reproduces_crop_caption_and_yaw():
     sample = make_sample(56)
     sample["dataset"] = "HumanML3D"
@@ -270,6 +295,50 @@ def test_length_bucket_sampler_indices_flow_through_dataloader():
     assert batch["root_motion"].shape == (1, 40, 5)
 
 
+def test_resumable_dataloader_restores_the_exact_next_batch():
+    class FourSampleDataset(Dataset):
+        def __init__(self):
+            self.samples = [make_sample(40, f"sample-{index}") for index in range(4)]
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, index):
+            return self.samples[index]
+
+    def create_loader():
+        dataset = MinimumFrameDataset(FourSampleDataset(), min_frames=40)
+        sampler = LengthBucketBatchSampler(
+            dataset,
+            batch_size=1,
+            bucket_width_frames=20,
+            max_frames=40,
+            seed=5,
+        )
+        sampler.set_epoch(3)
+        return ResumableDataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=lambda samples: samples[0]["name"],
+            num_workers=0,
+        )
+
+    original = create_loader()
+    iterator = iter(original)
+    consumed = [next(iterator), next(iterator)]
+    state = original.state_dict()
+    assert CombinedLoader(original, "max_size_cycle")._state_dicts() == [state]
+    expected_remaining = list(iterator)
+
+    resumed = create_loader()
+    resumed.load_state_dict(state)
+    assert list(resumed) == expected_remaining
+    assert len(consumed) + len(expected_remaining) == 4
+
+    resumed.batch_sampler.set_epoch(4)
+    assert len(list(resumed)) == 4
+
+
 def test_validation_probes_are_deterministic_for_cold_and_continuation():
     sample = make_sample(56)
     sample["dataset"] = "HumanML3D"
@@ -300,6 +369,25 @@ def test_validation_probes_are_deterministic_for_cold_and_continuation():
     assert first["context_token_count"].tolist() == [2]
     assert torch.equal(first["root_motion"], second["root_motion"])
     assert first["prompt_timeline"][0] == ["first"] * 10
+
+
+def test_continuation_validation_covers_early_middle_and_late_source_positions():
+    samples = [make_sample(80, f"sample-{index}") for index in range(3)]
+    for index, sample in enumerate(samples):
+        sample["_ldf_sample_index"] = index
+    batch = LDFSpanCollator(
+        min_frames=40,
+        max_frames=80,
+        encoder_context_tokens=2,
+        training=False,
+        cold_start=False,
+        validation_span_frames=40,
+        validation_positions=("early", "middle", "late"),
+    )(samples)
+
+    assert batch["validation_position"] == ["early", "middle", "late"]
+    assert batch["source_start_token"].tolist() == [1, 5, 10]
+    assert batch["context_token_count"].tolist() == [1, 2, 2]
 
 
 def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):

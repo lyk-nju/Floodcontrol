@@ -32,6 +32,31 @@ if REPO_ROOT not in sys.path:
 
 from models.tools.t5 import T5EncoderModel
 from utils.initialize import load_config
+from utils.training.ldf.text import create_text_embedding_content_id
+
+
+def _create_payload(
+    embeddings: Dict[str, torch.Tensor],
+    *,
+    text_len: int,
+    checkpoint_path: str | None,
+    tokenizer_path: str | None,
+) -> dict[str, object]:
+    payload = {
+        "embeddings": embeddings,
+        "text_dim": 4096,
+        "text_len": int(text_len),
+        "checkpoint_path": str(checkpoint_path),
+        "tokenizer_path": str(tokenizer_path),
+    }
+    payload["content_id"] = create_text_embedding_content_id(
+        embeddings,
+        text_dim=4096,
+        text_len=int(text_len),
+        checkpoint_path=str(checkpoint_path),
+        tokenizer_path=str(tokenizer_path),
+    )
+    return payload
 
 def _resolve_config_path(path: str) -> str:
     """支持从项目根或当前工作目录解析配置路径。"""
@@ -197,9 +222,28 @@ def main():
     cfg = load_config(config_path, override_args)
     oc = cfg.config
 
-    checkpoint_path = OmegaConf.select(oc, "model.params.checkpoint_path")
-    tokenizer_path = OmegaConf.select(oc, "model.params.tokenizer_path")
-    text_len = OmegaConf.select(oc, "model.params.text_len", default=512)
+    checkpoint_path = OmegaConf.select(oc, "text_encoder.checkpoint_path")
+    tokenizer_path = OmegaConf.select(oc, "text_encoder.tokenizer_path")
+    text_len = OmegaConf.select(oc, "text_encoder.text_len")
+    if checkpoint_path is None:
+        checkpoint_path = OmegaConf.select(oc, "model.params.checkpoint_path")
+    if tokenizer_path is None:
+        tokenizer_path = OmegaConf.select(oc, "model.params.tokenizer_path")
+    if text_len is None:
+        text_len = OmegaConf.select(oc, "model.params.text_len", default=512)
+    if checkpoint_path is None or not os.path.isfile(str(checkpoint_path)):
+        raise FileNotFoundError(
+            f"T5 checkpoint not found at {checkpoint_path!r}; set "
+            "text_encoder.checkpoint_path"
+        )
+    if tokenizer_path is None or not os.path.isdir(str(tokenizer_path)):
+        raise FileNotFoundError(
+            f"T5 tokenizer not found at {tokenizer_path!r}; set "
+            "text_encoder.tokenizer_path"
+        )
+    model_text_len = int(OmegaConf.select(oc, "model.params.text_len", default=text_len))
+    if int(text_len) != model_text_len:
+        raise ValueError("text_encoder.text_len and model.params.text_len must match")
     _log0(
         f"从配置读取 T5: checkpoint_path={checkpoint_path!r}, "
         f"tokenizer_path={tokenizer_path!r}, text_len={text_len}",
@@ -329,29 +373,33 @@ def main():
             for part in gather_list:
                 assert part is not None
                 merged.update(part)
-            payload = {
-                "embeddings": merged,
-                "text_dim": 4096,
-                "text_len": text_len,
-                "checkpoint_path": str(checkpoint_path),
-                "tokenizer_path": str(tokenizer_path),
-            }
+            payload = _create_payload(
+                merged,
+                text_len=text_len,
+                checkpoint_path=checkpoint_path,
+                tokenizer_path=tokenizer_path,
+            )
             torch.save(payload, out_path)
-            rank_zero_info(f"Saved {len(merged)} entries to {out_path}")
+            rank_zero_info(
+                f"Saved {len(merged)} entries to {out_path} "
+                f"(content_id={payload['content_id']})"
+            )
         dist.barrier()
         dist.destroy_process_group()
     else:
         merged = dict(existing_embeddings)
         merged.update(emb_dict)
-        payload = {
-            "embeddings": merged,
-            "text_dim": 4096,
-            "text_len": text_len,
-            "checkpoint_path": str(checkpoint_path),
-            "tokenizer_path": str(tokenizer_path),
-        }
+        payload = _create_payload(
+            merged,
+            text_len=text_len,
+            checkpoint_path=checkpoint_path,
+            tokenizer_path=tokenizer_path,
+        )
         torch.save(payload, out_path)
-        rank_zero_info(f"Saved {len(merged)} entries to {out_path}")
+        rank_zero_info(
+            f"Saved {len(merged)} entries to {out_path} "
+            f"(content_id={payload['content_id']})"
+        )
 
 
 if __name__ == "__main__":

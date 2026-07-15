@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_formal_ldf_config_uses_the_vae_as_contract_source():
     cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
-    assert cfg.status == "root_statistics_required"
+    assert cfg.status == "training_ready"
     assert cfg.model.target == "models.diffusion_forcing_wan.LDF"
     assert cfg.vae.target == "models.vae_wan_1d.BodyVAE"
     assert cfg.vae.params.latent_dim == 128
@@ -26,6 +26,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.data.cold_start_probability == 0.1
     assert cfg.data.length_bucket_frames == 20
     assert cfg.text_embeddings_path.endswith("HumanML3D_motion/t5_text_embeddings.pt")
+    assert cfg.validation.continuation_span_frames == 40
     assert cfg.validation.continuation_history_tokens == 5
     assert cfg.validation.self_forcing_steps == 5
     assert cfg.self_forcing.phase_start_step == 300000
@@ -44,6 +45,8 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
 
 def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     cfg = load_config(str(ROOT / "configs" / "ldf_multi.yaml"))
+    human_cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    assert cfg.status == "training_ready"
     assert cfg.data.target == "datasets.multi.MultiDataset"
     assert [item.target for item in cfg.data.datasets] == [
         "datasets.humanml3d.HumanML3DDataset",
@@ -55,6 +58,8 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     assert cfg.text_embeddings_path.endswith(
         "HumanML3D_BABEL_t5_text_embeddings.pt"
     )
+    assert cfg.root_stats_path == human_cfg.root_stats_path
+    assert cfg.validation.continuation_span_frames == 40
 
 
 def test_tiny_vae_config_instantiates_public_body_vae():

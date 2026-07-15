@@ -48,11 +48,12 @@ utils/
     ├── data.py
     ├── flow.py
     ├── batch.py
+    ├── losses.py
     ├── self_forcing.py
     └── lightning_module.py
 ```
 
-training目录不增加模型参数：`data.py`只产出physical span，`flow.py`保存固定噪声代数，`batch.py`构造完整S的`LDFInput/loss_mask`，`self_forcing.py`维护immutable plan与只替换clean history的mutable state。正式stream runtime不被导入训练内核。
+training目录不增加模型参数：`data.py`只产出physical span，`flow.py`保存固定噪声代数，`batch.py`构造完整S的`LDFInput/loss_mask`，`losses.py`只负责prediction/target/mask reduction，`self_forcing.py`维护immutable plan与只替换clean history的mutable state。正式stream runtime不被导入训练内核。
 
 ### `models/diffusion_forcing_wan.py`
 

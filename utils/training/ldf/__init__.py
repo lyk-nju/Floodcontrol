@@ -5,7 +5,6 @@ from utils.training.ldf.batch import (
     LDFTrainingStep,
     anchor_physical_batch,
     build_ldf_training_step,
-    compute_velocity_loss,
 )
 from utils.training.ldf.data import (
     LDFSpanCollator,
@@ -14,6 +13,7 @@ from utils.training.ldf.data import (
     create_dataset,
 )
 from utils.training.ldf.lightning_module import LDFLightningModule
+from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.self_forcing import (
     LDFWindowPlan,
     SelfForcingResult,

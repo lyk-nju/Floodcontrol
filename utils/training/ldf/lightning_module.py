@@ -20,7 +20,8 @@ from utils.token_frame import (
 )
 from utils.training.lightning_module import BasicLightningModule
 from utils.training.vae.checkpoint import load_vae_checkpoint
-from utils.training.ldf.batch import anchor_physical_batch, compute_velocity_loss
+from utils.training.ldf.batch import anchor_physical_batch
+from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.self_forcing import (
     SelfForcingState,
     run_self_forcing_rollout,
@@ -339,6 +340,7 @@ class LDFLightningModule(BasicLightningModule):
                 name: str(Path(str(path)).expanduser().resolve())
                 for name, path in paths.items()
             },
+            "text_embedding_content_id": self.text_embeddings.content_id,
             "vae_statistics": {
                 name: getattr(self.vae, name).detach().cpu().clone()
                 for name in _VAE_STATISTIC_NAMES
@@ -370,6 +372,10 @@ class LDFLightningModule(BasicLightningModule):
         else:
             if saved_contract.get("paths") != current_contract["paths"]:
                 raise RuntimeError("LDF resume VAE/statistics/text paths do not match")
+            if saved_contract.get("text_embedding_content_id") != current_contract[
+                "text_embedding_content_id"
+            ]:
+                raise RuntimeError("LDF resume text embedding content does not match")
             saved_statistics = saved_contract.get("vae_statistics", {})
             for name, current in current_contract["vae_statistics"].items():
                 saved = saved_statistics.get(name)

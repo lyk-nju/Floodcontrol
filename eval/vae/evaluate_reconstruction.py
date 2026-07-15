@@ -566,8 +566,26 @@ def reconstruction_metrics(
     return metrics
 
 
-def _output_paths(output_root: Path, dataset_name: str, sample_id: str) -> dict[str, Path]:
-    root = output_root / dataset_name
+def _validate_model_id(model_id: str) -> str:
+    """Validate the explicit directory identity used for one VAE checkpoint."""
+
+    model_id = str(model_id).strip()
+    if not model_id or model_id in {".", ".."}:
+        raise ValueError("model.model_id must be a non-empty directory name")
+    if Path(model_id).name != model_id:
+        raise ValueError(
+            "model.model_id must be one directory name without path separators"
+        )
+    return model_id
+
+
+def _output_paths(
+    output_root: Path,
+    dataset_name: str,
+    model_id: str,
+    sample_id: str,
+) -> dict[str, Path]:
+    root = output_root / dataset_name / _validate_model_id(model_id)
     return {
         "original_video": root / "video" / "original" / f"{sample_id}.mp4",
         "reconstruction_video": root / "video" / "reconstruction" / f"{sample_id}.mp4",
@@ -584,10 +602,11 @@ def _save_sample_outputs(
     *,
     output_root: Path,
     dataset_name: str,
+    model_id: str,
     render_video: bool,
     render_fps: int,
 ) -> dict[str, str]:
-    paths = _output_paths(output_root, dataset_name, sample.sample_id)
+    paths = _output_paths(output_root, dataset_name, model_id, sample.sample_id)
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -683,6 +702,7 @@ def evaluate_dataset(
     dataset=None,
     sample_count: int,
     output_root: Path,
+    model_id: str,
     device: torch.device,
     parity_atol: float,
     render_video: bool,
@@ -735,6 +755,7 @@ def evaluate_dataset(
             metrics,
             output_root=output_root,
             dataset_name=dataset_name,
+            model_id=model_id,
             render_video=render_video,
             render_fps=render_fps,
         )
@@ -753,9 +774,10 @@ def evaluate_dataset(
             f"position={metrics['position_mae_m']:.6f}m, "
             f"rotation={metrics['rotation_geodesic_deg']:.4f}deg"
         )
-    dataset_output = output_root / dataset_name
+    dataset_output = output_root / dataset_name / _validate_model_id(model_id)
     summary = {
         "dataset": dataset_name,
+        "model_id": model_id,
         "protocol": all_metrics[0]["protocol"],
         "sample_count": sample_count,
         "mean_metrics": _mean_metrics(all_metrics),
@@ -791,7 +813,9 @@ def run(cfg, *, mode: str) -> dict[str, object]:
     if sample_count <= 0:
         raise ValueError("sample_count must be positive")
     output_root = Path(str(cfg.output_dir))
+    model_id = _validate_model_id(str(cfg.model.model_id))
     model, checkpoint_metadata = _load_model(cfg, device)
+    checkpoint_metadata["model_id"] = model_id
     dataset_summaries = {}
     for dataset_name, dataset_config in cfg.datasets.items():
         dataset_summaries[dataset_name] = evaluate_dataset(
@@ -800,6 +824,7 @@ def run(cfg, *, mode: str) -> dict[str, object]:
             dataset_config=dataset_config,
             sample_count=sample_count,
             output_root=output_root,
+            model_id=model_id,
             device=device,
             parity_atol=float(cfg.stream_parity_atol),
             render_video=bool(cfg.render.enabled),
@@ -809,6 +834,7 @@ def run(cfg, *, mode: str) -> dict[str, object]:
         )
     protocol = STREAM_PROTOCOL if mode == "stream" else ROLLING_PROTOCOL
     summary = {
+        "model_id": model_id,
         "protocol": protocol,
         "mode": mode,
         "root_policy": "source explicit root shared by original and reconstruction",
@@ -818,7 +844,7 @@ def run(cfg, *, mode: str) -> dict[str, object]:
     }
     if mode == "rolling":
         summary["window"] = OmegaConf.to_container(cfg.window, resolve=True)
-    _write_json(output_root / "summary.json", summary)
+    _write_json(output_root / "summaries" / f"{model_id}.json", summary)
     return summary
 
 

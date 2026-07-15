@@ -191,8 +191,9 @@ def test_reconstruction_skating_metrics_use_position_transitions_and_masks():
 
 
 def test_output_layout_separates_original_and_reconstruction(tmp_path):
-    paths = _output_paths(tmp_path, "humanml3d", "sample")
-    assert paths["original_video"] == tmp_path / "humanml3d/video/original/sample.mp4"
-    assert paths["reconstruction_video"] == tmp_path / "humanml3d/video/reconstruction/sample.mp4"
-    assert paths["original_motion"] == tmp_path / "humanml3d/motion/original/sample.npz"
-    assert paths["reconstruction_motion"] == tmp_path / "humanml3d/motion/reconstruction/sample.npz"
+    paths = _output_paths(tmp_path, "humanml3d", "vae_body265_run", "sample")
+    model_root = tmp_path / "humanml3d/vae_body265_run"
+    assert paths["original_video"] == model_root / "video/original/sample.mp4"
+    assert paths["reconstruction_video"] == model_root / "video/reconstruction/sample.mp4"
+    assert paths["original_motion"] == model_root / "motion/original/sample.npz"
+    assert paths["reconstruction_motion"] == model_root / "motion/reconstruction/sample.npz"

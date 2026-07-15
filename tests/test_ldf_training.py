@@ -9,7 +9,8 @@ from datasets.humanml3d import HumanML3DDataset
 from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import write_statistics
 from utils.conditions.ldf import LDFCondition
-from utils.training.ldf.batch import anchor_physical_batch, compute_velocity_loss
+from utils.training.ldf.batch import anchor_physical_batch
+from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.data import LDFSpanCollator
 from utils.training.ldf.lightning_module import LDFLightningModule
 from utils.training.ldf.self_forcing import (
@@ -17,6 +18,7 @@ from utils.training.ldf.self_forcing import (
     run_self_forcing_rollout,
     sample_window_plan,
 )
+from utils.training.ldf.text import create_text_embedding_content_id
 
 
 def _write_vae_checkpoint(path, model: BodyVAE) -> None:
@@ -54,16 +56,20 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
         root_std=np.array([2.0, 2.0, 2.0, 0.5, 0.5], dtype=np.float32),
     )
     text_embeddings = tmp_path / "text_embeddings.pt"
+    embedding_values = {
+        "": torch.zeros(2, 8),
+        "walk": torch.ones(2, 8),
+        "turn": torch.full((2, 8), 2.0),
+        "sit": torch.full((2, 8), 3.0),
+    }
     torch.save(
         {
-            "embeddings": {
-                "": torch.zeros(2, 8),
-                "walk": torch.ones(2, 8),
-                "turn": torch.full((2, 8), 2.0),
-                "sit": torch.full((2, 8), 3.0),
-            },
+            "embeddings": embedding_values,
             "text_dim": 8,
             "text_len": 8,
+            "content_id": create_text_embedding_content_id(
+                embedding_values, text_dim=8, text_len=8
+            ),
         },
         text_embeddings,
     )
@@ -314,6 +320,25 @@ def test_ldf_resume_rejects_changed_vae_statistics_contract(tmp_path):
 
     resumed = LDFLightningModule(_make_config(tmp_path))
     with pytest.raises(RuntimeError, match="VAE statistics mismatch for latent_mean"):
+        resumed.on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_rejects_changed_text_embedding_at_the_same_path(tmp_path):
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+
+    path = tmp_path / "text_embeddings.pt"
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["embeddings"]["walk"] = torch.full((2, 8), 9.0)
+    payload["content_id"] = create_text_embedding_content_id(
+        payload["embeddings"], text_dim=8, text_len=8
+    )
+    torch.save(payload, path)
+
+    resumed = LDFLightningModule(cfg)
+    with pytest.raises(RuntimeError, match="text embedding content"):
         resumed.on_load_checkpoint(checkpoint)
 
 

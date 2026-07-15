@@ -2328,3 +2328,154 @@
 - `root_stats.npz`和两个T5 embedding table尚未在正式数据目录生成；配置继续保持`root_statistics_required`，因此本轮没有启动真实LDF长训。
 - span内root observation、span外future-root constraint训练采样/dropout及constraint-CFG校准仍需单独设计。
 - Web继续等待首个正式LDF checkpoint；本轮未解除`BLOCKED_ON_LDF_CHECKPOINT`。
+
+## 2026-07-16 · LDF数据恢复、continuation验证与文本表身份修复
+
+改动类型：LDF DataLoader resume / deterministic augmentation / validation coverage / text embedding artifact / checkpoint contract / 配置与测试
+
+实际改动内容：
+
+- `LengthBucketBatchSampler`不再在`__iter__()`内隐式递增epoch；Lightning通过既有`batch_sampler.sampler.set_epoch()`成为唯一epoch所有者。同一epoch重复构造iterator会得到相同bucket顺序和sample augmentation seed。
+- 新增单卡`ResumableDataLoader`，向Lightning `CombinedLoader`保存`epoch + yielded_batches`。游标以真正交给训练循环的batch为准，不读取会被multi-worker prefetch提前推进的sampler内部位置；resume时重建相同epoch顺序并跳过已消费batch，随后从精确next batch继续。
+- batch augmentation seed从可碰撞的加权和改为有序64-bit混合；batch内seed排列和内容都会改变crop、caption、yaw及后续随机流的batch seed。
+- 修复正式validation中短于`max_frames`的clip会把整段作为span、导致所谓continuation仍从token 0开始的问题。新增`validation.continuation_span_frames=40`，continuation/self-forcing使用至少多一个真实token的独立数据视图，并按稳定sample index在一个loader中轮换early/middle/late source位置。
+- 离线T5预编码表新增由encoder/tokenizer身份、caption、shape/dtype和embedding内容共同生成的`content_id`。`TextEmbeddingLookup`通过mmap加载时只检查metadata、shape和dtype，finite检查延迟到caption第一次lookup，避免启动时扫描整个表；LDF checkpoint保存并在resume前比较`content_id`，同路径内容被替换也会失败。
+- pure-noise frontier可见性保持不变：persistent state继续保存frontier，Transformer仍只读取history+active；该项与原版FloodDiffusion prefix输入一致，不作为bug修改。
+
+改动理由：
+
+- sampler epoch本身已经由当前Lightning恢复，真正缺口是epoch中途的batch cursor；将状态放在Lightning实际会保存的DataLoader边界，才能避免只实现一个无人调用的sampler `state_dict()`。
+- validation必须保证source start大于零，才能测到真实continuation；仅把collator标记为`cold_start=False`并不能在span占满整段clip时创造历史。
+- 文本表路径相同不代表内容相同，但每次训练启动重新hash数GB文件会破坏mmap的价值；离线生成一次内容身份、训练时直接比较是更明确且更便宜的边界。
+- mmap tensor的`detach()`不会复制完整embedding storage，实际启动成本来自逐tensor eager finite扫描，因此只移动检查时机，不引入offset-table重构。
+
+验证：
+
+- 新增sampler epoch所有权、旧加权和碰撞、Lightning stateful loader识别、精确next-batch恢复、新epoch重置、early/middle/late continuation、文本表缺失身份、lazy non-finite、内容变化和同路径resume拒绝测试。
+- 全仓`MPLCONFIGDIR=/tmp/matplotlib /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`177 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+- 修改Python文件`py_compile`通过，`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/{data,text,lightning_module}.py`
+- `tools/pretokenize_t5_text.py`
+- `configs/{ldf,ldf_multi}.yaml`
+- `tests/{test_ldf_data,test_ldf_text,test_ldf_training,test_migration_guards}.py`
+- `docs/rearchitecture/{02_DATA_PIPELINE,04_TRAINING_METHOD,05_TRAINING_CONFIG}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 现有旧格式T5 embedding文件没有`content_id`，正式LDF训练前必须用更新后的`tools/pretokenize_t5_text.py`重新生成；本轮没有在正式数据目录运行UMT5或修改外部数据。
+- 当前正式训练配置固定单卡；若未来重新启用DDP，需要设计并验证每个rank独立的loader cursor，不能直接把单卡恢复状态当成多卡合同。
+- frontier是否额外暴露一个`beta=1`边界token可作为单独消融，但全pure-noise frontier不会改成默认可见。
+
+## 2026-07-16 · LDF loss职责迁移
+
+改动类型：训练代码结构整理 / import迁移 / 文档与测试
+
+实际改动内容：
+
+- 新增`utils/training/ldf/losses.py`，集中保存`compute_velocity_loss()`。
+- `batch.py`只保留physical anchor、`LDFTrainingStep`、target和mask构造，不再负责prediction reduction。
+- Lightning module、包级导出与LDF训练/self-forcing测试统一从`losses.py`导入loss函数。
+- root/body normalized flow-v MSE、active-band mask、配置权重和日志键完全不变，没有新增decoded/FK/contact/skate辅助项。
+
+改动理由：
+
+- batch合同与loss reduction属于不同职责；在正式训练前拆开可以让后续loss消融只修改`losses.py`，不污染noise/window/input构造。
+- 本轮只整理所有权，不把文件重构伪装成训练目标变化。
+
+验证：
+
+- LDF training/self-forcing定向测试：`19 passed`。
+- 全仓`MPLCONFIGDIR=/tmp/matplotlib /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`177 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+- 修改Python文件`py_compile`通过，`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/{batch,losses,lightning_module,__init__}.py`
+- `tests/{test_ldf_training,test_ldf_self_forcing}.py`
+- `docs/rearchitecture/{04_TRAINING_METHOD,06_LDF_IMPLEMENTATION_DESIGN}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 当前loss仍是首轮teacher baseline的root/body flow-v MSE；是否加入任何辅助loss必须基于baseline结果单独消融，本轮未提前引入。
+
+## 2026-07-16 · VAE重建评测按模型隔离并评估164325 checkpoint
+
+改动类型：VAE eval输出协议 / 配置 / 测试 / 正式重建评测
+
+实际改动内容：
+
+- VAE stream与rolling配置切换到`20260715_164325_vae_body265/last.ckpt`的EMA权重，并显式声明稳定模型身份`vae_body265_20260715_164325`。
+- 评测输出从`output/<task>/<dataset>/...`改为`output/<task>/<dataset>/<model_id>/...`；dataset manifest、summary、逐样本指标、motion和视频均按checkpoint隔离，不再被后续模型评测覆盖。
+- task聚合summary改为`output/<task>/summaries/<model_id>.json`，并在task/dataset summary和checkpoint metadata中记录`model_id`。
+- `model_id`必须是非空单层目录名，禁止通过路径分隔符逃出预期输出层级；README和布局测试同步更新。
+- 在GPU 2实际运行stream与`history_tokens=10, commit_tokens=1` rolling：HumanML3D和BABEL各取validation前10个样本，每个task/dataset均生成10个原始视频、10个重建视频、20个motion NPZ和10个逐样本指标。评测产物继续由`.gitignore`排除。
+
+改动理由：
+
+- VAE checkpoint对比必须保留各模型独立的可视化、数值指标与manifest；仅替换配置中的checkpoint路径而复用dataset目录会静默覆盖旧实验，无法进行后续HumanML-only与multi VAE横向比较。
+- 显式`model_id`避免checkpoint被移动或命名顺序不一致时改变已发布实验目录，同时让配置承担模型身份所有权。
+
+验证：
+
+- `python -m py_compile eval/vae/evaluate_reconstruction.py`通过。
+- 定向测试`tests/test_vae_eval.py tests/test_multi_dataset.py`：`12 passed`。
+- 全仓`MPLCONFIGDIR=/tmp/matplotlib /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`177 passed, 1 warning`；warning仅为测试沙箱无法初始化NVML。
+- `git diff --check`通过。
+- 正式stream评测通过offline/token-stream parity；mean max-abs为HumanML3D `3.35e-5`、BABEL `3.03e-5`。HumanML3D平均position MAE为`0.001674 m`、rotation geodesic为`1.4454 deg`；BABEL分别为`0.003944 m`和`2.9407 deg`。
+- 正式rolling评测通过每个有限窗口的offline/cache parity；mean max-abs为HumanML3D `3.20e-5`、BABEL `3.05e-5`。相对persistent stream，HumanML3D平均position差为`1.24e-5 m`、rotation差为`0.01136 deg`；BABEL分别为`2.35e-6 m`和`0.00645 deg`。
+
+涉及文件：
+
+- `eval/vae/evaluate_reconstruction.py`
+- `eval/vae/{stream,rolling}.yaml`
+- `eval/vae/README.md`
+- `tests/test_vae_eval.py`
+- `tests/test_multi_dataset.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 当前164325 checkpoint只在HumanML3D训练；BABEL前10个样本的平均重建误差约为HumanML3D的两倍，且`11995_5`明显更困难。是否训练multi VAE应在扩大分层validation样本后决定，不能只根据这20个可视化样本作最终结论。
+- 本轮没有删除旧版未分模型的本地eval产物；它们不受Git跟踪，也不会影响新的model-scoped目录。若需要释放空间，可在确认旧结果无保留价值后单独清理。
+
+## 2026-07-16 · 生成HumanML3D与BABEL训练所需T5文本表
+
+改动类型：离线文本预编码工具修复 / 正式数据产物生成 / 配置接线验证
+
+实际改动内容：
+
+- 修复`tools/pretokenize_t5_text.py`仍从旧版`model.params`读取UMT5 checkpoint、tokenizer和文本长度的问题；当前优先读取正式配置的`text_encoder.*`，仅为旧配置保留回退读取。
+- 预编码启动前显式检查checkpoint文件、tokenizer目录，并要求`text_encoder.text_len`与LDF模型的`model.params.text_len`一致，避免缺失路径继续运行到模型加载阶段才失败。
+- 使用GPU 2生成HumanML3D文本表，共47,420条caption（包含空文本），保存到`HumanML3D_motion/t5_text_embeddings.pt`。
+- 以HumanML3D表为基础，通过`--reuse-existing`补充3,632条BABEL caption，生成供multi配置使用的HumanML3D+BABEL联合表，共51,052条，保存到`HumanML3D_BABEL_t5_text_embeddings.pt`；没有额外制造当前训练配置不消费的BABEL-only表。
+- 两个正式配置解析后的`text_embeddings_path`均已指向上述实际文件。
+
+改动理由：
+
+- 当前LDF训练只消费HumanML3D单数据表或HumanML3D+BABEL联合表，按配置边界生成两份产物可以避免重复存储HumanML embedding和无用途的第三份表。
+- 预编码脚本若继续读取旧字段会得到`None`路径；在长时间UMT5编码前完成路径和长度fail-fast，能防止生成错误或不兼容的embedding表。
+
+验证：
+
+- HumanML3D表通过正式`TextEmbeddingLookup(expected_dim=4096, expected_text_len=128)`加载：47,420条，空文本shape为`[1,4096]`、dtype为`bfloat16`，`content_id=c517945625635128a03b0bf16241df0dc73999c1`，文件大小6,927,794,453 bytes。
+- 联合表通过相同正式loader加载：51,052条，空文本shape为`[1,4096]`、dtype为`bfloat16`，`content_id=1ba8101404f15b2388dc90e3b4474f51ea8b1bcf`，文件大小7,080,869,033 bytes。
+- `configs/ldf.yaml`和`configs/ldf_multi.yaml`经项目`load_config()`解析后，目标文件均存在且大小与上述结果一致。
+- `tests/test_ldf_text.py tests/test_migration_guards.py`：`27 passed`。
+- `python -m py_compile tools/pretokenize_t5_text.py`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `tools/pretokenize_t5_text.py`
+- `docs/DEVELOPMENT_LOG.md`
+- 外部数据产物：`/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/t5_text_embeddings.pt`
+- 外部数据产物：`/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_BABEL_t5_text_embeddings.pt`
+
+尚未完成的后续事项：
+
+- 本轮只补齐文本embedding表；正式LDF启动仍需检查并生成配置要求的root statistics等剩余训练前产物。
+- 本轮未运行全仓pytest；工具修复由两次真实UMT5生成、正式loader加载和27项相关测试覆盖。

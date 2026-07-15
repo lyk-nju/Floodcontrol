@@ -21,6 +21,31 @@ from utils.motion_process import BODY_DIM, ROOT_DIM, rotate_motion_yaw, rotate_r
 from utils.token_frame import FRAMES_PER_TOKEN
 
 
+_SEED_MASK = (1 << 64) - 1
+
+
+def _mix_seed(values: list[int]) -> int:
+    """Combine ordered integer seeds without the collisions of a weighted sum."""
+
+    state = 0x6A09E667F3BCC909
+    for value in values:
+        mixed = (int(value) & _SEED_MASK) + 0x9E3779B97F4A7C15
+        mixed &= _SEED_MASK
+        mixed ^= mixed >> 30
+        mixed = (mixed * 0xBF58476D1CE4E5B9) & _SEED_MASK
+        mixed ^= mixed >> 27
+        mixed = (mixed * 0x94D049BB133111EB) & _SEED_MASK
+        mixed ^= mixed >> 31
+        state ^= (
+            mixed
+            + 0x9E3779B97F4A7C15
+            + ((state << 6) & _SEED_MASK)
+            + (state >> 2)
+        ) & _SEED_MASK
+        state &= _SEED_MASK
+    return state % (2**63 - 1)
+
+
 class MinimumFrameDataset(Dataset):
     """Task-local view that excludes clips too short for one LDF span."""
 
@@ -32,9 +57,19 @@ class MinimumFrameDataset(Dataset):
         sources = dataset.datasets if isinstance(dataset, ConcatDataset) else [dataset]
         for source in sources:
             records = getattr(source, "dataset", None)
+            known_frame_counts = getattr(source, "frame_counts", None)
             for index in range(len(source)):
                 frame_count = None
-                if isinstance(records, list) and index < len(records):
+                if (
+                    isinstance(known_frame_counts, list)
+                    and index < len(known_frame_counts)
+                ):
+                    frame_count = int(known_frame_counts[index])
+                if (
+                    frame_count is None
+                    and isinstance(records, list)
+                    and index < len(records)
+                ):
                     record = records[index]
                     motion_path = record.get("motion_path") if isinstance(record, dict) else None
                     if motion_path is not None:
@@ -60,12 +95,13 @@ class MinimumFrameDataset(Dataset):
         if isinstance(index, tuple):
             index, augmentation_seed = index
         source, source_index = self.samples[index]
-        sample = source[source_index]
-        if augmentation_seed is None:
-            return sample
-        seeded = dict(sample)
-        seeded["_augmentation_seed"] = int(augmentation_seed)
-        return seeded
+        sample = dict(source[source_index])
+        # This task-local index is stable across workers and lets validation
+        # distribute deterministic probes without changing Dataset contracts.
+        sample["_ldf_sample_index"] = int(index)
+        if augmentation_seed is not None:
+            sample["_augmentation_seed"] = int(augmentation_seed)
+        return sample
 
 
 class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
@@ -116,7 +152,6 @@ class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
             )
         order = torch.randperm(len(batches), generator=generator).tolist()
         epoch = self.epoch
-        self.epoch += 1
         for position in order:
             yield [
                 (index, self.seed + epoch * 1_000_003 + index)
@@ -127,6 +162,61 @@ class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
         return sum(
             ceil(len(indices) / self.batch_size) for indices in self.buckets.values()
         )
+
+
+class ResumableDataLoader(DataLoader):
+    """Expose consumed-batch state to Lightning's CombinedLoader checkpoint."""
+
+    _STATE_VERSION = 1
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._active_epoch: int | None = None
+        self._yielded_batches = 0
+
+    def __iter__(self):
+        sampler = self.batch_sampler
+        epoch = int(getattr(sampler, "epoch", 0))
+        if self._active_epoch != epoch:
+            self._active_epoch = epoch
+            self._yielded_batches = 0
+
+        iterator = super().__iter__()
+        skipped = 0
+        while skipped < self._yielded_batches:
+            try:
+                next(iterator)
+            except StopIteration as error:
+                raise RuntimeError(
+                    "saved LDF dataloader cursor exceeds the reconstructed epoch"
+                ) from error
+            skipped += 1
+
+        for batch in iterator:
+            self._yielded_batches += 1
+            yield batch
+
+    def state_dict(self) -> dict[str, int]:
+        epoch = int(getattr(self.batch_sampler, "epoch", 0))
+        return {
+            "version": self._STATE_VERSION,
+            "epoch": epoch,
+            "yielded_batches": int(self._yielded_batches),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, int]) -> None:
+        if int(state_dict.get("version", -1)) != self._STATE_VERSION:
+            raise RuntimeError("unsupported LDF dataloader checkpoint state")
+        epoch = int(state_dict["epoch"])
+        yielded_batches = int(state_dict["yielded_batches"])
+        if epoch < 0 or not 0 <= yielded_batches <= len(self):
+            raise RuntimeError("invalid LDF dataloader checkpoint cursor")
+        set_epoch = getattr(self.batch_sampler, "set_epoch", None)
+        if not callable(set_epoch):
+            raise RuntimeError("resumable LDF dataloader requires an epoch-aware sampler")
+        set_epoch(epoch)
+        self._active_epoch = epoch
+        self._yielded_batches = yielded_batches
 
 
 class LDFSpanCollator:
@@ -143,6 +233,8 @@ class LDFSpanCollator:
         cold_start_probability: float = 0.1,
         cold_start: bool | None = None,
         validation_probe: str | None = None,
+        validation_span_frames: int | None = None,
+        validation_positions: tuple[str, ...] | None = None,
     ):
         self.min_frames = int(min_frames)
         self.max_frames = int(max_frames)
@@ -153,6 +245,10 @@ class LDFSpanCollator:
         self.cold_start_probability = float(cold_start_probability)
         self.cold_start = cold_start
         self.validation_probe = validation_probe
+        self.validation_span_frames = (
+            None if validation_span_frames is None else int(validation_span_frames)
+        )
+        self.validation_positions = validation_positions
 
         for name, value in (
             ("min_frames", self.min_frames),
@@ -166,6 +262,30 @@ class LDFSpanCollator:
             raise ValueError("encoder_context_tokens must be non-negative")
         if not 0.0 <= self.cold_start_probability <= 1.0:
             raise ValueError("cold_start_probability must lie in [0,1]")
+        if self.validation_span_frames is not None:
+            if self.training:
+                raise ValueError("validation_span_frames is only valid for validation")
+            if (
+                self.validation_span_frames < self.min_frames
+                or self.validation_span_frames > self.max_frames
+                or self.validation_span_frames % FRAMES_PER_TOKEN
+            ):
+                raise ValueError(
+                    "validation_span_frames must be a four-frame multiple within "
+                    "[min_frames,max_frames]"
+                )
+        if self.validation_positions is not None:
+            if self.training or self.cold_start is not False:
+                raise ValueError(
+                    "validation_positions requires a continuation validation collator"
+                )
+            allowed = {"early", "middle", "late"}
+            if not self.validation_positions or not set(
+                self.validation_positions
+            ).issubset(allowed):
+                raise ValueError(
+                    "validation_positions may only contain early/middle/late"
+                )
 
     def _select_cold_start(self, rng=random) -> bool:
         if self.cold_start is not None:
@@ -191,7 +311,16 @@ class LDFSpanCollator:
                 f"LDF span requires at least {self.min_frames} frames; "
                 f"short batch contains {identities}"
             )
-        return rng.randint(minimum, maximum) if self.training else maximum
+        if self.training:
+            return rng.randint(minimum, maximum)
+        if self.validation_span_frames is not None:
+            requested = self.validation_span_frames // FRAMES_PER_TOKEN
+            if requested > maximum:
+                raise ValueError(
+                    "validation sample is shorter than validation_span_frames"
+                )
+            return requested
+        return maximum
 
     def _select_start_token(
         self,
@@ -199,6 +328,7 @@ class LDFSpanCollator:
         available_tokens: int,
         span_tokens: int,
         cold_start: bool,
+        validation_position: str | None = None,
         rng=random,
     ) -> int:
         if cold_start:
@@ -206,7 +336,16 @@ class LDFSpanCollator:
         maximum = available_tokens - span_tokens
         if self.training:
             return rng.randint(0, maximum)
-        return maximum // 2
+        if maximum <= 0:
+            raise ValueError(
+                "continuation validation requires at least one source token before "
+                "the active span"
+            )
+        if validation_position == "early":
+            return 1
+        if validation_position == "late":
+            return maximum
+        return max(1, maximum // 2)
 
     def _select_caption(
         self,
@@ -309,6 +448,7 @@ class LDFSpanCollator:
         *,
         span_tokens: int,
         cold_start: bool,
+        validation_position: str | None = None,
         rng=random,
         torch_generator: torch.Generator | None = None,
     ) -> dict[str, object]:
@@ -320,6 +460,7 @@ class LDFSpanCollator:
             available_tokens=available_tokens,
             span_tokens=span_tokens,
             cold_start=cold_start,
+            validation_position=validation_position,
             rng=rng,
         )
         start = start_token * FRAMES_PER_TOKEN
@@ -379,9 +520,7 @@ class LDFSpanCollator:
         ):
             raise ValueError("training samples must either all carry seeds or all omit them")
         if all(seed is not None for seed in seeds):
-            batch_seed = sum(
-                (index + 1) * int(seed) for index, seed in enumerate(seeds)
-            ) % (2**63 - 1)
+            batch_seed = _mix_seed([int(seed) for seed in seeds])
             rng = random.Random(batch_seed)
             torch_generator = torch.Generator().manual_seed(batch_seed)
         else:
@@ -389,16 +528,24 @@ class LDFSpanCollator:
             torch_generator = None
         cold_start = self._select_cold_start(rng)
         span_tokens = self._select_span_tokens(samples, rng)
-        spans = [
-            self._crop_sample(
+        spans = []
+        for sample in samples:
+            validation_position = None
+            if self.validation_positions is not None:
+                sample_index = int(sample.get("_ldf_sample_index", 0))
+                validation_position = self.validation_positions[
+                    sample_index % len(self.validation_positions)
+                ]
+            span = self._crop_sample(
                 sample,
                 span_tokens=span_tokens,
                 cold_start=cold_start,
+                validation_position=validation_position,
                 rng=rng,
                 torch_generator=torch_generator,
             )
-            for sample in samples
-        ]
+            span["validation_position"] = validation_position
+            spans.append(span)
         batch_size = len(spans)
         span_frames = span_tokens * FRAMES_PER_TOKEN
         total_frames = max(int(item["body_with_context"].shape[0]) for item in spans)
@@ -458,6 +605,10 @@ class LDFSpanCollator:
         }
         if self.validation_probe is not None:
             output["validation_probe"] = self.validation_probe
+        if self.validation_positions is not None:
+            output["validation_position"] = [
+                item["validation_position"] for item in spans
+            ]
         return output
 
 
@@ -506,7 +657,7 @@ def create_dataloaders(
             max_frames=int(cfg.data.max_frames),
             seed=int(cfg.get("seed", 0)),
         )
-        train_loader = DataLoader(
+        train_loader = ResumableDataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
             collate_fn=LDFSpanCollator(
@@ -520,9 +671,27 @@ def create_dataloaders(
             **common,
         )
 
-    def validation_loader(name: str, *, cold_start: bool) -> DataLoader:
+    validation = cfg.get("validation") or {}
+    continuation_span_frames = int(
+        validation.get("continuation_span_frames", cfg.data.min_frames)
+    )
+    if continuation_span_frames % FRAMES_PER_TOKEN:
+        raise ValueError("validation.continuation_span_frames must align to four frames")
+    continuation_dataset = MinimumFrameDataset(
+        val_dataset,
+        min_frames=continuation_span_frames + FRAMES_PER_TOKEN,
+    )
+
+    def validation_loader(
+        name: str,
+        *,
+        cold_start: bool,
+        dataset: Dataset,
+        span_frames: int | None = None,
+        positions: tuple[str, ...] | None = None,
+    ) -> DataLoader:
         return DataLoader(
-            val_dataset,
+            dataset,
             batch_size=int(cfg.data.val_batch_size),
             shuffle=False,
             collate_fn=LDFSpanCollator(
@@ -533,17 +702,33 @@ def create_dataloaders(
                 random_yaw=False,
                 cold_start=cold_start,
                 validation_probe=name,
+                validation_span_frames=span_frames,
+                validation_positions=positions,
             ),
             **common,
         )
 
     val_loaders = [
-        validation_loader("teacher_cold", cold_start=True),
-        validation_loader("teacher_continuation", cold_start=False),
+        validation_loader("teacher_cold", cold_start=True, dataset=val_dataset),
+        validation_loader(
+            "teacher_continuation",
+            cold_start=False,
+            dataset=continuation_dataset,
+            span_frames=continuation_span_frames,
+            positions=("early", "middle", "late"),
+        ),
     ]
     self_forcing = cfg.get("self_forcing")
     if self_forcing is not None and bool(self_forcing.get("enabled", False)):
-        val_loaders.append(validation_loader("self_forcing", cold_start=False))
+        val_loaders.append(
+            validation_loader(
+                "self_forcing",
+                cold_start=False,
+                dataset=continuation_dataset,
+                span_frames=continuation_span_frames,
+                positions=("early", "middle", "late"),
+            )
+        )
     return train_loader, val_loaders
 
 
@@ -551,6 +736,7 @@ __all__ = [
     "LDFSpanCollator",
     "LengthBucketBatchSampler",
     "MinimumFrameDataset",
+    "ResumableDataLoader",
     "create_dataloaders",
     "create_dataset",
 ]

@@ -57,10 +57,13 @@ python -m eval.vae.rolling \
   --output /tmp/vae_rolling_eval
 ```
 
-Each task writes the same per-dataset layout:
+`model.model_id` is an explicit, filesystem-safe checkpoint identity. It is not
+inferred from the checkpoint path, so published experiment names remain stable
+even when checkpoint files are moved. Each task writes the same model-scoped
+per-dataset layout and a model-scoped aggregate summary:
 
 ```text
-output/<task>/<dataset>/
+output/<task>/<dataset>/<model_id>/
 ├── video/original/<sample_id>.mp4
 ├── video/reconstruction/<sample_id>.mp4
 ├── motion/original/<sample_id>.npz
@@ -68,6 +71,8 @@ output/<task>/<dataset>/
 ├── metrics/<sample_id>.json
 ├── manifest.json
 └── summary.json
+
+output/<task>/summaries/<model_id>.json
 ```
 
 The reconstruction NPZ retains deterministic `posterior_mu`, derived
