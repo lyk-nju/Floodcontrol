@@ -21,20 +21,22 @@ from models.tools.wan_model import (
     sinusoidal_embedding_1d,
 )
 from utils.conditions.ldf import (
-    FRAMES_PER_TOKEN,
-    LOCAL_ROOT_DIM,
-    ROOT_DIM,
     HybridMotion,
     LDFCondition,
     LDFInput,
     LDFPrediction,
     LDFStreamState,
     create_cfg_condition,
-    derive_local_root_motion,
     normalize_features,
-    project_root_heading,
     unnormalize_features,
 )
+from utils.motion_process import (
+    LOCAL_ROOT_DIM,
+    ROOT_DIM,
+    project_root_heading,
+    recover_local_root,
+)
+from utils.token_frame import FRAMES_PER_TOKEN
 
 
 def _as_stats(name: str, value, expected_dim: int) -> torch.Tensor:
@@ -458,8 +460,8 @@ class LDF(nn.Module):
         self, clean_root: torch.Tensor, previous_root_frame: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         physical = unnormalize_features(clean_root, self.root_mean, self.root_std)
-        local, valid = derive_local_root_motion(
-            physical, previous_root_frame, fps=self.fps
+        local, valid = recover_local_root(
+            physical.flatten(1, 2), previous_root_frame, fps=self.fps
         )
         normalized = normalize_features(
             local, self.local_root_mean, self.local_root_std

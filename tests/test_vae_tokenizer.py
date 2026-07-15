@@ -1,124 +1,61 @@
-import json
-import sys
-from pathlib import Path
-
-import numpy as np
 import pytest
 import torch
 
-from models.vae_wan_1d import BodyVAE
-from tools.motion_artifact import process_file
-from tools.preprocess_humanml3d import build_dataset
-from tools.pretokenize_body_latents import main as pretokenize_main
-from utils.motion_representation import deterministic_sample_yaw
-from utils.training.vae.checkpoint import (
-    ema_state_dict,
-    save_tokenizer_bundle,
-    state_dict_sha256,
-)
+from tests.vae_helpers import make_vae, write_statistics
+from tools.compute_vae_latent_stats import LatentStatisticsAccumulator
+from utils.training.vae.checkpoint import load_vae_checkpoint
 
 
-def _humanml263(frames: int = 8) -> np.ndarray:
-    value = np.zeros((frames, 263), dtype=np.float32)
-    value[:, 3] = 1.0
-    identity = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
-    value[:, 67:193] = np.tile(identity, 21)
-    return value
+def _checkpoint(model, path, *, ema=True):
+    payload = {"state_dict": model.state_dict()}
+    if ema:
+        payload["ema_state"] = {
+            "shadow_params": [parameter.detach().clone() for parameter in model.parameters()]
+        }
+    torch.save(payload, path)
 
 
-def _tiny_model() -> BodyVAE:
-    return BodyVAE(
+def test_checkpoint_loader_uses_ema_and_preserves_latent_statistics(tmp_path):
+    source = make_vae(
+        latent_dim=4, hidden_dim=8, encoder_layers=1, decoder_layers=1
+    )
+    checkpoint = tmp_path / "training.ckpt"
+    _checkpoint(source, checkpoint)
+    motion, latent = write_statistics(
+        tmp_path / "target", latent_dim=4, latent_mean=2.0, latent_std=3.0
+    )
+    target = type(source)(
+        motion_stats_path=motion,
+        latent_stats_path=latent,
         latent_dim=4,
         hidden_dim=8,
         encoder_layers=1,
         decoder_layers=1,
-        allow_identity_statistics=True,
-        require_latent_statistics=False,
     )
+    load_vae_checkpoint(target, checkpoint)
+    assert torch.equal(target.latent_mean, torch.full((4,), 2.0))
+    assert torch.equal(target.latent_std, torch.full((4,), 3.0))
+    assert not target.training
+    assert not any(parameter.requires_grad for parameter in target.parameters())
+    # Loading is idempotent even after the first call freezes the model.
+    load_vae_checkpoint(target, checkpoint)
 
 
-def test_ema_state_dict_rejects_raw_only_and_replaces_every_parameter():
-    model = _tiny_model()
-    raw = {name: value.detach().clone() for name, value in model.state_dict().items()}
+def test_checkpoint_loader_requires_ema_by_default(tmp_path):
+    model = make_vae(latent_dim=4, hidden_dim=8, encoder_layers=1, decoder_layers=1)
+    checkpoint = tmp_path / "raw.ckpt"
+    _checkpoint(model, checkpoint, ema=False)
     with pytest.raises(ValueError, match="missing ema_state"):
-        ema_state_dict(model, {"state_dict": raw})
-    shadows = [torch.full_like(parameter, 0.25) for parameter in model.parameters()]
-    state = ema_state_dict(
-        model,
-        {"state_dict": raw, "ema_state": {"shadow_params": shadows}},
-    )
-    for name, parameter in model.named_parameters():
-        assert torch.equal(state[name], torch.full_like(parameter, 0.25))
+        load_vae_checkpoint(model, checkpoint)
 
 
-def test_pretokenize_is_namespaced_two_pass_and_yaw_deterministic(tmp_path, monkeypatch):
-    roots = []
-    for dataset in ("HumanML3D_motion", "BABEL_motion"):
-        root = tmp_path / dataset
-        (root / "artifacts").mkdir(parents=True)
-        source = tmp_path / f"{dataset}.npy"
-        np.save(source, _humanml263())
-        process_file(source, root / "artifacts" / "sample.npz", fps=20.0)
-        (root / "train.txt").write_text("sample\n")
-        roots.append(root)
-
-    model = _tiny_model().eval()
-    state = model.state_dict()
-    inference_hash = state_dict_sha256(state)
-    tokenizer = tmp_path / "tokenizer_ema.pt"
-    save_tokenizer_bundle(
-        model,
-        tokenizer,
-        model_config={
-            "latent_dim": 4,
-            "hidden_dim": 8,
-            "encoder_layers": 1,
-            "decoder_layers": 1,
-            "kernel_size": 3,
-            "dropout": 0.0,
-            "fps": 20.0,
-        },
-        checkpoint_metadata={
-            "weights_kind": "ema",
-            "training_checkpoint_sha256": "checkpoint",
-            "inference_state_sha256": inference_hash,
-            "motion_stats_sha256": "statistics",
-            "global_step": 300000,
-        },
-    )
-    output = tmp_path / "latents"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "pretokenize_body_latents.py",
-            "--train-meta-paths",
-            str(roots[0] / "train.txt"),
-            str(roots[1] / "train.txt"),
-            "--tokenizer",
-            str(tokenizer),
-            "--output",
-            str(output),
-            "--batch-size",
-            "2",
-            "--yaw-seed",
-            "7",
-        ],
-    )
-    pretokenize_main()
-    for root in roots:
-        artifact = output / "latents" / root.name / "sample.npz"
-        assert artifact.is_file()
-        with np.load(artifact, allow_pickle=False) as data:
-            assert data["latent_motion"].shape == (2, 4)
-            assert float(data["yaw_offset"]) == pytest.approx(
-                deterministic_sample_yaw(root.name, "sample", seed=7), abs=1e-6
-            )
-    metadata = json.loads(str(np.load(output / "latent_stats.npz")["metadata"]))
-    assert metadata["weights_kind"] == "ema"
-    assert metadata["yaw_policy"] == "sample-id-sha256-uniform-v1"
-    assert metadata["train_token_count"] == 4
-    assert (output / "train.txt").read_text().splitlines() == [
-        "HumanML3D_motion/sample",
-        "BABEL_motion/sample",
-    ]
+def test_latent_statistics_fail_on_non_finite_values():
+    accumulator = LatentStatisticsAccumulator(2)
+    with pytest.raises(ValueError, match="sample/nonfinite"):
+        accumulator.update(
+            torch.tensor([[float("nan"), 0.0]]), sample_identity="sample/nonfinite"
+        )
+    accumulator.update(torch.tensor([[1.0, 2.0]]), sample_identity="sample/ok")
+    accumulator.total[0] = float("inf")
+    with pytest.raises(ValueError, match="non-finite"):
+        accumulator.finish()

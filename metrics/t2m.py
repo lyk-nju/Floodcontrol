@@ -4,7 +4,7 @@ import torch
 from typing import List
 from torch import Tensor
 from torchmetrics import Metric
-from utils.initialize import instantiate
+from utils.initialize import instantiate_target
 from .tools.utils import (
     calculate_activation_statistics_np,
     calculate_diversity_np,
@@ -61,12 +61,12 @@ class T2MMetrics(Metric):
         # init module
         t2m_checkpoint = {}
         if self.evaluate_text:
-            self.w_vectorizer = instantiate(
+            self.w_vectorizer = instantiate_target(
                 cfg.wordvectorizer.target,
                 cfg=None,
                 **cfg.wordvectorizer.params,
             )
-            self.t2m_textencoder = instantiate(
+            self.t2m_textencoder = instantiate_target(
                 cfg.textencoder.target, cfg=None, **cfg.textencoder.params
             )
             t2m_checkpoint["text_encoder"] = torch.load(
@@ -87,10 +87,10 @@ class T2MMetrics(Metric):
         )
         self.register_buffer("metric_std", torch.from_numpy(self.metric_std_np).float())
 
-        self.t2m_moveencoder = instantiate(
+        self.t2m_moveencoder = instantiate_target(
             cfg.moveencoder.target, cfg=None, **cfg.moveencoder.params
         )
-        self.t2m_motionencoder = instantiate(
+        self.t2m_motionencoder = instantiate_target(
             cfg.motionencoder.target, cfg=None, **cfg.motionencoder.params
         )
 

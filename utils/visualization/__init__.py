@@ -1,19 +1,12 @@
-from .skeleton import (
-    get_humanml3d_chains,
-    render_simple_skeleton_video,
-    render_skeleton_video,
-)
-from .video import (
-    make_composite_compare_videos,
-    render_single_video,
-    render_video,
-)
+"""Public HumanML22 visualization interfaces."""
+
+from .motion_video import render_joint_video, render_motion_video
+from .skeleton import HUMANML22_CHAINS, HUMANML22_CHAIN_COLORS
+
 
 __all__ = [
-    "get_humanml3d_chains",
-    "make_composite_compare_videos",
-    "render_simple_skeleton_video",
-    "render_single_video",
-    "render_skeleton_video",
-    "render_video",
+    "HUMANML22_CHAINS",
+    "HUMANML22_CHAIN_COLORS",
+    "render_joint_video",
+    "render_motion_video",
 ]

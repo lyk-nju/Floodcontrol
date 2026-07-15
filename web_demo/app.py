@@ -4,7 +4,6 @@ import threading
 import argparse
 import os
 import sys
-import numpy as np
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -12,12 +11,10 @@ if PROJECT_ROOT not in sys.path:
 
 from flask import Flask
 from flask_cors import CORS
-from web_demo.model_manager import get_model_manager
+from web_demo.model_manager import WEB_MIGRATION_ERROR, get_model_manager
 from web_demo.api.routes import register_routes
 from web_demo.config import load_debug_preset_cfg, load_traj_mask_cfg
 from web_demo.services.session_service import SessionService
-from utils.motion_process import extract_root_trajectory_263
-from utils.inference.geometry import resample_polyline
 
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
@@ -49,82 +46,12 @@ def init_model():
     return model_manager
 
 
-def _load_first_caption(text_path: str) -> str:
-    with open(text_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            return line.split("#")[0].strip()
-    return ""
-
-
-def _resample_uniform_arclength(points_xyz: np.ndarray, num_points: int) -> np.ndarray:
-    """Resample a world-space XZ polyline to uniformly spaced points."""
-    points = np.asarray(points_xyz, dtype=np.float32)
-    if num_points <= 0 or len(points) == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    if num_points == 1 or len(points) == 1:
-        return points[:1].astype(np.float32)
-
-    seg_lens = np.linalg.norm(np.diff(points[:, [0, 2]], axis=0), axis=1)
-    total_len = float(seg_lens.sum())
-    if total_len <= 1e-6:
-        return np.repeat(points[:1].astype(np.float32), num_points, axis=0)
-    return resample_polyline(
-        points,
-        num_tokens=num_points,
-        token_step=total_len / float(num_points - 1),
-    )
-
-
 def load_debug_preset_sample():
-    """Load a HumanML3D root trajectory preset for web-demo sanity checks.
-
-    The preset intentionally passes only world-space root points to the normal
-    web trajectory path.  ModelManager then assigns timestamps with
-    traj_mask.waypoint_dt, matching user-drawn paths instead of using a separate
-    debug-only timestamp source.
-    """
+    """Fail explicitly while the root5/body265 Web bridge is unavailable."""
     cfg = debug_preset_cfg or {}
     if not bool(cfg.get("enabled", False)):
         return None
-
-    dataset = str(cfg.get("dataset", "humanml3d")).lower()
-    sample_id = str(cfg.get("sample_id", "001168"))
-    raw_data_dir = cfg.get("raw_data_dir")
-    if not raw_data_dir:
-        raise ValueError("web_demo_debug.raw_data_dir is required when debug preset is enabled")
-
-    if dataset != "humanml3d":
-        raise ValueError(f"Unsupported web_demo_debug.dataset: {dataset}")
-
-    data_dir = os.path.join(raw_data_dir, "HumanML3D")
-    feature_path = os.path.join(
-        data_dir,
-        str(cfg.get("feature_path", "new_joint_vecs")),
-        f"{sample_id}.npy",
-    )
-    text_path = os.path.join(
-        data_dir,
-        str(cfg.get("text_path", "texts")),
-        f"{sample_id}.txt",
-    )
-    feature = np.load(feature_path).astype(np.float32)
-    root = extract_root_trajectory_263(feature).astype(np.float32)
-    root = _resample_uniform_arclength(root, len(root))
-    waypoint_dt = float((traj_mask_cfg or {}).get("waypoint_dt", 0.05))
-    text = str(cfg.get("text", "")).strip() or _load_first_caption(text_path)
-    return {
-        "dataset": dataset,
-        "sample_id": sample_id,
-        "text": text,
-        "trajectory": root,
-        "num_frames": int(len(feature)),
-        "duration_seconds": float(max(0, len(root) - 1) * waypoint_dt),
-        "waypoint_dt": waypoint_dt,
-        "repeat": dict(cfg.get("repeat", {}) or {}),
-    }
+    raise RuntimeError(WEB_MIGRATION_ERROR)
 
 
 @app.after_request

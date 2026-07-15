@@ -1,112 +1,167 @@
-"""Four-frame token/frame mapping.
+"""Canonical mapping between motion frames and latent tokens.
 
-Token ``k`` always covers the half-open frame range ``[4k, 4(k+1))``.
-There is no first-token special case.
+Floodcontrol has one temporal contract: every token represents exactly four
+consecutive frames. Token ``k`` owns the half-open frame interval
+``[4 * k, 4 * (k + 1))``. There is no special one-frame first token.
+
+This module deliberately separates exact model-boundary conversions from
+explicit preprocessing truncation. Model, Dataset and runtime code must use
+the exact conversions; only offline preprocessing should call
+``aligned_frame_floor()`` before discarding an incomplete tail patch.
 """
 
 from __future__ import annotations
 
-FRAMES_PER_TOKEN_DEFAULT = 4
+from numbers import Integral
+
+import torch
 
 
-def _check_factor(frames_per_token: int) -> int:
-    factor = int(frames_per_token)
-    if factor <= 0:
-        raise ValueError("frames_per_token must be positive")
-    return factor
+FRAMES_PER_TOKEN = 4
 
 
-def token_start_frame(token_idx: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
-    return max(0, int(token_idx)) * _check_factor(frames_per_token)
+def _non_negative_integer(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return value
 
 
-def token_end_frame(token_idx: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
-    return token_start_frame(token_idx, frames_per_token) + _check_factor(frames_per_token) - 1
+def require_aligned_frame_count(frame_count: int) -> int:
+    """Validate and return a frame count containing only complete patches."""
+    frame_count = _non_negative_integer("frame_count", frame_count)
+    if frame_count % FRAMES_PER_TOKEN:
+        raise ValueError(
+            f"frame_count must be divisible by four ({FRAMES_PER_TOKEN}), got {frame_count}"
+        )
+    return frame_count
 
 
-def commit_boundary_frame(commit_idx: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
-    """Last available frame before commit_idx; cold start has no negative index."""
-    return max(0, first_future_frame_abs(commit_idx, frames_per_token) - 1)
+def aligned_frame_floor(frame_count: int) -> int:
+    """Return the largest complete-patch length not exceeding ``frame_count``.
+
+    This operation may discard tail frames and is therefore intended only for
+    explicit offline preprocessing code.
+    """
+    frame_count = _non_negative_integer("frame_count", frame_count)
+    return frame_count - frame_count % FRAMES_PER_TOKEN
 
 
-def first_future_frame_abs(commit_idx: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
-    return max(0, int(commit_idx)) * _check_factor(frames_per_token)
+def frame_count_to_token_count(frame_count: int) -> int:
+    """Convert an exactly aligned frame count to its token count."""
+    return require_aligned_frame_count(frame_count) // FRAMES_PER_TOKEN
 
 
-def last_generated_frame_abs(commit_idx: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int | None:
-    future = first_future_frame_abs(commit_idx, frames_per_token)
-    return None if future == 0 else future - 1
+def token_count_to_frame_count(token_count: int) -> int:
+    """Convert a token count to the exact number of represented frames."""
+    return _non_negative_integer("token_count", token_count) * FRAMES_PER_TOKEN
 
 
-def num_frames_for_tokens(num_tokens: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
-    return max(0, int(num_tokens)) * _check_factor(frames_per_token)
+def token_index_to_frame_start(token_index: int) -> int:
+    """Return the first frame owned by ``token_index``."""
+    return _non_negative_integer("token_index", token_index) * FRAMES_PER_TOKEN
 
 
-def frame_idx_to_token_idx(frame_idx: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
-    return max(0, int(frame_idx)) // _check_factor(frames_per_token)
+def token_index_to_frame_slice(token_index: int) -> slice:
+    """Return the four-frame half-open slice owned by one token."""
+    start = token_index_to_frame_start(token_index)
+    return slice(start, start + FRAMES_PER_TOKEN)
 
 
-def num_tokens_for_frame_len(frame_len: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT) -> int:
-    frames = max(0, int(frame_len))
-    factor = _check_factor(frames_per_token)
-    return (frames + factor - 1) // factor
+def token_range_to_frame_slice(start_token_index: int, token_count: int) -> slice:
+    """Return the frame slice represented by a contiguous token range."""
+    start = token_index_to_frame_start(start_token_index)
+    return slice(start, start + token_count_to_frame_count(token_count))
 
 
-def token_range_to_frame_slice(
-    start_token_idx: int,
-    num_tokens: int,
-    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
-) -> slice:
-    start = token_start_frame(start_token_idx, frames_per_token)
-    return slice(start, start + num_frames_for_tokens(num_tokens, frames_per_token))
+def frame_index_to_token_index(frame_index: int) -> int:
+    """Return the token that owns an absolute frame index."""
+    return _non_negative_integer("frame_index", frame_index) // FRAMES_PER_TOKEN
 
 
-def token_active_window_left_frame(
-    end_token_idx: int,
-    chunk_size_tokens: int,
-    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
-) -> int:
-    return token_start_frame(max(0, int(end_token_idx) - int(chunk_size_tokens)), frames_per_token)
+def commit_index_to_frame_count(commit_index: int) -> int:
+    """Return the number of frames committed before a token commit boundary."""
+    return token_count_to_frame_count(commit_index)
 
 
-def token_body_window_left_frame(
-    end_token_idx: int,
-    body_window_tokens: int,
-    frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT,
-) -> int:
-    return token_start_frame(max(0, int(end_token_idx) - int(body_window_tokens)), frames_per_token)
+def previous_committed_frame_index(commit_index: int) -> int | None:
+    """Return the last committed frame, or ``None`` at cold start."""
+    committed_frames = commit_index_to_frame_count(commit_index)
+    return None if committed_frames == 0 else committed_frames - 1
 
 
-def frames_to_token_mask(mask_frame, num_tokens: int, frames_per_token: int = FRAMES_PER_TOKEN_DEFAULT):
-    """OR-reduce each non-overlapping four-frame patch."""
-    factor = _check_factor(frames_per_token)
-    leading = mask_frame.shape[:-1]
-    result = mask_frame.new_zeros(*leading, int(num_tokens))
-    for token in range(int(num_tokens)):
-        start = token * factor
-        stop = min(start + factor, mask_frame.shape[-1])
-        if start < stop:
-            result[..., token] = (mask_frame[..., start:stop] > 0).any(-1).to(mask_frame.dtype)
-    return result
+def _patch_frame_mask(mask: torch.Tensor, *, frame_dim: int, reduce: str) -> torch.Tensor:
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError(f"mask must be a torch.Tensor, got {type(mask).__name__}")
+    if mask.dtype != torch.bool:
+        raise TypeError(f"mask must have dtype bool, got {mask.dtype}")
+    if mask.ndim == 0:
+        raise ValueError("mask must have at least one dimension")
+
+    frame_dim = frame_dim % mask.ndim
+    moved = mask.movedim(frame_dim, -1)
+    frames = require_aligned_frame_count(moved.shape[-1])
+    patched = moved.reshape(*moved.shape[:-1], frame_count_to_token_count(frames), FRAMES_PER_TOKEN)
+    if reduce == "all":
+        reduced = patched.all(dim=-1)
+    elif reduce == "any":
+        reduced = patched.any(dim=-1)
+    else:  # pragma: no cover - private invariant
+        raise ValueError(f"unknown reduction: {reduce}")
+    return reduced.movedim(-1, frame_dim)
 
 
-def prefix_len_from_tail_invalid(token_mask):
-    import torch
+def frame_valid_to_token_valid(mask: torch.Tensor, *, frame_dim: int = -1) -> torch.Tensor:
+    """AND-reduce frame validity so a token is valid only if all four frames are."""
+    return _patch_frame_mask(mask, frame_dim=frame_dim, reduce="all")
 
-    valid = token_mask > 0
-    _, num_tokens = valid.shape
-    invalid = ~valid
-    has_invalid = invalid.any(dim=1)
-    first_invalid = torch.argmax(invalid.to(torch.int8), dim=1)
-    prefix_len = torch.where(has_invalid, first_invalid, torch.full_like(first_invalid, num_tokens))
-    pure_prefix = valid.sum(dim=1) == prefix_len
-    return torch.where(pure_prefix, prefix_len, torch.full_like(prefix_len, num_tokens)).long()
+
+def frame_observation_to_token_mask(
+    mask: torch.Tensor,
+    *,
+    frame_dim: int = -1,
+) -> torch.Tensor:
+    """OR-reduce sparse observations so any observed frame activates the token."""
+    return _patch_frame_mask(mask, frame_dim=frame_dim, reduce="any")
+
+
+def prefix_valid_token_count(token_mask: torch.Tensor) -> torch.Tensor:
+    """Count valid prefix tokens and reject masks containing validity holes.
+
+    Args:
+        token_mask: Boolean tensor whose final dimension is token time.
+
+    Returns:
+        Long tensor with the final token dimension removed.
+    """
+    if not isinstance(token_mask, torch.Tensor):
+        raise TypeError("token_mask must be a torch.Tensor")
+    if token_mask.dtype != torch.bool:
+        raise TypeError(f"token_mask must have dtype bool, got {token_mask.dtype}")
+    if token_mask.ndim == 0:
+        raise ValueError("token_mask must have at least one dimension")
+    if token_mask.shape[-1] > 1:
+        has_hole = ((~token_mask[..., :-1]) & token_mask[..., 1:]).any()
+        if bool(has_hole):
+            raise ValueError("token_mask must be a contiguous valid prefix")
+    return token_mask.sum(dim=-1, dtype=torch.long)
 
 
 __all__ = [
-    "FRAMES_PER_TOKEN_DEFAULT", "commit_boundary_frame", "first_future_frame_abs",
-    "frame_idx_to_token_idx", "frames_to_token_mask", "last_generated_frame_abs",
-    "num_frames_for_tokens", "num_tokens_for_frame_len", "prefix_len_from_tail_invalid",
-    "token_active_window_left_frame", "token_body_window_left_frame", "token_end_frame",
-    "token_range_to_frame_slice", "token_start_frame",
+    "FRAMES_PER_TOKEN",
+    "aligned_frame_floor",
+    "commit_index_to_frame_count",
+    "frame_count_to_token_count",
+    "frame_index_to_token_index",
+    "frame_observation_to_token_mask",
+    "frame_valid_to_token_valid",
+    "prefix_valid_token_count",
+    "previous_committed_frame_index",
+    "require_aligned_frame_count",
+    "token_count_to_frame_count",
+    "token_index_to_frame_slice",
+    "token_index_to_frame_start",
+    "token_range_to_frame_slice",
 ]

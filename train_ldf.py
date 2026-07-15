@@ -5,9 +5,10 @@ from __future__ import annotations
 
 TRAINING_MIGRATION_ERROR = (
     "Floodcontrol LDF training is BLOCKED_ON_BODY_VAE: the model core is "
-    "available and the four-frame body VAE/EMA tokenizer is implemented, "
-    "but the frozen online encoder, verified latent statistics, causal "
-    "encoder-context sampler, and hybrid training batch are not connected."
+    "available, the EMA tokenizer and verified latent statistics are ready, "
+    "and BodyVAE.encode_window exposes the causal context boundary; however, "
+    "the context-aware crop/collate, frozen online encoder call, and hybrid "
+    "training batch are not connected to an LDF Lightning module."
 )
 
 

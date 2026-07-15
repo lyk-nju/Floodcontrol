@@ -1,138 +1,192 @@
+"""Configuration, dynamic construction, and run-initialization helpers.
+
+The project uses YAML targets such as ``models.vae_wan_1d.BodyVAE`` to build
+models, Datasets, optimizers, and schedulers. This module owns that small
+bootstrap layer plus the filesystem metadata created at the start of a run.
+It does not own model, Dataset, or training-loop behavior.
+"""
+
+from __future__ import annotations
+
 import argparse
 import os
 import shutil
 import time
-
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
 
 
-class Config:
+DEFAULT_CONFIG_PATH = "configs/default.yaml"
+PATH_CONFIG_CANDIDATES = (
+    Path("configs/paths.yaml"),
+    Path("configs/paths_default.yaml"),
+)
+RUN_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+RUN_TIMESTAMP_ENV = "PL_RUN_TIME"
+
+
+class ProjectConfig:
+    """Merged project configuration with attribute and key access.
+
+    Path settings are loaded first from ``configs/paths.yaml`` when present,
+    otherwise from the tracked ``configs/paths_default.yaml``. The requested
+    experiment YAML and explicit command-line overrides are then applied in
+    that order.
+    """
+
     def __init__(
         self,
-        config_path: Optional[str] = None,
-        override_args: Optional[Dict[str, Any]] = None,
-    ):
+        config_path: str | Path | None = None,
+        overrides: Mapping[str, Any] | None = None,
+    ) -> None:
         self.config = OmegaConf.create({})
+        path_config = next(
+            (path for path in PATH_CONFIG_CANDIDATES if path.is_file()),
+            None,
+        )
+        if path_config is None:
+            candidates = ", ".join(str(path) for path in PATH_CONFIG_CANDIDATES)
+            raise FileNotFoundError(f"no path configuration found; checked {candidates}")
+        self.merge_yaml(path_config)
+        if config_path is not None:
+            self.merge_yaml(config_path)
+        if overrides:
+            self.apply_overrides(overrides)
 
-        paths_config_path = os.path.join("configs", "paths.yaml")
-        if not os.path.exists(paths_config_path):
-            paths_config_path = os.path.join("configs", "paths_default.yaml")
-        paths_config = OmegaConf.load(paths_config_path)
-        self.config = OmegaConf.merge(self.config, paths_config)
+    def merge_yaml(self, config_path: str | Path) -> None:
+        """Merge one YAML file into the current configuration."""
+        loaded = OmegaConf.load(config_path)
+        self.config = OmegaConf.merge(self.config, loaded)
 
-        if config_path:
-            self.load_yaml(config_path)
-        if override_args:
-            self.override_config(override_args)
-
-    def load_yaml(self, config_path: str) -> None:
-        """Load YAML configuration file"""
-        loaded_config = OmegaConf.load(config_path)
-        self.config = OmegaConf.merge(self.config, loaded_config)
-
-    def override_config(self, override_args: Dict[str, Any]) -> None:
-        """Handle command line override arguments"""
-        for key, value in override_args.items():
-            OmegaConf.update(self.config, key, self._convert_value(value))
-
-    def _convert_value(self, value: Any) -> Any:
-        """Convert string value to appropriate type"""
-        if not isinstance(value, str):
-            return value
-        lowered = value.lower()
-        if lowered == "true":
-            return True
-        elif lowered == "false":
-            return False
-        elif lowered == "null":
-            return None
-        try:
-            return int(value)
-        except ValueError:
-            try:
-                return float(value)
-            except ValueError:
-                return value
+    def apply_overrides(self, overrides: Mapping[str, Any]) -> None:
+        """Apply dot-separated OmegaConf keys after parsing scalar strings."""
+        for key, value in overrides.items():
+            OmegaConf.update(self.config, key, _parse_override_value(value))
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Get configuration value"""
+        """Select a possibly nested key, returning ``default`` when absent."""
         return OmegaConf.select(self.config, key, default=default)
 
     def __getattr__(self, name: str) -> Any:
-        """Support dot notation access"""
         return self.config[name]
 
     def __getitem__(self, key: str) -> Any:
-        """Support dictionary-like access"""
         return self.config[key]
 
-    def export_config(self, path: str) -> None:
-        """Export current configuration to file"""
+    def save(self, path: str | Path) -> None:
+        """Write the fully merged configuration to YAML."""
         OmegaConf.save(self.config, path)
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments"""
+def _parse_override_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    lowered = value.casefold()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+def parse_config_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse the common project configuration CLI arguments."""
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Experiment YAML path")
     parser.add_argument(
-        "--config", type=str, default="configs/default.yaml", help="Path to config file"
+        "--override",
+        nargs="+",
+        metavar="KEY=VALUE",
+        help="Dot-separated OmegaConf overrides",
     )
-    parser.add_argument(
-        "--override", type=str, nargs="+", help="Override config values (key=value)"
-    )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def _parse_override_arguments(values: Sequence[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for item in values or ():
+        if "=" not in item:
+            raise ValueError(f"override must use KEY=VALUE syntax, got {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"override key must not be empty: {item!r}")
+        overrides[key] = value.strip()
+    return overrides
 
 
 def load_config(
-    config_path: Optional[str] = None, override_args: Optional[Dict[str, Any]] = None
-) -> Config:
-    """Load configuration"""
+    config_path: str | Path | None = None,
+    overrides: Mapping[str, Any] | None = None,
+) -> ProjectConfig:
+    """Load path settings, one experiment YAML, and optional overrides."""
     if config_path is None:
-        args = parse_args()
-        config_path = args.config
-        if args.override:
-            override_args = {}
-            for override in args.override:
-                key, value = override.split("=", 1)
-                override_args[key.strip()] = value.strip()
-
-    return Config(config_path, override_args)
+        arguments = parse_config_arguments()
+        config_path = arguments.config
+        overrides = _parse_override_arguments(arguments.override)
+    return ProjectConfig(config_path, overrides)
 
 
-def instantiate(target: str, cfg=None, hfstyle: bool = False, **init_args):
-    module_name, class_name = target.rsplit(".", 1)
+def _resolve_target(target: str) -> Any:
+    if not isinstance(target, str) or "." not in target:
+        raise ValueError(f"target must be a fully-qualified name, got {target!r}")
+    module_name, attribute_name = target.rsplit(".", 1)
     module = import_module(module_name)
-    class_ = getattr(module, class_name)
+    try:
+        return getattr(module, attribute_name)
+    except AttributeError as error:
+        raise AttributeError(f"target {target!r} does not exist") from error
+
+
+def instantiate_target(
+    target: str,
+    *,
+    cfg: Any = None,
+    hfstyle: bool = False,
+    **arguments: Any,
+) -> Any:
+    """Instantiate a fully-qualified class or factory from configuration."""
+    constructor = _resolve_target(target)
+    if not callable(constructor):
+        raise TypeError(f"target {target!r} is not callable")
     if cfg is None:
-        return class_(**init_args)
+        return constructor(**arguments)
     if hfstyle:
-        config_class = class_.config_class
-        cfg = config_class(config_obj=cfg)
-    return class_(cfg, **init_args)
+        cfg = constructor.config_class(config_obj=cfg)
+    return constructor(cfg, **arguments)
 
 
-def get_function(target: str):
-    module_name, function_name = target.rsplit(".", 1)
-    module = import_module(module_name)
-    function_ = getattr(module, function_name)
-    return function_
+def resolve_function(target: str) -> Callable[..., Any]:
+    """Resolve and validate a fully-qualified function-like target."""
+    function = _resolve_target(target)
+    if not callable(function):
+        raise TypeError(f"target {target!r} is not callable")
+    return function
 
 
-def save_config_and_codes(config, save_dir) -> None:
-    os.makedirs(save_dir, exist_ok=True)
-    sanity_check_dir = Path(save_dir) / "sanity_check"
-    sanity_check_dir.mkdir(parents=True, exist_ok=True)
-    with open(sanity_check_dir / f"{config.exp_name}.yaml", "w") as f:
-        OmegaConf.save(config.config, f)
-    current_dir = Path.cwd()
-    excluded_names = {
+def save_run_snapshot(config: ProjectConfig, run_directory: str | Path) -> None:
+    """Save the resolved YAML and Python sources used to start a run."""
+    snapshot_directory = Path(run_directory) / "sanity_check"
+    snapshot_directory.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(config.config, snapshot_directory / f"{config.exp_name}.yaml")
+
+    source_root = Path.cwd()
+    excluded_directories = {
         ".git",
         "__pycache__",
         ".pytest_cache",
@@ -140,146 +194,138 @@ def save_config_and_codes(config, save_dir) -> None:
         "outputs",
         "sanity_check",
     }
-    for root, dirnames, filenames in os.walk(current_dir, topdown=True):
-        dirnames[:] = [name for name in dirnames if name not in excluded_names]
+    for root, directory_names, file_names in os.walk(source_root, topdown=True):
+        directory_names[:] = [
+            name for name in directory_names if name not in excluded_directories
+        ]
         root_path = Path(root)
-        for filename in filenames:
-            if not filename.endswith(".py"):
+        for file_name in file_names:
+            if not file_name.endswith(".py"):
                 continue
-            py_file = root_path / filename
-            dest_path = sanity_check_dir / py_file.relative_to(current_dir)
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(py_file, dest_path)
+            source = root_path / file_name
+            destination = snapshot_directory / source.relative_to(source_root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
 
 
-def print_model_size(model) -> None:
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    rank_zero_info(f"Total parameters: {total_params:,}")
-    rank_zero_info(f"Trainable parameters: {trainable_params:,}")
-    rank_zero_info(f"Non-trainable parameters: {(total_params - trainable_params):,}")
+def log_model_parameters(model: torch.nn.Module) -> None:
+    """Log total, trainable, and frozen parameter counts on global rank zero."""
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    rank_zero_info(f"Total parameters: {total:,}")
+    rank_zero_info(f"Trainable parameters: {trainable:,}")
+    rank_zero_info(f"Non-trainable parameters: {total - trainable:,}")
 
 
-def check_state_dict(state_dict, named_parameters, named_buffers) -> None:
-    """Compare differences between state_dict and parameters"""
-    state_dict_keys = set(state_dict.keys())
-    parameter_keys = set(name for name, _ in named_parameters)
-    buffer_keys = set(name for name, _ in named_buffers)
+def log_state_dict_summary(
+    state_dict: Mapping[str, Any],
+    named_parameters,
+    named_buffers,
+) -> None:
+    """Log missing or unexpected state keys on global rank zero."""
+    state_keys = set(state_dict)
+    parameter_keys = {name for name, _ in named_parameters}
+    buffer_keys = {name for name, _ in named_buffers}
+    expected_keys = parameter_keys | buffer_keys
 
-    # Find keys that only exist in state_dict
-    only_in_state_dict = state_dict_keys - parameter_keys
+    unexpected = sorted(state_keys - expected_keys)
+    missing_parameters = sorted(parameter_keys - state_keys)
+    missing_buffers = sorted(buffer_keys - state_keys)
+    if unexpected:
+        rank_zero_info(f"Unexpected state_dict keys: {unexpected}")
+    if missing_parameters:
+        rank_zero_info(f"Missing parameter keys: {missing_parameters}")
+    if missing_buffers:
+        rank_zero_info(f"Missing buffer keys: {missing_buffers}")
+    if not unexpected and not missing_parameters and not missing_buffers:
+        rank_zero_info("All state_dict keys match model parameters and buffers")
 
-    # Find keys that only exist in named_parameters
-    only_in_named_params = parameter_keys - state_dict_keys
-
-    if only_in_state_dict:
-        print(f"Only in state_dict (not in parameters): {sorted(only_in_state_dict)}")
-
-    if only_in_named_params:
-        print(
-            "Only in named_parameters (not in state_dict): "
-            f"{sorted(only_in_named_params)}"
-        )
-
-    if not only_in_state_dict and not only_in_named_params:
-        print("All parameters match between state_dict and named_parameters")
-
-    buffers_only = state_dict_keys - parameter_keys - buffer_keys
-
-    if buffers_only:
-        print(
-            "Other items in state_dict (neither params nor buffers): "
-            f"{sorted(buffers_only)}"
-        )
-
-    print(f"Total state_dict items: {len(state_dict_keys)}")
-    print(f"Total named_parameters: {len(parameter_keys)}")
-    print(f"Total named_buffers: {len(buffer_keys)}")
+    rank_zero_info(f"Total state_dict items: {len(state_keys)}")
+    rank_zero_info(f"Total named parameters: {len(parameter_keys)}")
+    rank_zero_info(f"Total named buffers: {len(buffer_keys)}")
 
 
 def _resolve_global_rank() -> int:
-    """Resolve the global rank from environment variables."""
     for key in ("GLOBAL_RANK", "RANK", "SLURM_PROCID", "LOCAL_RANK"):
-        if key in os.environ:
-            try:
-                return int(os.environ[key])
-            except ValueError:
-                continue
+        try:
+            return int(os.environ[key])
+        except (KeyError, ValueError):
+            continue
     return 0
 
 
-def get_shared_run_time(base_dir: str, env_key: str = "PL_RUN_TIME") -> str:
-    """Get a synchronized run time across all processes.
+def get_shared_run_timestamp(
+    base_directory: str | Path,
+    *,
+    environment_key: str = RUN_TIMESTAMP_ENV,
+) -> str:
+    """Return one run timestamp shared by every distributed process.
 
-    This function ensures all processes (both in distributed training and multi-process
-    scenarios) use the same timestamp for output directories and experiment tracking.
-
-    Args:
-        base_dir: Base directory for output files
-        env_key: Environment variable key to cache the run time
-
-    Returns:
-        Synchronized timestamp string in format YYYYMMDD_HHMMSS
+    Initialized torch.distributed jobs broadcast directly from rank zero. Jobs
+    launched as independent processes coordinate through a short-lived file in
+    the output directory. The value is cached in ``environment_key``.
     """
-    cached = os.environ.get(env_key)
+    cached = os.environ.get(environment_key)
     if cached:
         return cached
 
-    timestamp_format = "%Y%m%d_%H%M%S"
-
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            run_time = datetime.now().strftime(timestamp_format)
-        else:
-            run_time = None
-        container = [run_time]
-        torch.distributed.broadcast_object_list(container, src=0)
-        run_time = container[0]
-        if run_time is None:
-            raise RuntimeError("Failed to synchronize run time across ranks.")
-        os.environ[env_key] = run_time
-        return run_time
+        timestamp = (
+            datetime.now().strftime(RUN_TIMESTAMP_FORMAT)
+            if torch.distributed.get_rank() == 0
+            else None
+        )
+        values = [timestamp]
+        torch.distributed.broadcast_object_list(values, src=0)
+        timestamp = values[0]
+        if timestamp is None:
+            raise RuntimeError("failed to synchronize the run timestamp")
+        os.environ[environment_key] = timestamp
+        return timestamp
 
-    os.makedirs(base_dir, exist_ok=True)
-    sync_token = (
+    base_directory = Path(base_directory)
+    sync_directory = base_directory / ".run_time_sync"
+    sync_directory.mkdir(parents=True, exist_ok=True)
+    job_identity = (
         os.environ.get("SLURM_JOB_ID")
         or os.environ.get("TORCHELASTIC_RUN_ID")
         or os.environ.get("JOB_ID")
         or "default"
     )
-    sync_dir = os.path.join(base_dir, ".run_time_sync")
-    os.makedirs(sync_dir, exist_ok=True)
-    sync_file = os.path.join(sync_dir, f"{sync_token}.txt")
+    sync_file = sync_directory / f"{job_identity}.txt"
 
-    global_rank = _resolve_global_rank()
-    if global_rank == 0:
-        if os.path.exists(sync_file):
-            try:
-                os.remove(sync_file)
-            except OSError:
-                pass
-
-        run_time = datetime.now().strftime(timestamp_format)
-        with open(sync_file, "w", encoding="utf-8") as f:
-            f.write(run_time)
+    if _resolve_global_rank() == 0:
+        sync_file.unlink(missing_ok=True)
+        timestamp = datetime.now().strftime(RUN_TIMESTAMP_FORMAT)
+        sync_file.write_text(timestamp, encoding="utf-8")
     else:
-        timeout = time.monotonic() + 1200.0
+        deadline = time.monotonic() + 1200.0
         while True:
-            if os.path.exists(sync_file):
-                try:
-                    with open(sync_file, "r", encoding="utf-8") as f:
-                        run_time = f.read().strip()
-                    dt = datetime.strptime(run_time, timestamp_format)
-                    if abs((datetime.now() - dt).total_seconds()) < 60:
-                        break
-                except (ValueError, OSError):
-                    pass
-
-            if time.monotonic() > timeout:
-                raise TimeoutError(
-                    "Timed out waiting for rank 0 to write synchronized timestamp."
-                )
+            try:
+                timestamp = sync_file.read_text(encoding="utf-8").strip()
+                parsed = datetime.strptime(timestamp, RUN_TIMESTAMP_FORMAT)
+                if abs((datetime.now() - parsed).total_seconds()) < 60:
+                    break
+            except (OSError, ValueError):
+                pass
+            if time.monotonic() > deadline:
+                raise TimeoutError("timed out waiting for the rank-zero run timestamp")
             time.sleep(0.1)
 
-    os.environ[env_key] = run_time
-    return run_time
+    os.environ[environment_key] = timestamp
+    return timestamp
+
+
+__all__ = [
+    "ProjectConfig",
+    "get_shared_run_timestamp",
+    "instantiate_target",
+    "load_config",
+    "log_model_parameters",
+    "log_state_dict_summary",
+    "parse_config_arguments",
+    "resolve_function",
+    "save_run_snapshot",
+]

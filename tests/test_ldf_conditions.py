@@ -10,8 +10,8 @@ from utils.conditions.ldf import (
     create_cfg_condition,
     create_ldf_condition,
     create_window_condition,
-    derive_local_root_motion,
 )
+from utils.motion_process import recover_local_root
 
 
 def _text(batch=1, dim=8):
@@ -22,7 +22,7 @@ def test_backward_local_root_cold_start_and_forward_motion():
     root = torch.zeros(1, 1, 4, 5)
     root[..., 3] = 1.0
     root[0, 0, :, 2] = torch.arange(4) * 0.1
-    values, valid = derive_local_root_motion(root, None, fps=20.0)
+    values, valid = recover_local_root(root.flatten(1, 2), None, fps=20.0)
     assert torch.equal(valid[0, 0, 0], torch.tensor([False, False, False, True]))
     assert torch.allclose(values[0, 0, 0, :3], torch.zeros(3))
     assert torch.allclose(values[0, 0, 1:, 2], torch.full((3,), 2.0))
@@ -32,7 +32,7 @@ def test_local_velocity_is_invariant_to_global_yaw_rotation():
     root = torch.zeros(1, 1, 4, 5)
     root[..., 3] = 1.0
     root[0, 0, :, 2] = torch.arange(4) * 0.1
-    original, _ = derive_local_root_motion(root, None)
+    original, _ = recover_local_root(root.flatten(1, 2), None)
 
     angle = math.pi / 2
     rotated = root.clone()
@@ -41,7 +41,7 @@ def test_local_velocity_is_invariant_to_global_yaw_rotation():
     rotated[..., 2] = -math.sin(angle) * x + math.cos(angle) * z
     rotated[..., 3] = math.cos(angle)
     rotated[..., 4] = math.sin(angle)
-    transformed, _ = derive_local_root_motion(rotated, None)
+    transformed, _ = recover_local_root(rotated.flatten(1, 2), None)
     assert torch.allclose(original[..., :3], transformed[..., :3], atol=1e-5)
 
 

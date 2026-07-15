@@ -9,18 +9,16 @@ test_ckpt: null
 trainer:
   max_steps: 300000
   accelerator: gpu
-  devices: 3
-  strategy: ddp
+  devices: 1
+  strategy: auto
   log_every_n_steps: 50
 validation:
   validation_steps: 1000
-  test_steps: 10000
   save_every_n_steps: 10000
   save_top_k: 20
 
 data:
   target: datasets.multi.MultiDataset
-  collate_fn: datasets.multi.collate_multi
   datasets:
     - target: datasets.humanml3d.HumanML3DDataset
       train_meta_paths:
@@ -28,16 +26,17 @@ data:
       val_meta_paths:
         - ${dirs.raw_data}/HumanML3D_motion/val.txt
       artifact_path: artifacts
+      text_path: null
     - target: datasets.babel.BABELDataset
       train_meta_paths:
         - ${dirs.raw_data}/BABEL_motion/train.txt
       val_meta_paths:
         - ${dirs.raw_data}/BABEL_motion/val.txt
       artifact_path: artifacts
-  train_bs: 32
-  val_bs: 32
-  test_bs: 32
-  num_workers: 8
+      text_path: null
+  train_batch_size: 128
+  val_batch_size: 128
+  num_workers: 16
   min_frames: 20
   max_frames: 200
   random_yaw: true
@@ -55,8 +54,6 @@ model:
     fps: 20.0
     motion_stats_path: ${dirs.raw_data}/HumanML3D_BABEL_motion_stats.npz
     latent_stats_path: null
-    allow_identity_statistics: false
-    require_latent_statistics: false
 
 loss:
   lambda_position: 1.0

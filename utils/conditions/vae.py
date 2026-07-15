@@ -10,18 +10,18 @@ from dataclasses import dataclass
 
 import torch
 
-
-FRAMES_PER_TOKEN = 4
-NUM_JOINTS = 22
-ROOT_DIM = 5
-LOCAL_ROOT_DIM = 4
-BODY_POSITION_DIM = (NUM_JOINTS - 1) * 3
-BODY_ROTATION_DIM = NUM_JOINTS * 6
-BODY_VELOCITY_DIM = NUM_JOINTS * 3
-BODY_CONTINUOUS_DIM = BODY_POSITION_DIM + BODY_ROTATION_DIM + BODY_VELOCITY_DIM
-BODY_CONTACT_DIM = 4
-BODY_DIM = BODY_CONTINUOUS_DIM + BODY_CONTACT_DIM
-CONTRACT_VERSION = "body265-v1"
+from utils.motion_process import (
+    BODY_CONTACT_DIM,
+    BODY_CONTINUOUS_DIM,
+    BODY_DIM,
+    BODY_POSITION_DIM,
+    BODY_ROTATION_DIM,
+    BODY_VELOCITY_DIM,
+    LOCAL_ROOT_DIM,
+    NUM_JOINTS,
+    ROOT_DIM,
+)
+from utils.token_frame import FRAMES_PER_TOKEN, require_aligned_frame_count
 
 
 def _require(name: str, value: torch.Tensor, shape_tail: tuple[int, ...]) -> None:
@@ -48,8 +48,7 @@ class VAEInput:
         if self.body_motion.shape[:2] != self.root_motion.shape[:2]:
             raise ValueError("body_motion and root_motion must share [B,F]")
         batch, frames = self.body_motion.shape[:2]
-        if frames % FRAMES_PER_TOKEN:
-            raise ValueError("frame length must be divisible by four")
+        require_aligned_frame_count(frames)
         if tuple(self.frame_valid_mask.shape) != (batch, frames):
             raise ValueError("frame_valid_mask must be [B,F]")
         if self.frame_valid_mask.dtype != torch.bool:
@@ -108,21 +107,19 @@ class VAEPrediction:
 
 @dataclass(frozen=True)
 class VAEDecoderState:
-    """Per-session causal decoder caches; no cache lives on the module."""
+    """Explicit causal decoder caches; no cache lives on the module."""
 
     caches: tuple[tuple[torch.Tensor, torch.Tensor], ...]
-    token_index: int = 0
 
     def clone(self) -> "VAEDecoderState":
         return VAEDecoderState(
-            tuple((first.clone(), second.clone()) for first, second in self.caches),
-            int(self.token_index),
+            tuple((first.clone(), second.clone()) for first, second in self.caches)
         )
 
 
 __all__ = [
     "BODY_CONTACT_DIM", "BODY_CONTINUOUS_DIM", "BODY_DIM", "BODY_POSITION_DIM",
-    "BODY_ROTATION_DIM", "BODY_VELOCITY_DIM", "CONTRACT_VERSION",
-    "FRAMES_PER_TOKEN", "LOCAL_ROOT_DIM", "NUM_JOINTS", "ROOT_DIM",
+    "BODY_ROTATION_DIM", "BODY_VELOCITY_DIM",
+    "LOCAL_ROOT_DIM", "NUM_JOINTS", "ROOT_DIM",
     "BodyPrediction", "VAEDecoderState", "VAEInput", "VAEPosterior", "VAEPrediction",
 ]

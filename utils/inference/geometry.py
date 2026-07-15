@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from utils.token_frame import FRAMES_PER_TOKEN
+
+
 def project_point_to_polyline(
     point_xyz: np.ndarray, waypoints_xyz: np.ndarray
 ) -> tuple[np.ndarray, int, float]:
@@ -275,7 +278,7 @@ def estimate_token_step_distance(
     if frame_steps.size == 0:
         return default
     recent = frame_steps[-min(12, frame_steps.size):]
-    token_step = float(np.median(recent) * 4.0)
+    token_step = float(np.median(recent) * FRAMES_PER_TOKEN)
     return float(np.clip(token_step, min_step, max_step))
 
 

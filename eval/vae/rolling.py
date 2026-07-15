@@ -1,4 +1,4 @@
-"""Run fixed-history/future rolling-window VAE reconstruction."""
+"""Run finite-history replay rolling VAE reconstruction."""
 
 from .evaluate_reconstruction import load_task_config, run
 

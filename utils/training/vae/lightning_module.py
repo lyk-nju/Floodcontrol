@@ -2,10 +2,32 @@
 
 from __future__ import annotations
 
+import torch
+
 from utils.conditions.vae import VAEPrediction, VAEInput
 from utils.training.lightning_module import BasicLightningModule
 
+from .checkpoint import PHYSICAL_STATISTIC_BUFFERS
 from .losses import VAELoss
+
+
+def validate_resume_checkpoint(
+    model,
+    checkpoint,
+) -> None:
+    state = checkpoint.get("state_dict")
+    if not isinstance(state, dict):
+        raise ValueError("VAE resume checkpoint is missing state_dict")
+    configured = model.state_dict()
+    for name in PHYSICAL_STATISTIC_BUFFERS:
+        saved = state.get(name)
+        if not torch.is_tensor(saved) or not torch.equal(
+            saved.detach().cpu(), configured[name].detach().cpu()
+        ):
+            raise RuntimeError(
+                f"VAE_RESUME_STATISTICS_MISMATCH: checkpoint buffer {name!r} "
+                "does not match the configured motion statistics"
+            )
 
 
 class VAELightningModule(BasicLightningModule):
@@ -16,6 +38,14 @@ class VAELightningModule(BasicLightningModule):
             body_cont_std=self.model.body_cont_std,
             **dict(cfg.loss),
         )
+
+    def on_load_checkpoint(self, checkpoint) -> None:
+        validate_resume_checkpoint(self.model, checkpoint)
+        # Existing training checkpoints stored placeholder latent statistics.
+        # They are not model state anymore and must not enter resumed training.
+        checkpoint["state_dict"].pop("latent_mean", None)
+        checkpoint["state_dict"].pop("latent_std", None)
+        super().on_load_checkpoint(checkpoint)
 
     @staticmethod
     def _create_input(batch) -> VAEInput:
@@ -63,4 +93,4 @@ class VAELightningModule(BasicLightningModule):
         return losses
 
 
-__all__ = ["VAELightningModule"]
+__all__ = ["VAELightningModule", "validate_resume_checkpoint"]

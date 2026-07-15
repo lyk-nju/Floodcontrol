@@ -10,14 +10,14 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from utils.local_frame import (
-    transform_xz_local_delta_to_world,
+from utils.coordinate_transform import (
+    rotate_vectors_local_to_world,
     wrap_angle,
 )
 from utils.token_frame import (
-    frame_idx_to_token_idx,
+    frame_index_to_token_index,
     token_range_to_frame_slice,
-    token_start_frame,
+    token_index_to_frame_start,
 )
 
 log = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ def advance_head_from_body_window(
         )
         return head_state
 
-    delta_xz_world = transform_xz_local_delta_to_world(
+    delta_xz_world = rotate_vectors_local_to_world(
         delta_xz_local,
         body_anchor_state.world_yaw,
     )
@@ -237,7 +237,6 @@ def committed_frame_slice(
     head_commit_idx: int,
     body_anchor_commit_idx: int,
     committed_tokens: int,
-    frames_per_token: int = 4,
 ) -> slice:
     """Committed body-output frame slice in body-window-local coordinates."""
     relative_start_token = int(head_commit_idx) - int(body_anchor_commit_idx)
@@ -251,7 +250,6 @@ def committed_frame_slice(
     return token_range_to_frame_slice(
         relative_start_token,
         int(committed_tokens),
-        int(frames_per_token),
     )
 
 
@@ -268,7 +266,7 @@ def recovery_root_state_to_world(
         dtype=torch.float32,
         device=anchor_xz.device,
     )
-    world_xz = anchor_xz + transform_xz_local_delta_to_world(local_xz, anchor_yaw)
+    world_xz = anchor_xz + rotate_vectors_local_to_world(local_xz, anchor_yaw)
     local_yaw = torch.as_tensor(
         -2.0 * float(recovery.r_rot_ang_accum),
         dtype=torch.float32,
@@ -287,14 +285,13 @@ def append_timeline_state_at_token_start_frame(
     recovery: Any,
     session_anchor_state: RootFrameState | None = None,
     source: str = "stream_recovery",
-    frames_per_token: int = 4,
 ) -> bool:
     """Append recovered root state when ``frame_idx`` is a token start frame."""
     frame_idx = int(frame_idx)
     if frame_idx <= 0:
         return False
-    commit_idx = frame_idx_to_token_idx(frame_idx, frames_per_token)
-    if token_start_frame(commit_idx, frames_per_token) != frame_idx:
+    commit_idx = frame_index_to_token_index(frame_idx)
+    if token_index_to_frame_start(commit_idx) != frame_idx:
         return False
     if commit_idx <= timeline.head.commit_idx:
         return False

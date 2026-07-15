@@ -13,30 +13,28 @@ from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
 
 from utils.initialize import (
-    get_shared_run_time,
+    get_shared_run_timestamp,
     load_config,
-    save_config_and_codes,
+    save_run_snapshot,
 )
 from utils.training.vae import VAELightningModule, create_dataloaders
 
 
 def _validate_training_config(cfg) -> None:
-    if not cfg.model.params.get("motion_stats_path") and not cfg.model.params.get(
-        "allow_identity_statistics", False
-    ):
+    if not cfg.model.params.get("motion_stats_path"):
         raise RuntimeError(
             "MOTION_STATISTICS_REQUIRED: compute train-split statistics before real VAE training"
         )
 
 
 def _create_run_directory(cfg) -> tuple[str, Path]:
-    run_time = get_shared_run_time(cfg.save_dir)
+    run_time = get_shared_run_timestamp(cfg.save_dir)
     save_dir = Path(cfg.save_dir) / f"{run_time}_{cfg.exp_name}"
     save_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.update(cfg.config, "save_dir", str(save_dir))
     OmegaConf.update(cfg.config, "run_time", run_time)
     rank_zero_info(f"Save dir: {save_dir}, exp_name: {cfg.exp_name}")
-    save_config_and_codes(cfg, str(save_dir))
+    save_run_snapshot(cfg, save_dir)
     return run_time, save_dir
 
 

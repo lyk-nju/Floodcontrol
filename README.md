@@ -12,13 +12,13 @@ root_motion + latent_motion
 当前仓库已经完成新版模型核心里程碑：
 
 - strict `4 frames / token` 时间协议；
-- body-only causal VAE核心、body265 codec、分组loss和显式`VAEDecoderState`已经落地；
+- body-only causal VAE核心、body265 codec、分组loss和仅含cache的显式`VAEDecoderState`已经落地；
 - `HybridMotion`、typed condition、Root/Body non-causal LDF和constraint CFG已经落地；
 - `generate/stream_generate/stream_generate_step`已经使用显式Hybrid流式状态；
 - HumanML3D/BABEL的独立body265 artifact、联合statistics与同构multi-dataset训练入口；
 - 分主题架构文档和契约测试。
 
-旧的附加控制网络、外置轨迹编码器和外置root planner已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、唯一`humanml265`转换器、合成张量流式decode和LDF heading bridge。第一版HumanML-only VAE已完成300k steps并导出EMA encoder+EMA decoder tokenizer；本地`HumanML3D_motion`、`BABEL_motion`和VAE-owned statistics已升级为converter/FPS/source-manifest强校验。真实LDF训练采用冻结EMA encoder在线产生deterministic `mu`，仍需encoder context sampler、latent statistics和hybrid batch接线；Web生成仍需commit-time decoder事务接线。
+旧的附加控制网络、外置轨迹编码器、外置root planner以及263D/trajectory7 runtime已经从新版仓库物理删除。当前里程碑保证hybrid LDF与BodyVAE模型核心、唯一`humanml265`离线转换器、root5/body265运行时motion API、合成张量流式decode和LDF heading bridge。HumanML3D/BABEL Dataset现在只返回统一完整sample，VAE与LDF各自在training data层构造crop、context与mask。第一版HumanML-only VAE已完成300k steps；训练、评测与后续LDF通过同一个公共函数从训练checkpoint加载EMA encoder+decoder。motion与latent statistics使用普通NPZ数组。LDF encoder context sampler已落地，真实训练仍需frozen online encoder与HybridMotion batch接线；Web生成仍需commit-time decoder接线。
 
 ## 当前可验证范围
 

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Summarize HumanML3D sample difficulty and split into bins.
+"""Summarize root5/body265 artifact trajectory difficulty and split bins.
 
 This script scans a HumanML3D metadata list (e.g. train.txt / test_min.txt),
-loads per-sample motion features and trajectory features, computes a few simple
+loads per-sample physical root motion, computes a few simple
 trajectory difficulty metrics, and writes a ranked table plus optional bin lists.
 
 Expected directory layout (same as FloodNet datasets):
-  <dataset_root>/new_joint_vecs/<name>.npy
-  <dataset_root>/TOKENS_.../<name>.npy
-  <dataset_root>/texts/<name>.txt
+  <dataset_root>/artifacts/<name>.npz
 
 Usage example:
   python tools/summarize_difficulty.py \
@@ -26,24 +24,24 @@ import numpy as np
 
 from pathlib import Path
 from typing import Dict, List
-from utils.motion_process import extract_root_trajectory_263, extract_root_trajectory_length
-
-
-def load_feature(path: Path) -> np.ndarray:
-    feat = np.load(path)
-    if np.isnan(feat).any():
+def load_root_motion(path: Path) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as data:
+        root = np.asarray(data["root_motion"], dtype=np.float32)
+    if root.ndim != 2 or root.shape[-1] != 5:
+        raise ValueError(f"root_motion must be [F,5] in {path}")
+    if not np.isfinite(root).all():
         raise ValueError(f"NaN values found in {path}")
-    return feat
+    return root
 
 
 def compute_metrics(
-    feature: np.ndarray,
+    root_motion: np.ndarray,
     min_path_length: float,
     min_speed_std: float,
 ) -> Dict[str, float]:
-    traj = extract_root_trajectory_263(feature)
+    traj = root_motion[:, :3]
     xz = traj[:, [0, 2]]
-    traj_length = extract_root_trajectory_length(feature, xy_only=True)
+    traj_length = float(np.linalg.norm(np.diff(xz, axis=0), axis=-1).sum())
     if len(xz) < 2:
         return {
             "traj_length": float(len(xz)),
@@ -140,7 +138,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta", required=True, help="Path to HumanML3D meta text file")
     parser.add_argument("--out", required=True, help="Output json path")
-    parser.add_argument("--feature-path", default="new_joint_vecs", help="Relative feature dir under dataset root")
+    parser.add_argument("--artifact-path", default="artifacts", help="Relative artifact dir under dataset root")
     parser.add_argument("--bins", default="easy,medium,hard", help="Comma-separated difficulty bins")
     parser.add_argument("--hard-top-ratio", type=float, default=0.3, help="Top ratio to mark as hard")
     parser.add_argument("--easy-bottom-ratio", type=float, default=0.3, help="Bottom ratio to mark as easy")
@@ -151,7 +149,7 @@ def main() -> None:
 
     meta = Path(args.meta).resolve()
     dataset_root = meta.parent
-    feature_dir = dataset_root / args.feature_path
+    artifact_dir = dataset_root / args.artifact_path
     names = [line.strip() for line in meta.read_text().splitlines() if line.strip()]
 
     records: List[Dict[str, float]] = []
@@ -159,17 +157,17 @@ def main() -> None:
     filtered_missing = 0
     filtered_error = 0
     for name in names:
-        feat_path = feature_dir / f"{name}.npy"
-        if not feat_path.exists():
+        artifact_path = artifact_dir / f"{name}.npz"
+        if not artifact_path.exists():
             filtered_missing += 1
             continue
         try:
-            feat = load_feature(feat_path)
-            if feat.shape[0] > args.max_frames:
+            root_motion = load_root_motion(artifact_path)
+            if root_motion.shape[0] > args.max_frames:
                 filtered_long += 1
                 continue
             metrics = compute_metrics(
-                feat,
+                root_motion,
                 min_path_length=args.min_path_length,
                 min_speed_std=args.min_speed_std,
             )

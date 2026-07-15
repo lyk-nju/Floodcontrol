@@ -1,25 +1,31 @@
 import torch
 
+from metrics.stream import (
+    compute_stream_boundary_metrics,
+    compute_stream_vs_offline_metrics,
+)
 from eval.vae.evaluate_reconstruction import (
     MotionSample,
+    ReconstructionResult,
     _output_paths,
-    body_to_global_joints,
     create_rolling_window,
     reconstruction_metrics,
     rolling_reconstruct,
     stream_reconstruct,
 )
 from models.vae_wan_1d import BodyVAE
+from utils.conditions.vae import BodyPrediction
+from tests.vae_helpers import make_vae
+from utils.motion_process import recover_joint_positions
 
 
 def _model() -> BodyVAE:
-    return BodyVAE(
+    return make_vae(
         latent_dim=8,
         hidden_dim=16,
         encoder_layers=1,
         decoder_layers=1,
-        allow_identity_statistics=True,
-        require_latent_statistics=False,
+        with_latent_stats=False,
     ).eval()
 
 
@@ -32,7 +38,7 @@ def _sample(frames: int = 12) -> MotionSample:
     body[:, 261:] = torch.randint(0, 2, (frames, 4)).float()
     return MotionSample(
         sample_id="sample",
-        dataset="HumanML3D_motion",
+        dataset="HumanML3D",
         root_motion=root,
         body_motion=body,
         body_feature_valid_mask=torch.ones_like(body, dtype=torch.bool),
@@ -59,14 +65,33 @@ def test_stream_reconstruction_uses_deterministic_mu_and_matches_offline():
     assert metrics["stream_offline_max_abs"] <= 1e-5
 
 
-def test_body_to_global_joints_uses_explicit_root_xz_and_global_height():
+def test_recover_joint_positions_uses_explicit_root_xz_and_global_height():
     root = torch.tensor([[2.0, 1.2, -3.0, 1.0, 0.0]])
     body = torch.zeros(1, 265)
     body[0, :3] = torch.tensor([0.5, 0.8, -0.25])
-    joints = body_to_global_joints(root, body)
+    joints = recover_joint_positions(root, body)
     assert joints.shape == (1, 22, 3)
     assert torch.equal(joints[0, 0], torch.tensor([2.0, 1.2, -3.0]))
     assert torch.equal(joints[0, 1], torch.tensor([2.5, 0.8, -3.25]))
+
+
+def test_stream_metrics_consume_explicit_root_and_body_motion():
+    sample = _sample(frames=12)
+    boundary = compute_stream_boundary_metrics(
+        sample.root_motion,
+        sample.body_motion,
+        [4, 8, 12],
+    )
+    assert boundary["n_boundaries"] == 2
+    assert abs(boundary["root_jump_mean"] - 0.01) < 1e-7
+    parity = compute_stream_vs_offline_metrics(
+        sample.root_motion,
+        sample.body_motion,
+        sample.root_motion,
+        sample.body_motion,
+    )
+    assert parity["feature_l2_mean"] == 0.0
+    assert parity["root_ade"] == 0.0
 
 
 def test_rolling_window_has_fixed_history_and_current_contract():
@@ -115,13 +140,54 @@ def test_rolling_reconstruction_replays_finite_history_and_checks_cache_parity()
     assert torch.equal(rolling.rolling_trace["commit_token"], torch.arange(11))
     assert rolling.rolling_trace["timeline_position_ids"].shape == (11, 2)
     assert rolling.rolling_trace["history_mask"][0].sum() == 0
-    assert rolling.rolling_trace["history_mask"][1:].all()
-    assert rolling.rolling_trace["current_mask"].all()
+    assert rolling.rolling_trace["history_mask"][1:, 0].all()
+    assert not rolling.rolling_trace["history_mask"][:, 1].any()
+    assert rolling.rolling_trace["current_mask"][:, 1].all()
+    assert not rolling.rolling_trace["current_mask"][:, 0].any()
     metrics = reconstruction_metrics(sample, rolling)
     assert metrics["history_tokens"] == 1
     assert metrics["rolling_steps"] == 11
     assert metrics["rolling_stream_max_abs"] > 0
     assert metrics["cache_window_offline_max_abs"] <= 1e-5
+
+
+def test_rolling_full_decoder_context_matches_persistent_stream():
+    model = _model()
+    sample = _sample(frames=44)
+    result = rolling_reconstruct(
+        model,
+        sample,
+        device="cpu",
+        history_tokens=model.decoder_context_tokens,
+        commit_tokens=1,
+    )
+    assert result.rolling_reference_max_abs <= 1e-5
+
+
+def test_reconstruction_skating_metrics_use_position_transitions_and_masks():
+    sample = _sample(frames=12)
+    sample.body_motion.zero_()
+    sample.body_motion[:, 261] = 1.0
+    continuous = torch.zeros(1, 12, 261)
+    continuous[0, :, :63].reshape(12, 21, 3)[:, 6, 0] = (
+        torch.arange(12) * 0.1
+    )
+    logits = torch.full((1, 12, 4), -100.0)
+    logits[..., 0] = 100.0
+    body = BodyPrediction(continuous, logits)
+    result = ReconstructionResult(
+        protocol="test",
+        posterior_mu=torch.zeros(1, 3, 8),
+        local_root_motion=torch.zeros(1, 3, 4, 4),
+        local_root_valid_mask=torch.ones(1, 3, 4, 4, dtype=torch.bool),
+        streamed_body=body,
+        offline_body=body,
+        stream_offline_max_abs=0.0,
+    )
+    metrics = reconstruction_metrics(sample, result)
+    assert metrics["gt_contact_position_skating_mps"] > 0
+    assert metrics["predicted_contact_position_skating_mps"] > 0
+    assert metrics["gt_contact_velocity_feature_mps"] == 0
 
 
 def test_output_layout_separates_original_and_reconstruction(tmp_path):

@@ -1,0 +1,96 @@
+"""Build minimal root5/body265 NPZ files from HumanML-style 263D motion."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import shutil
+
+import numpy as np
+import torch
+
+from tools.convert_motion_263_to_265 import (
+    HUMANML_DIM,
+    convert_motion_263_to_265,
+)
+from utils.motion_process import BODY_DIM, ROOT_DIM
+from utils.token_frame import FRAMES_PER_TOKEN, aligned_frame_floor
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(value)
+    temporary.replace(path)
+
+
+def atomic_copy(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def artifact_is_current(source: Path, target: Path, *, fps: float) -> bool:
+    """Return whether a usable minimal target already exists.
+
+    ``source`` and ``fps`` remain in the signature so preprocessing worker code
+    stays simple.  Dataset products intentionally carry no source hashes or
+    converter/runtime version identity.
+    """
+
+    del source, fps
+    if not target.is_file():
+        return False
+    try:
+        with np.load(target, allow_pickle=False) as data:
+            return (
+                data["root_motion"].ndim == 2
+                and data["root_motion"].shape[-1] == ROOT_DIM
+                and data["body_motion"].ndim == 2
+                and data["body_motion"].shape[-1] == BODY_DIM
+                and data["body_feature_valid_mask"].shape == data["body_motion"].shape
+                and data["root_motion"].shape[0] == data["body_motion"].shape[0]
+            )
+    except (KeyError, OSError, ValueError):
+        return False
+
+
+def process_file(source: Path, target: Path, *, fps: float = 20.0) -> dict:
+    feature = np.load(source, allow_pickle=False)
+    if feature.ndim != 2 or feature.shape[-1] != HUMANML_DIM:
+        raise ValueError(
+            f"HumanML-style source must be [F,{HUMANML_DIM}], "
+            f"got {feature.shape} at {source}"
+        )
+    if not np.isfinite(feature).all():
+        raise ValueError(f"HumanML-style source contains non-finite values at {source}")
+    usable = aligned_frame_floor(feature.shape[0])
+    if usable < FRAMES_PER_TOKEN:
+        raise ValueError(f"{source} has fewer than four usable frames")
+    motion = torch.from_numpy(feature[:usable]).float()
+    root, body, feature_valid = convert_motion_263_to_265(motion, fps=fps)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.{os.getpid()}.tmp.npz")
+    try:
+        np.savez_compressed(
+            temporary,
+            root_motion=root.numpy(),
+            body_motion=body.numpy(),
+            body_feature_valid_mask=feature_valid.numpy(),
+        )
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"frames": usable}
+
+
+__all__ = [
+    "artifact_is_current",
+    "atomic_copy",
+    "atomic_write_text",
+    "process_file",
+]

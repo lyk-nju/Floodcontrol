@@ -19,37 +19,34 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from datasets.babel import load_babel_records
-from datasets.humanml3d import load_humanml3d_records
+from datasets.babel import BABELDataset
+from datasets.humanml3d import HumanML3DDataset
 from models.vae_wan_1d import BodyVAE
 from utils.conditions.vae import (
     BODY_CONTINUOUS_DIM,
-    BODY_DIM,
     BODY_POSITION_DIM,
     BODY_ROTATION_DIM,
-    CONTRACT_VERSION,
-    FRAMES_PER_TOKEN,
     NUM_JOINTS,
-    ROOT_DIM,
     BodyPrediction,
 )
-from utils.motion_representation import (
-    MOTION_CONVERTER_VERSION,
-    derive_patched_local_root,
-    rotation_6d_to_matrix,
+from utils.token_frame import (
+    FRAMES_PER_TOKEN,
+    frame_count_to_token_count,
 )
-from utils.training.vae.checkpoint import load_ema_checkpoint
-from utils.visualization.skeleton import (
-    get_humanml3d_chains,
-    render_simple_skeleton_video,
+from utils.motion_process import (
+    recover_joint_positions,
+    recover_local_root,
+    rotation_to_matrix,
 )
+from utils.training.vae.checkpoint import load_vae_checkpoint
+from utils.visualization import render_joint_video
 
 
 STREAM_PROTOCOL = "deterministic-mu-stream-decode-v1"
 ROLLING_PROTOCOL = "deterministic-mu-history-replay-v1"
-DATASET_LOADERS = {
-    "humanml3d": load_humanml3d_records,
-    "babel": load_babel_records,
+DATASET_TYPES = {
+    "humanml3d": HumanML3DDataset,
+    "babel": BABELDataset,
 }
 
 
@@ -99,59 +96,17 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
     path.write_text(json.dumps(_json_ready(payload), indent=2, sort_keys=True) + "\n")
 
 
-def _read_scalar(data, name: str, path: Path):
-    if name not in data:
-        raise ValueError(f"motion artifact is missing {name!r} in {path}")
-    value = np.asarray(data[name])
-    if value.shape != ():
-        raise ValueError(f"motion artifact {name!r} must be scalar in {path}")
-    return value.item()
+def load_motion_sample(sample: Mapping[str, object], *, expected_fps: float) -> MotionSample:
+    """Adapt one already validated full Dataset sample for reconstruction."""
 
-
-def load_motion_sample(record: Mapping[str, object], *, expected_fps: float) -> MotionSample:
-    path = Path(record["artifact"])
-    with np.load(path, allow_pickle=False) as data:
-        if str(_read_scalar(data, "contract_version", path)) != CONTRACT_VERSION:
-            raise ValueError(f"motion artifact contract version mismatch in {path}")
-        if str(_read_scalar(data, "converter_version", path)) != MOTION_CONVERTER_VERSION:
-            raise ValueError(f"motion artifact converter version mismatch in {path}")
-        fps = float(_read_scalar(data, "fps", path))
-        root = torch.from_numpy(data["root_motion"]).float()
-        body = torch.from_numpy(data["body_motion"]).float()
-        feature_valid = torch.from_numpy(data["body_feature_valid_mask"]).bool()
-        previous_root = (
-            torch.from_numpy(data["previous_root_frame"]).float()
-            if "previous_root_frame" in data
-            else None
-        )
-    if not np.isclose(fps, expected_fps, rtol=0.0, atol=1e-6):
-        raise ValueError(
-            f"motion artifact FPS mismatch in {path}: expected {expected_fps}, got {fps}"
-        )
-    if root.ndim != 2 or tuple(root.shape[1:]) != (ROOT_DIM,):
-        raise ValueError(f"root_motion must be [F,{ROOT_DIM}] in {path}")
-    if body.ndim != 2 or tuple(body.shape[1:]) != (BODY_DIM,):
-        raise ValueError(f"body_motion must be [F,{BODY_DIM}] in {path}")
-    if root.shape[0] != body.shape[0] or root.shape[0] % FRAMES_PER_TOKEN:
-        raise ValueError(f"motion artifact frame contract mismatch in {path}")
-    if tuple(feature_valid.shape) != tuple(body.shape):
-        raise ValueError(f"body_feature_valid_mask must match body_motion in {path}")
-    if previous_root is not None and tuple(previous_root.shape) != (ROOT_DIM,):
-        raise ValueError(f"previous_root_frame must be [{ROOT_DIM}] in {path}")
-    if not all(
-        bool(torch.isfinite(value).all())
-        for value in (root, body, previous_root)
-        if value is not None
-    ):
-        raise ValueError(f"motion artifact contains non-finite values in {path}")
     return MotionSample(
-        sample_id=str(record["name"]),
-        dataset=str(record["dataset"]),
-        root_motion=root,
-        body_motion=body,
-        body_feature_valid_mask=feature_valid,
-        previous_root_frame=previous_root,
-        fps=fps,
+        sample_id=str(sample["name"]),
+        dataset=str(sample["dataset"]),
+        root_motion=sample["root_motion"],
+        body_motion=sample["body_motion"],
+        body_feature_valid_mask=sample["body_feature_valid_mask"],
+        previous_root_frame=None,
+        fps=float(expected_fps),
     )
 
 
@@ -178,7 +133,7 @@ def stream_reconstruct(
         else None
     )
     posterior_mu = model.encode(body, frame_valid).mu
-    local_root, local_valid = derive_patched_local_root(
+    local_root, local_valid = recover_local_root(
         root,
         previous_root,
         fps=sample.fps,
@@ -189,12 +144,11 @@ def stream_reconstruct(
     continuous_chunks = []
     contact_chunks = []
     for token_index in range(posterior_mu.shape[1]):
-        state, prediction = model.stream_decode_step(
+        state, prediction = model.decode_step(
             posterior_mu[:, token_index : token_index + 1],
             local_root[:, token_index : token_index + 1],
+            local_valid[:, token_index : token_index + 1],
             state,
-            local_root_valid_mask=local_valid[:, token_index : token_index + 1],
-            normalized_latent=False,
         )
         continuous_chunks.append(prediction.continuous_body)
         contact_chunks.append(prediction.contact_logits)
@@ -211,8 +165,6 @@ def stream_reconstruct(
             f"offline/stream decoder parity failed for {sample.dataset}/{sample.sample_id}: "
             f"max_abs={max_abs:.8g}, tolerance={parity_atol:.8g}"
         )
-    if state.token_index != posterior_mu.shape[1]:
-        raise AssertionError("decoder state token index does not match committed tokens")
     return ReconstructionResult(
         protocol=STREAM_PROTOCOL,
         posterior_mu=posterior_mu.cpu(),
@@ -314,7 +266,7 @@ def rolling_reconstruct(
         else None
     )
     posterior_mu = model.encode(body, frame_valid).mu
-    local_root, local_valid = derive_patched_local_root(
+    local_root, local_valid = recover_local_root(
         root,
         previous_root,
         fps=sample.fps,
@@ -330,12 +282,11 @@ def rolling_reconstruct(
         1, device=device, dtype=posterior_mu.dtype
     )
     for token_index in range(posterior_mu.shape[1]):
-        reference_state, reference_prediction = model.stream_decode_step(
+        reference_state, reference_prediction = model.decode_step(
             posterior_mu[:, token_index : token_index + 1],
             local_root[:, token_index : token_index + 1],
+            local_valid[:, token_index : token_index + 1],
             reference_state,
-            local_root_valid_mask=local_valid[:, token_index : token_index + 1],
-            normalized_latent=False,
         )
         reference_continuous.append(reference_prediction.continuous_body)
         reference_contacts.append(reference_prediction.contact_logits)
@@ -382,12 +333,11 @@ def rolling_reconstruct(
         state = model.init_decoder_state(1, device=device, dtype=posterior_mu.dtype)
         prediction = None
         for replay_index in range(history_start, window_end):
-            state, prediction = model.stream_decode_step(
+            state, prediction = model.decode_step(
                 posterior_mu[:, replay_index : replay_index + 1],
                 local_root[:, replay_index : replay_index + 1],
+                local_valid[:, replay_index : replay_index + 1],
                 state,
-                local_root_valid_mask=local_valid[:, replay_index : replay_index + 1],
-                normalized_latent=False,
             )
         if prediction is None:
             raise AssertionError("rolling replay did not decode the current token")
@@ -465,19 +415,6 @@ def rolling_reconstruct(
     )
 
 
-def body_to_global_joints(root_motion: torch.Tensor, body_motion: torch.Tensor) -> torch.Tensor:
-    if root_motion.ndim != 2 or tuple(root_motion.shape[1:]) != (ROOT_DIM,):
-        raise ValueError("root_motion must be [F,5]")
-    if body_motion.ndim != 2 or body_motion.shape[1] < BODY_POSITION_DIM:
-        raise ValueError("body_motion must contain non-root joint positions")
-    if root_motion.shape[0] != body_motion.shape[0]:
-        raise ValueError("root_motion and body_motion must share frame length")
-    non_root = body_motion[:, :BODY_POSITION_DIM].reshape(-1, NUM_JOINTS - 1, 3).clone()
-    non_root[..., 0] += root_motion[:, None, 0]
-    non_root[..., 2] += root_motion[:, None, 2]
-    return torch.cat([root_motion[:, None, :3], non_root], dim=1)
-
-
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> float:
     expanded = mask.expand_as(value)
     if not bool(expanded.any()):
@@ -496,10 +433,10 @@ def reconstruction_metrics(
     velocity_start = BODY_POSITION_DIM + BODY_ROTATION_DIM
     velocity_error = (predicted[:, velocity_start:] - target[:, velocity_start:BODY_CONTINUOUS_DIM]).abs()
 
-    pred_rotation = rotation_6d_to_matrix(
+    pred_rotation = rotation_to_matrix(
         predicted[:, BODY_POSITION_DIM:velocity_start].reshape(-1, NUM_JOINTS, 6)
     )
-    target_rotation = rotation_6d_to_matrix(
+    target_rotation = rotation_to_matrix(
         target[:, BODY_POSITION_DIM:velocity_start].reshape(-1, NUM_JOINTS, 6)
     )
     relative = pred_rotation.transpose(-1, -2) @ target_rotation
@@ -518,26 +455,40 @@ def reconstruction_metrics(
     recall = true_positive / max(true_positive + false_negative, 1)
 
     foot_indices = torch.tensor((7, 10, 8, 11))
-    predicted_velocity = predicted[:, velocity_start:].reshape(-1, NUM_JOINTS, 3)
-    target_velocity = target[:, velocity_start:BODY_CONTINUOUS_DIM].reshape(
-        -1, NUM_JOINTS, 3
+    reconstructed_joints = recover_joint_positions(
+        sample.root_motion, predicted
     )
+    reconstructed_foot_positions = reconstructed_joints.index_select(
+        1, foot_indices
+    )
+    position_foot_speed = predicted.new_zeros(target.shape[0], 4)
+    position_foot_speed[1:] = (
+        reconstructed_foot_positions[1:]
+        - reconstructed_foot_positions[:-1]
+    ).norm(dim=-1) * float(sample.fps)
+    foot_position_valid = feature_valid[:, :BODY_POSITION_DIM].reshape(
+        -1, NUM_JOINTS - 1, 3
+    ).all(dim=-1).index_select(1, foot_indices - 1)
+    transition_valid = torch.zeros_like(foot_position_valid)
+    transition_valid[1:] = foot_position_valid[1:] & foot_position_valid[:-1]
+    contact_valid = feature_valid[:, BODY_CONTINUOUS_DIM:]
+    position_skating_valid = transition_valid & contact_valid
+
+    predicted_velocity = predicted[:, velocity_start:].reshape(-1, NUM_JOINTS, 3)
+    velocity_valid = feature_valid[:, velocity_start:BODY_CONTINUOUS_DIM].reshape(
+        -1, NUM_JOINTS, 3
+    ).all(dim=-1).index_select(1, foot_indices)
     contact_probability = result.streamed_body.contact_logits[0].sigmoid()
-    reconstructed_skating = (
-        contact_probability
-        * predicted_velocity.index_select(1, foot_indices).norm(dim=-1)
-    ).mean()
-    original_skating = (
-        target_contact.float()
-        * target_velocity.index_select(1, foot_indices).norm(dim=-1)
-    ).mean()
+    predicted_velocity_speed = predicted_velocity.index_select(
+        1, foot_indices
+    ).norm(dim=-1)
 
     metrics = {
         "protocol": result.protocol,
         "dataset": sample.dataset,
         "sample_id": sample.sample_id,
         "frames": int(target.shape[0]),
-        "tokens": int(target.shape[0] // FRAMES_PER_TOKEN),
+        "tokens": frame_count_to_token_count(target.shape[0]),
         "position_mae_m": _masked_mean(
             position_error, feature_valid[:, :BODY_POSITION_DIM]
         ),
@@ -549,8 +500,18 @@ def reconstruction_metrics(
         "contact_precision": precision,
         "contact_recall": recall,
         "contact_f1": 2.0 * precision * recall / max(precision + recall, 1e-12),
-        "original_skating_mps": float(original_skating),
-        "reconstruction_skating_mps": float(reconstructed_skating),
+        "gt_contact_position_skating_mps": _masked_mean(
+            target_contact.float() * position_foot_speed,
+            position_skating_valid,
+        ),
+        "predicted_contact_position_skating_mps": _masked_mean(
+            contact_probability * position_foot_speed,
+            position_skating_valid,
+        ),
+        "gt_contact_velocity_feature_mps": _masked_mean(
+            target_contact.float() * predicted_velocity_speed,
+            velocity_valid & contact_valid,
+        ),
         "stream_offline_max_abs": result.stream_offline_max_abs,
     }
     if result.reference_stream_body is not None:
@@ -561,7 +522,7 @@ def reconstruction_metrics(
         reference_velocity_error = (
             predicted[:, velocity_start:] - reference[:, velocity_start:]
         ).abs()
-        reference_rotation = rotation_6d_to_matrix(
+        reference_rotation = rotation_to_matrix(
             reference[:, BODY_POSITION_DIM:velocity_start].reshape(
                 -1, NUM_JOINTS, 6
             )
@@ -630,9 +591,11 @@ def _save_sample_outputs(
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    original_joints = body_to_global_joints(sample.root_motion, sample.body_motion)
+    original_joints = recover_joint_positions(
+        sample.root_motion, sample.body_motion
+    )
     reconstructed_continuous = result.streamed_body.continuous_body[0]
-    reconstructed_joints = body_to_global_joints(
+    reconstructed_joints = recover_joint_positions(
         sample.root_motion, reconstructed_continuous
     )
     np.savez_compressed(
@@ -684,14 +647,14 @@ def _save_sample_outputs(
     np.savez_compressed(paths["reconstruction_motion"], **reconstruction_payload)
     _write_json(paths["metrics"], metrics)
     if render_video:
-        chains = get_humanml3d_chains()
-        render_simple_skeleton_video(
-            original_joints.numpy(), chains, str(paths["original_video"]), fps=render_fps
+        render_joint_video(
+            original_joints,
+            paths["original_video"],
+            fps=render_fps,
         )
-        render_simple_skeleton_video(
-            reconstructed_joints.numpy(),
-            chains,
-            str(paths["reconstruction_video"]),
+        render_joint_video(
+            reconstructed_joints,
+            paths["reconstruction_video"],
             fps=render_fps,
         )
     return {name: str(path) for name, path in paths.items()}
@@ -716,7 +679,8 @@ def evaluate_dataset(
     model: BodyVAE,
     *,
     dataset_name: str,
-    dataset_config,
+    dataset_config=None,
+    dataset=None,
     sample_count: int,
     output_root: Path,
     device: torch.device,
@@ -726,20 +690,27 @@ def evaluate_dataset(
     mode: str,
     window_config=None,
 ) -> dict[str, object]:
-    if dataset_name not in DATASET_LOADERS:
-        raise ValueError(f"unsupported VAE evaluation dataset {dataset_name!r}")
-    records = DATASET_LOADERS[dataset_name](
-        [dataset_config.val_meta_path], artifact_path=dataset_config.artifact_path
-    )[:sample_count]
-    if len(records) != sample_count:
+    if dataset is None:
+        if dataset_name not in DATASET_TYPES:
+            raise ValueError(f"unsupported VAE evaluation dataset {dataset_name!r}")
+        if dataset_config is None:
+            raise ValueError("dataset_config is required when dataset is not provided")
+        dataset = DATASET_TYPES[dataset_name](
+            meta_paths=[dataset_config.val_meta_path],
+            split="val",
+            artifact_path=dataset_config.artifact_path,
+            text_path=dataset_config.get("text_path"),
+            fps=model.fps,
+        )
+    if len(dataset) < sample_count:
         raise RuntimeError(
-            f"{dataset_name} val split contains only {len(records)} samples, "
+            f"{dataset_name} val split contains only {len(dataset)} samples, "
             f"expected {sample_count}"
         )
     manifest_samples = []
     all_metrics = []
-    for index, record in enumerate(records):
-        sample = load_motion_sample(record, expected_fps=model.fps)
+    for index in range(sample_count):
+        sample = load_motion_sample(dataset[index], expected_fps=model.fps)
         if mode == "stream":
             result = stream_reconstruct(
                 model, sample, device=device, parity_atol=parity_atol
@@ -772,7 +743,7 @@ def evaluate_dataset(
             {
                 "index": index,
                 "sample_id": sample.sample_id,
-                "source_artifact": str(record["artifact"]),
+                "source_dataset": sample.dataset,
                 "frames": int(sample.body_motion.shape[0]),
                 "outputs": outputs,
             }
@@ -798,10 +769,9 @@ def _load_model(cfg, device: torch.device) -> tuple[BodyVAE, dict[str, object]]:
     model = BodyVAE(
         **OmegaConf.to_container(cfg.model.params, resolve=True),
         motion_stats_path=str(cfg.model.motion_stats_path),
-        require_latent_statistics=False,
     )
-    checkpoint_metadata = load_ema_checkpoint(model, cfg.model.checkpoint_path)
-    return model.eval().to(device), checkpoint_metadata
+    load_vae_checkpoint(model, cfg.model.checkpoint_path)
+    return model.to(device), {"path": str(cfg.model.checkpoint_path), "weights": "ema"}
 
 
 def run(cfg, *, mode: str) -> dict[str, object]:

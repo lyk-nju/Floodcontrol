@@ -10,16 +10,17 @@ from typing import Mapping
 
 import numpy as np
 
-from tools.motion_artifact import (
+from tools.build_motion_artifact import (
     artifact_is_current,
+    atomic_copy,
     atomic_write_text,
     process_file,
 )
-from utils.conditions.vae import CONTRACT_VERSION, FRAMES_PER_TOKEN
-from utils.motion_representation import (
-    HUMANML_DIM,
-    HUMANML_SOURCE_REPRESENTATION,
-    MOTION_CONVERTER_VERSION,
+from tools.convert_motion_263_to_265 import HUMANML_DIM
+from utils.token_frame import (
+    FRAMES_PER_TOKEN,
+    aligned_frame_floor,
+    require_aligned_frame_count,
 )
 
 
@@ -55,7 +56,7 @@ def _inspect_motion(path: Path) -> tuple[int, bool]:
         raise ValueError(
             f"BABEL motion must be [F,{HUMANML_DIM}], got {feature.shape} at {path}"
         )
-    usable = int(feature.shape[0]) // FRAMES_PER_TOKEN * FRAMES_PER_TOKEN
+    usable = aligned_frame_floor(int(feature.shape[0]))
     return usable, bool(np.isfinite(feature).all())
 
 
@@ -87,14 +88,18 @@ def build_dataset(
         if value.is_absolute() or ".." in value.parts:
             raise ValueError(f"{name} must be a relative directory")
     motion_root = source_root / motion_subdir
+    text_root = source_root / "texts"
     if not motion_root.is_dir():
         raise RuntimeError(f"BABEL_DATA_REQUIRED: motion directory not found at {motion_root}")
+    if not text_root.is_dir():
+        raise RuntimeError(f"BABEL text directory not found at {text_root}")
     if output.resolve() == source_root.resolve():
         raise ValueError("output must be separate from the legacy BABEL_streamed root")
 
     min_frames = int(min_frames)
-    if min_frames < FRAMES_PER_TOKEN or min_frames % FRAMES_PER_TOKEN:
+    if min_frames < FRAMES_PER_TOKEN:
         raise ValueError("min_frames must be a positive multiple of four")
+    require_aligned_frame_count(min_frames)
     split_files = dict(split_files or DEFAULT_SPLIT_FILES)
     if not split_files:
         raise ValueError("at least one BABEL split must be configured")
@@ -181,13 +186,15 @@ def build_dataset(
             executor.shutdown(wait=True, cancel_futures=True)
 
     output.mkdir(parents=True, exist_ok=True)
+    for name in unique_names:
+        source_text = text_root / f"{name}.txt"
+        if not source_text.is_file():
+            raise RuntimeError(f"BABEL text file not found at {source_text}")
+        atomic_copy(source_text, output / "texts" / source_text.name)
     for split, names in split_names.items():
         atomic_write_text(output / f"{split}.txt", "".join(f"{name}\n" for name in names))
     summary = {
-        "contract_version": CONTRACT_VERSION,
-        "converter_version": MOTION_CONVERTER_VERSION,
         "source_dataset": "BABEL_streamed",
-        "source_representation": HUMANML_SOURCE_REPRESENTATION,
         "source_root": str(source_root.resolve()),
         "motion_path": str(motion_subdir),
         "artifact_path": str(artifact_subdir),
@@ -201,14 +208,11 @@ def build_dataset(
         },
         "too_short": {name: len(values) for name, values in too_short_by_split.items()},
         "unique_artifacts": len(tasks),
+        "copied_texts": len(unique_names),
         "converted": converted,
         "skipped": skipped,
         "converted_frames": converted_frames,
     }
-    atomic_write_text(
-        output / "build_summary.json",
-        json.dumps(summary, indent=2, sort_keys=True) + "\n",
-    )
     return summary
 
 

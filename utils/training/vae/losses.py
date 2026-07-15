@@ -10,12 +10,12 @@ from utils.conditions.vae import (
     BODY_CONTINUOUS_DIM,
     BODY_POSITION_DIM,
     BODY_ROTATION_DIM,
-    FRAMES_PER_TOKEN,
     NUM_JOINTS,
     VAEInput,
     VAEPrediction,
 )
-from utils.motion_representation import rotation_6d_to_matrix
+from utils.motion_process import rotation_to_matrix
+from utils.token_frame import frame_valid_to_token_valid
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -147,28 +147,47 @@ class VAELoss(nn.Module):
         losses["contact"] = contact_loss
         reconstruction = reconstruction + self.lambda_contact * contact_loss
 
-        velocity_start = BODY_POSITION_DIM + BODY_ROTATION_DIM
-        velocities = predicted[..., velocity_start:].reshape(
-            *predicted.shape[:2], NUM_JOINTS, 3
+        direct_non_root = predicted[..., :BODY_POSITION_DIM].reshape(
+            *predicted.shape[:2], NUM_JOINTS - 1, 3
+        )
+        direct_positions = self._global_positions(
+            inputs.root_motion, direct_non_root
         )
         foot_indices = torch.as_tensor(self.foot_joint_indices, device=predicted.device)
-        foot_speed = velocities.index_select(-2, foot_indices).norm(dim=-1)
-        velocity_valid = feature_mask[..., velocity_start:].reshape(
-            *predicted.shape[:2], NUM_JOINTS, 3
-        ).all(dim=-1).index_select(-1, foot_indices)
-        skating_mask = contact_mask & velocity_valid
+        foot_positions = direct_positions.index_select(-2, foot_indices)
+        foot_speed = predicted.new_zeros(*predicted.shape[:2], len(self.foot_joint_indices))
+        foot_speed[:, 1:] = (
+            foot_positions[:, 1:] - foot_positions[:, :-1]
+        ).norm(dim=-1) * self.fps
+        non_root_foot_indices = foot_indices - 1
+        foot_position_valid = feature_mask[..., :BODY_POSITION_DIM].reshape(
+            *predicted.shape[:2], NUM_JOINTS - 1, 3
+        ).all(dim=-1).index_select(-1, non_root_foot_indices)
+        transition_valid = torch.zeros_like(foot_position_valid)
+        transition_valid[:, 1:] = (
+            foot_position_valid[:, 1:]
+            & foot_position_valid[:, :-1]
+            & inputs.frame_valid_mask[:, 1:, None]
+            & inputs.frame_valid_mask[:, :-1, None]
+        )
+        skating_mask = contact_mask & transition_valid
         skating = _masked_mean(
             contacts * foot_speed,
             skating_mask,
         )
         losses["skating"] = skating
 
+        velocity_start = BODY_POSITION_DIM + BODY_ROTATION_DIM
+        velocities = predicted[..., velocity_start:].reshape(
+            *predicted.shape[:2], NUM_JOINTS, 3
+        )
+
         if self.lambda_geodesic:
-            pred_rot = rotation_6d_to_matrix(
+            pred_rot = rotation_to_matrix(
                 predicted[..., BODY_POSITION_DIM : BODY_POSITION_DIM + BODY_ROTATION_DIM]
                 .reshape(*predicted.shape[:2], NUM_JOINTS, 6)
             )
-            target_rot = rotation_6d_to_matrix(
+            target_rot = rotation_to_matrix(
                 target[..., BODY_POSITION_DIM : BODY_POSITION_DIM + BODY_ROTATION_DIM]
                 .reshape(*target.shape[:2], NUM_JOINTS, 6)
             )
@@ -179,14 +198,8 @@ class VAELoss(nn.Module):
             geodesic = predicted.new_zeros(())
         losses["geodesic"] = geodesic
 
-        need_positions = self.lambda_fk or self.lambda_position_consistency or self.lambda_velocity_consistency
-        if need_positions:
-            direct_non_root = predicted[..., :BODY_POSITION_DIM].reshape(
-                *predicted.shape[:2], NUM_JOINTS - 1, 3
-            )
-            direct_positions = self._global_positions(inputs.root_motion, direct_non_root)
         if self.lambda_fk or self.lambda_position_consistency:
-            pred_rot = rotation_6d_to_matrix(
+            pred_rot = rotation_to_matrix(
                 predicted[..., BODY_POSITION_DIM : BODY_POSITION_DIM + BODY_ROTATION_DIM]
                 .reshape(*predicted.shape[:2], NUM_JOINTS, 6)
             )
@@ -221,9 +234,7 @@ class VAELoss(nn.Module):
             velocity_consistency = predicted.new_zeros(())
         losses["velocity_consistency"] = velocity_consistency
 
-        token_mask = inputs.frame_valid_mask.reshape(
-            inputs.frame_valid_mask.shape[0], -1, FRAMES_PER_TOKEN
-        ).all(dim=-1)
+        token_mask = frame_valid_to_token_valid(inputs.frame_valid_mask)
         kl_element = -0.5 * (
             1 + prediction.posterior.logvar - prediction.posterior.mu.square()
             - prediction.posterior.logvar.exp()

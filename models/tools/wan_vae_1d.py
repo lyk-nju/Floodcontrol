@@ -15,12 +15,11 @@ from utils.conditions.vae import (
     BODY_CONTACT_DIM,
     BODY_CONTINUOUS_DIM,
     BODY_DIM,
-    FRAMES_PER_TOKEN,
     LOCAL_ROOT_DIM,
     BodyPrediction,
-    VAEDecoderState,
     VAEPosterior,
 )
+from utils.token_frame import FRAMES_PER_TOKEN, require_aligned_frame_count
 
 
 class ChannelLayerNorm(nn.Module):
@@ -114,6 +113,7 @@ class CausalBodyVAE(nn.Module):
         # with kernel k contributes k-1 historical tokens, so this is the exact
         # warm-up prefix required when an LDF crop is encoded online.
         self.encoder_context_tokens = int(encoder_layers) * 2 * (int(kernel_size) - 1)
+        self.decoder_context_tokens = int(decoder_layers) * 2 * (int(kernel_size) - 1)
         self.encoder_input = nn.Linear(FRAMES_PER_TOKEN * BODY_DIM, hidden_dim)
         self.encoder_blocks = nn.ModuleList(
             [CausalResidualBlock(hidden_dim, kernel_size=kernel_size, dropout=dropout)
@@ -136,8 +136,7 @@ class CausalBodyVAE(nn.Module):
     def _patch_body(body_motion: torch.Tensor) -> torch.Tensor:
         if body_motion.ndim != 3 or body_motion.shape[-1] != BODY_DIM:
             raise ValueError("body_motion must be [B,F,265]")
-        if body_motion.shape[1] % FRAMES_PER_TOKEN:
-            raise ValueError("frame length must be divisible by four")
+        require_aligned_frame_count(body_motion.shape[1])
         return body_motion.reshape(body_motion.shape[0], -1, FRAMES_PER_TOKEN * BODY_DIM)
 
     def encode(self, normalized_body: torch.Tensor) -> VAEPosterior:
@@ -191,35 +190,40 @@ class CausalBodyVAE(nn.Module):
             hidden = block(hidden)
         return self._project_output(hidden)
 
-    def init_decoder_state(self, batch_size: int, *, device, dtype) -> VAEDecoderState:
-        return VAEDecoderState(
-            tuple(block.init_cache(batch_size, device=device, dtype=dtype)
-                  for block in self.decoder_blocks),
-            token_index=0,
+    def init_decoder_cache(
+        self,
+        batch_size: int,
+        *,
+        device,
+        dtype,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        return tuple(
+            block.init_cache(batch_size, device=device, dtype=dtype)
+            for block in self.decoder_blocks
         )
 
-    def stream_decode_step(
+    def decode_step(
         self,
         latent_token: torch.Tensor,
         normalized_local_root_patch: torch.Tensor,
         local_root_valid_mask: torch.Tensor,
-        state: VAEDecoderState,
-    ) -> tuple[VAEDecoderState, BodyPrediction]:
+        caches: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ) -> tuple[tuple[tuple[torch.Tensor, torch.Tensor], ...], BodyPrediction]:
         if latent_token.ndim != 3 or latent_token.shape[1] != 1:
             raise ValueError("latent_token must be [B,1,D]")
-        if len(state.caches) != len(self.decoder_blocks):
-            raise ValueError("decoder state does not match decoder depth")
+        if len(caches) != len(self.decoder_blocks):
+            raise ValueError("decoder cache does not match decoder depth")
         hidden = self.decoder_input(
             self._decoder_features(
                 latent_token, normalized_local_root_patch, local_root_valid_mask
             )
         ).transpose(1, 2)
-        caches = []
-        for block, block_cache in zip(self.decoder_blocks, state.caches, strict=True):
+        next_caches = []
+        for block, block_cache in zip(self.decoder_blocks, caches, strict=True):
             hidden, next_cache = block.stream_step(hidden, block_cache)
-            caches.append(next_cache)
+            next_caches.append(next_cache)
         prediction = self._project_output(hidden)
-        return VAEDecoderState(tuple(caches), state.token_index + 1), prediction
+        return tuple(next_caches), prediction
 
 
 __all__ = [

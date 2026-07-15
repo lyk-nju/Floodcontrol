@@ -1086,3 +1086,785 @@
 - MultiDataset仍采用自然concat比例，尚未记录显式sampling-policy artifact或按HumanML/BABEL分别汇报validation loss。
 - decoder snapshot仍未绑定VAE checkpoint/architecture/session identity，该项留给Web/runtime事务接线阶段。
 - 当前首个300k checkpoint是在GT-contact skating修复前训练的；代码通关不等于该旧权重已经获得新loss收益。
+
+## 2026-07-15 · VAE rolling评估修正为有限历史cache回放
+
+类型：评估协议修正 / causal decoder cache验证 / artifact与指标 / 测试
+
+实际改动内容：
+
+- 修正此前“VAE direct-stream与10/10 rolling评估任务拆分”条目中的rolling语义：VAE decoder为causal模型，rolling不再包含future token，也不再把当前token持续提交到完整历史的persistent state。
+- rolling每个commit点均创建全新的`VAEDecoderState`，最多回放当前token之前10个deterministic posterior `mu`及对应GT local-root patch，再解码当前token并只提交其4帧输出；cold start的历史slot继续右对齐并以`position_id=-1`显式padding。
+- 增加两种彼此独立的对照：完整序列persistent stream作为有限历史误差reference；相同`history + current`截断窗口的offline decode作为fresh cache逐token回放的正确性oracle。
+- rolling trace从`history/future`合同改为`history/current`合同，记录`timeline_position_ids`、history/current mask、窗口起止和唯一commit token；配置删除`future_tokens`，默认窗口为10 history + 1 current。
+- rolling reconstruction NPZ额外保存persistent-stream continuous body和contact logits；metrics增加rolling相对完整stream的position、velocity、rotation、contact与max-abs差异，以及同窗口cache/offline parity误差。
+- README和定向测试同步采用“完整encoder deterministic mu + GT local root，只截断decoder历史”的VAE专用实验定义。
+
+改动理由：
+
+- 原10/10实现虽然移动了可见窗口，但decoder一直保留从token 0开始的完整persistent cache，而且每次提交的仍是完全相同的`mu`，因此输出必然与direct stream相同，无法衡量真实有限窗口重建影响。
+- VAE causal decoder不消费未来token；future horizon属于LDF去噪窗口，而不是VAE cache实验合同。
+- 将“rolling对完整历史的预期差异”和“同窗口offline/stream应一致”拆开，才能区分有限上下文造成的模型误差与decoder cache实现错误。
+
+验证：
+
+- `python -m py_compile eval/vae/evaluate_reconstruction.py tests/test_vae_eval.py`通过。
+- `pytest -q tests/test_vae_eval.py`：5 passed；覆盖history/current slot合同、有限历史结果区别、唯一commit和同窗口cache parity。
+- CPU真实EMA checkpoint smoke通过：HumanML3D `012698`与BABEL `11364_1`均完成；HumanML样本48 token的trace shape为`[48,11]`、commit范围为`0..47`、artifact不存在future字段且包含persistent reference。
+- HumanML真实样本rolling相对完整stream的max-abs为`5.0783e-3`，同一截断窗口cache/offline max-abs为`2.4796e-5`，符合“有限历史改变输出、cache回放仍正确”的预期。
+- 全仓测试共76项：75 passed，1 failed；唯一失败为工作区`configs/vae.yaml`当前`trainer.devices=1`，而既有`test_formal_vae_training_config_matches_frozen_recipe`仍断言3卡，与本次VAE rolling修改无关，本轮未擅自改动训练设备配置。
+
+涉及文件：
+
+- `eval/vae/evaluate_reconstruction.py`
+- `eval/vae/rolling.py`
+- `eval/vae/rolling.yaml`
+- `eval/vae/README.md`
+- `tests/test_vae_eval.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮只执行了两个数据集各1个样本的CPU无视频smoke；修正后的HumanML3D/BABEL各10样本GPU视频评估尚未重跑。
+- VAE rolling只验证GT local root和encoder deterministic mu下的decoder有限历史影响；LDF自身的active window、去噪、root/latent联合rolling仍应由独立LDF评估覆盖。
+
+## 2026-07-15 · HumanML root5/body265表示接口收敛与旧motion工具清理
+
+类型：表示接口重构 / 旧代码清理 / 命名优化 / 数据增强边界 / 测试
+
+实际改动内容：
+
+- 将正式HumanML 263D source adapter中的root积分恢复从`utils/motion_process.py`迁入`utils/motion_representation.py`，公共名称改为`recover_humanml263_root()`；使用输入同源的`new_zeros/zeros_like`保留device和dtype，并增加shape、长度与finite校验。
+- 新增`extract_initial_root_yaw(root_motion)`，直接从explicit root5第一帧的`[cos(yaw), sin(yaw)]`恢复物理yaw；不新增重复字段，也不把随机偏移写进确定性263D预处理。
+- 新增`root_body_to_global_joints()`作为root5 + body265/body261到global 22-joint positions的统一接口，并将VAE reconstruction eval从局部重复实现迁移到该公共函数。
+- `motion_process.py`明确降级为旧工具兼容模块，删除无调用的legacy root4/trajectory7提取、263D root replacement、`StreamJointRecovery263`、未使用SMPL85/axis-angle恢复链及通配符quaternion导入；文件从616行缩减到218行。
+- 仍有旧Web/metrics/runtime调用的263D trajectory、trajectory7和272D visualization适配器暂时保留，但命名显式化：`extract_root_trajectory_length_263()`、`convert_legacy_motion_to_joints()`及私有`_legacy_*`辅助函数；`xy_only`修正为符合实际XZ语义的`planar_only`。
+- 更新`local_frame`关于HumanML canonical quaternion来源的文档引用，并增加migration guard，防止已删除的root replacement、旧通用转换名和stream recovery接口重新出现。
+
+改动理由：
+
+- 新版训练和生成的权威表示是root5/body265；旧`motion_process.py`同时暴露263D、trajectory7、272D和SMPL工具，会让新代码继续依赖隐式积分、维度分派和冲突的rotation约定。
+- HumanML raw 263D仍是artifact重建的上游来源，因此其确定性root恢复不能直接删除，但应被明确限制在source conversion职责内。
+- 首帧yaw已经存在于root5，训练随机yaw必须继续由`rotate_root_body_yaw()`同步作用于root、body positions/rotations/velocities和previous boundary；独立首帧yaw状态或预处理随机化会造成重复状态与不可复现statistics。
+- 旧root recovery通过`torch.zeros(...).to(device)`丢失输入dtype，float64输入会在赋值时报错；迁移后的实现修复了该确定性缺陷。
+
+验证：
+
+- `py_compile`覆盖motion representation/process、local frame、VAE eval、legacy visualization、difficulty工具及相关测试，通过。
+- 定向回归：`37 passed`，覆盖263D转换、float64 dtype保持、首帧yaw随机偏移、local-root旋转不变量、root/body global joints、VAE eval及migration guards。
+- 全仓测试共78项：`77 passed, 1 failed`；唯一失败仍为工作区`configs/vae.yaml`当前`trainer.devices=1`，而既有冻结配置测试断言3卡，本轮未修改用户当前训练设备配置。
+- `git diff --check`通过；全仓搜索只在migration guard字符串中保留被删除API名称，不存在活跃导入或调用。
+
+涉及文件：
+
+- `utils/motion_representation.py`
+- `utils/motion_process.py`
+- `utils/local_frame.py`
+- `utils/visualization/video.py`
+- `eval/vae/evaluate_reconstruction.py`
+- `tools/summarize_difficulty.py`
+- `tests/test_vae_contract.py`
+- `tests/test_vae_data_pipeline.py`
+- `tests/test_vae_eval.py`
+- `tests/test_migration_guards.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 旧Web debug、`datasets/generate.py`和legacy stream/traj metrics仍从raw 263D恢复trajectory；切换到HumanML3D_motion root5/body265 artifact后，可继续删除`extract_root_trajectory_263*()`与`recover_joint_positions_263()`。
+- 旧`stream_runtime/runtime_update`仍使用trajectory7 view；新版LDF runtime完成root5 timeline接线后，应删除`build_physical_7d_from_5d()`及其私有delta adapter。
+- legacy 272D visualization仍通过`convert_legacy_motion_to_joints()`保留；新版通用视频入口迁移为显式root5/body265或global joints输入后，可物理删除`motion_process.py`剩余内容。
+
+## 2026-07-15 · Motion processing统一为root5/body265并物理清理旧runtime
+
+类型：表示接口重构 / 263D离线转换隔离 / 旧runtime物理删除 / 指标与可视化迁移 / 测试
+
+实际改动内容：
+
+- 将`utils/motion_process.py`重写为唯一canonical physical motion模块，文件头完整记录root5/body265通道、坐标系、单位与rotation6d列约定；公共API冻结为`pack_body/unpack_body`、`rotation_to_matrix/matrix_to_rotation`、`compute_joint_velocities/build_motion`、三个`recover_*`和两个yaw旋转函数。
+- 删除`utils/motion_representation.py`。VAE statistics与artifact manifest校验迁入中立`utils/motion_artifact.py`；converter/source版本常量迁入VAE/data contract，模型和Dataset不依赖离线tools。
+- 新增`tools/convert_motion_263_to_265.py`，集中记录HumanML 263D与目标265D定义，并独占`recover_root_263`、world joint positions、层级global rotations、contact策略和唯一263→265转换；HumanML/BABEL artifact构建器统一调用该离线转换。
+- 将Dataset、BodyVAE、loss、statistics、latent statistics、pretokenize、reconstruction eval、测试和可视化迁移到新API。`rotation_6d_to_matrix/matrix_to_rotation_6d`正式改名为`rotation_to_matrix/matrix_to_rotation`；首帧heading通过`recover_root_yaw(...)[...,0]`取得。
+- `metrics.stream`改为直接接收explicit root5/body265并计算boundary与offline parity；difficulty工具改为读取转换后的artifact root5；通用video入口改为从root5/body265恢复world joints，不再按263/272维度分派。
+- 物理删除无活跃调用的旧`metrics/traj.py`、`datasets/generate.py`、旧turn-update工具、`utils/inference/stream_runtime`、`utils/inference/runtime_update`和Web trajectory7诊断。Web debug preset在body-VAE runtime接线前复用既有`BLOCKED_ON_BODY_VAE`显式失败。
+- 更新VAE/data架构文档、README和migration guards，明确运行时只允许root5/body265，263D只作为离线source adapter存在。
+
+改动理由：
+
+- 运行时同时存在263D积分恢复、trajectory7、272D分派与root5/body265会造成表示所有权不清、rotation约定冲突以及新代码继续依赖legacy shape分支。
+- 263D仍是当前artifact的真实上游来源，因此需要保留可测试的离线转换，但不能被模型、Dataset或在线runtime直接消费。
+- 显式root与body表示已经能直接支持joint恢复、stream指标和可视化；继续维护旧root replacement和trajectory7适配器没有架构收益。
+
+验证：
+
+- `python -m compileall -q datasets eval metrics models tools utils web_demo tests`通过。
+- VAE/数据/评测/迁移定向回归：`50 passed`。
+- 全仓`pytest -q`：`94 passed, 1 warning`；warning仅为测试环境无法初始化NVML，不影响CPU测试结果。
+- `git diff --check`通过。
+- 全仓Python残留搜索确认不存在活动的`motion_representation`导入、旧motion函数名、trajectory7、旧stream/runtime模块引用；263D只保留在离线转换、预处理以及对应测试中。
+
+涉及文件：
+
+- `utils/motion_process.py`
+- `utils/motion_artifact.py`
+- `utils/conditions/vae.py`
+- `tools/convert_motion_263_to_265.py`
+- Dataset、VAE、loss、statistics、eval、metrics、visualization及对应测试调用方
+- 旧263/trajectory7 runtime、metrics和工具文件（删除）
+- `README.md`、`docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`、`docs/rearchitecture/02_DATA_PIPELINE.md`
+
+尚未完成的后续事项：
+
+- 真实LDF在线EMA encoder bridge、latent statistics与hybrid batch仍未接线，`train_ldf.py`继续按既定协议fail-fast。
+- Web commit-time decoder事务仍未实现；旧trajectory7 runtime已删除，后续Web接线必须直接使用LDF Hybrid stream state、root5 timeline和body265 decode结果。
+
+## 2026-07-15 · VAE tokenizer/statistics、causal context与skating交付修复
+
+类型：checkpoint协议修复 / loss与评估修正 / causal streaming合同 / statistics产品 / 配置与测试
+
+实际改动内容：
+
+- 将正式`tokenizer_ema.pt`限定为EMA encoder/decoder参数、body/local-root physical statistics与模型身份；导出和加载均排除`latent_mean/std`，加载时先验证state hash与architecture hash，再只允许这两个post-hoc buffers缺失。`load_ema_checkpoint()`采用相同规则，不会覆盖调用方已经加载的latent statistics。
+- 新增独立`tools/compute_vae_latent_stats.py`：使用冻结EMA encoder、完整因果上下文、确定性sample-hash yaw和batched GPU扫描计算`latent_stats.npz`，全程检查posterior、mean/std和normalized latent的finite与正std；可选pretoken工具同步加入fail-fast，但仍不属于正式LDF数据路径。
+- VAE resume在任何state覆盖前比较body/local-root四个physical statistics buffers；新checkpoint额外记录contract、converter、FPS、motion-statistics hash和artifact-manifest hash，旧checkpoint仅在physical buffers完全一致时允许恢复。
+- `L_skate`改为从预测global foot positions的相邻帧差分直接计算足速，再由GT contact加权；crop首帧、padding、无效position transition不参与。评估拆分为GT-contact position-derived、predicted-contact position-derived和GT-contact velocity-feature三个指标。
+- `BodyVAE`补齐`decoder_context_tokens`和`encode_window()`；当前正式encoder/decoder上下文均为24 tokens。`VAEDecoderState`加入tokenizer hash、architecture hash、session identity与token index，step/snapshot/restore拒绝跨模型、跨会话和非连续调用。
+- Physical statistics显式记录`uniform_yaw/no_yaw`，训练入口强制匹配`data.random_yaw`；Dataset提前拒绝同一namespace重复sample ID。
+- `vae.yaml`与`vae_multi.yaml`统一为单卡、`strategy: auto`以及train/val/test实际batch size 128；未设置梯度累积或静默batch调整。
+- 更新LDF fail-fast信息、VAE设计文档和rolling评估文档；LDF入口仍保持阻断，但现在准确说明剩余项是context-aware crop/collate、frozen online encoder调用与HybridMotion training batch。
+
+改动理由：
+
+- 训练checkpoint中的identity latent buffers不能覆盖VAE冻结后计算的真实latent尺度，否则LDF normalize/unnormalize会静默错误；EMA tokenizer和post-hoc latent statistics必须有独立所有权并相互绑定hash。
+- 预测velocity feature与最终展示使用的position输出是独立head，使用前者计算skating不能直接约束视觉脚滑。
+- LDF在线encode和有限历史decode只有在精确感受野、session隔离与连续commit边界被公共接口固定后，才能避免crop/reset分布漂移和cache串用。
+
+验证：
+
+- 全仓`pytest -q`：`94 passed, 1 warning`；warning为测试环境无法初始化NVML，不影响结果。
+- `py_compile`覆盖VAE模型、contracts、checkpoint、training、loss、data、statistics、eval、metrics和LDF守卫，通过。
+- `git diff --check`通过。
+- 使用23,240条HumanML train artifacts重算physical statistics，metadata确认`yaw_policy=uniform_yaw`。
+- 从`step_299999.ckpt`原子替换`tokenizer_ema.pt`，确认state中不存在`latent_mean/std`且EMA global step为300000。
+- 使用GPU 2、batch 128扫描全部train motions生成独立`latent_stats.npz`；联合加载确认tokenizer hash一致、encoder/decoder context均为24、latent mean/std finite且最小std为`1.1106098`。
+
+涉及文件：
+
+- `models/vae_wan_1d.py`、`models/tools/wan_vae_1d.py`、`utils/conditions/vae.py`
+- `utils/training/vae/{checkpoint,data,lightning_module,losses}.py`、`utils/training/lightning_module.py`
+- `tools/{compute_vae_stats,compute_vae_latent_stats,pretokenize_body_latents}.py`
+- `datasets/humanml3d.py`、`eval/vae/`、`metrics/stream.py`、VAE相关测试与配置
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`、`train_ldf.py`
+- 外部数据产品：HumanML motion statistics、300k run目录中的`tokenizer_ema.pt`与`latent_stats.npz`
+
+尚未完成的后续事项：
+
+- 现有300k权重是在position-derived skating启用前训练的；重新导出不改变其训练收益，只有后续重新训练才会学习该loss。
+- LDF context-aware crop/collate、frozen online encoder调用和HybridMotion batch尚未实现，真实`train_ldf.py`继续fail-fast。
+- Web commit-time decoder事务尚未接线；新增decoder state身份合同已为该阶段提供保护边界。
+
+## 2026-07-15 · Motion utils职责收敛与依赖方向重构
+
+类型：模块职责重构 / root codec统一 / 离线工具重命名 / 旧几何清理 / 测试与文档
+
+实际改动内容：
+
+- 将`FRAMES_PER_TOKEN`、root/local-root/body维度及feature slice统一收敛到`utils/motion_process.py`；VAE/LDF contracts改为导入同一组物理常量，不再各自维护数值副本。
+- 将heading单位圆投影和backward/current-heading-local root派生集中到`utils.motion_process.project_root_heading()`与`recover_local_root()`。`utils/conditions/ldf.py`只保留typed tensor contracts与condition编译，不再实现物理root codec；LDF模型改为通过唯一motion API恢复local root。
+- 将artifact contract、converter/source identity与statistics schema归入`utils/motion_artifact.py`，消除中立artifact模块反向依赖VAE condition的关系；VAE condition只导入并公开这些数据身份。
+- 将离线NPZ构建工具从`tools/motion_artifact.py`改名为`tools/build_motion_artifact.py`，并迁移HumanML/BABEL预处理及测试调用，避免与运行时`utils/motion_artifact.py`同名。
+- 从`utils/local_frame.py`删除无调用的5D/7D canonicalization及其私有原地变换函数，只保留通用yaw和XZ坐标几何。
+- 增加migration guards，锁定`conditions → motion_process → local_frame`依赖方向、唯一root codec、唯一物理常量所有权、离线builder命名和旧trajectory canonicalization不可回归。
+- 更新VAE与数据架构文档，明确runtime physical motion、artifact identity/statistics、offline conversion/build各自所有权。
+
+改动理由：
+
+- 原先`motion_process`反向导入`conditions.ldf`来恢复local root，使底层物理表示依赖上层模型合同；同一物理维度也散落在VAE/LDF两个condition模块，容易发生协议漂移。
+- 两个不同职责的`motion_artifact.py`无法从文件名判断是runtime statistics还是offline writer；显式builder命名可以避免错误导入。
+- 已删除的trajectory7 runtime不再消费canonicalization函数，继续保留只会暗示旧表示仍是受支持路径。
+
+验证：
+
+- 定向回归：`53 passed`，覆盖LDF condition/root codec、VAE contract/data/tokenizer、MultiDataset与migration guards。
+- 全仓`pytest -q`：`97 passed`。
+- `python -m compileall -q datasets eval metrics models tools utils web_demo tests`通过。
+- `git diff --check`通过。
+- 残留搜索确认除反回归断言外，不存在活动的`derive_local_root_motion`、旧`tools.motion_artifact`或5D/7D canonicalization调用；`motion_process.py`与`motion_artifact.py`不再导入`utils.conditions`。
+
+涉及文件：
+
+- `utils/motion_process.py`、`utils/motion_artifact.py`、`utils/local_frame.py`
+- `utils/conditions/{ldf,vae,__init__}.py`
+- `models/diffusion_forcing_wan.py`
+- `tools/build_motion_artifact.py`、`tools/preprocess_humanml3d.py`、`tools/preprocess_babel.py`（旧`tools/motion_artifact.py`删除）
+- LDF/VAE/MultiDataset/migration相关测试
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`、`docs/rearchitecture/02_DATA_PIPELINE.md`
+
+尚未完成的后续事项：
+
+- 真实LDF context-aware crop/collate、冻结EMA encoder在线调用与HybridMotion batch仍待实现，训练入口继续fail-fast。
+- Web commit-time decoder事务仍待接线；本次仅收敛底层motion与artifact职责，不扩大runtime功能范围。
+
+## 2026-07-15 · BodyVAE生命周期拆分与简洁latent接口重构
+
+类型：模型职责重构 / statistics与tokenizer加载协议 / decoder session事务 / 配置迁移 / 资产兼容验证
+
+实际改动内容：
+
+- 将`BodyVAE`公共latent语义固定为四组简洁接口：`encode/decode`与`encode_window/decode_step`只处理raw posterior latent；`tokenize/detokenize`与`tokenize_window/detokenize_step`只处理normalized latent。删除根据`normalized_latent`布尔值切换输入空间的双语义方法。
+- `BodyVAE.forward()`改为只接受`VAEInput`；batch dict继续由`VAELightningModule`转换。模型构造函数不再读取NPZ、解析metadata或接受statistics路径/零散tensor/identity fallback布尔组合，只接收已验证的`VAEStatistics`与可选`LatentStatistics`对象。
+- 在`utils/motion_artifact.py`实现`LatentStatistics`的shape、finite、EMA、tokenizer hash、motion-statistics hash、yaw与encoder-context校验；physical/latent identity statistics仅通过显式test helper构造。latent buffers设为non-persistent，不写入训练checkpoint或tokenizer bundle。
+- 新增`utils/training/vae/factory.py`的`build_vae_for_training()`，正式VAE配置改为通过命名factory加载physical statistics并构造不带latent statistics的训练模型；删除配置中的`allow_identity_statistics`、`require_latent_statistics`与`latent_stats_path`。
+- 新增中立`utils/vae_tokenizer.py`，集中EMA tokenizer bundle的hash/architecture/physical statistics验证、导出，以及`load_ema_tokenizer()`和`load_frozen_body_tokenizer()`生命周期入口。LDF/runtime loader不再依赖`utils.training`。
+- `utils/training/vae/checkpoint.py`收敛为训练checkpoint/EMA提取；从旧300k训练checkpoint恢复时显式剥离历史placeholder latent buffers，同时继续在覆盖模型前校验四个physical statistics buffers。
+- 底层`CausalBodyVAE`只创建和更新causal convolution cache tensor，不再理解tokenizer、architecture、session或token index。
+- 新增`utils/inference/vae_decoder.py`的`VAEDecoderSession`，统一拥有正式tokenizer identity、session identity、连续token index、snapshot/restore和normalized token逐步解码；调用方不再重复传回state内已有identity/index。
+- VAE reconstruction eval迁移到raw `decode_step`做网络/cache parity；通用stream decode迁移到normalized `VAEDecoderSession`。EMA导出、latent statistics和诊断pretokenize工具迁移到新的artifact/tokenizer loader。
+- 更新VAE架构文档与migration guards，冻结模型、artifact、训练loader和runtime session的职责边界。
+
+改动理由：
+
+- 原`BodyVAE`同时承担网络计算、statistics文件加载、tokenizer身份绑定与流式事务，构造参数和方法语义会随着artifact/runtime需求持续增长。
+- raw posterior latent与normalized LDF latent由同一step方法的布尔参数解释时，调用错误不会体现在类型或方法名上；固定方法语义可以在LDF接线前消除这一风险。
+- runtime若依赖training checkpoint模块，会使部署路径携带无关训练生命周期；正式tokenizer必须由中立、可验证的loader一次性构造。
+- session identity与snapshot是调用事务，不是causal convolution数学；将其移出模型后，底层cache更新可以独立验证，模型也不再生成不稳定的随机tokenizer identity。
+
+验证：
+
+- VAE/tokenizer/training/eval/migration定向回归通过：`62 passed`。
+- 全仓`pytest -q`：`102 passed`。
+- `python -m compileall -q datasets eval metrics models tools utils web_demo tests`通过。
+- `git diff --check`通过；残留搜索确认不存在活动的旧statistics布尔参数、`bind_tokenizer_identity`、模型内stream/snapshot方法或`normalized_latent`开关，runtime/model不反向导入`utils.training.vae`。
+- 使用现有300k `tokenizer_ema.pt`与`latent_stats.npz`通过`load_frozen_body_tokenizer()`实际加载：latent 128D、encoder/decoder context均为24 tokens、模型frozen/eval、global step为300000。
+- 使用现有`step_299999.ckpt`和HumanML motion statistics通过训练factory与`load_ema_checkpoint()`实际加载，EMA tokenizer state hash保持`fcb19743016780db...`，确认网络参数命名与已有资产兼容。
+
+涉及文件：
+
+- `models/vae_wan_1d.py`、`models/tools/wan_vae_1d.py`
+- `utils/motion_artifact.py`、`utils/vae_tokenizer.py`
+- `utils/inference/vae_decoder.py`、`utils/inference/__init__.py`
+- `utils/training/vae/{factory,checkpoint,lightning_module,__init__}.py`
+- `configs/vae.yaml`、`configs/vae_multi.yaml`、`train_vae.py`
+- `tools/{export_vae_tokenizer,compute_vae_latent_stats,pretokenize_body_latents}.py`
+- `eval/vae/evaluate_reconstruction.py`、`metrics/stream.py`
+- VAE model/tokenizer/training/eval/migration相关测试
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+
+尚未完成的后续事项：
+
+- 真实LDF context-aware dataset/collate尚未调用`load_frozen_body_tokenizer()`与`tokenize_window()`构造HybridMotion batch，`train_ldf.py`继续fail-fast。
+- Web commit-time decode尚未持有`VAEDecoderSession`并与LDF commit事务绑定；本次完成session能力与身份保护，但未恢复Web生成。
+
+## 2026-07-15 · Coordinate transform几何层重构
+
+类型：模块重命名 / 坐标几何分层 / 调用迁移 / 测试与文档
+
+实际改动内容：
+
+- 将`utils/local_frame.py`替换为`utils/coordinate_transform.py`，以文件名明确其职责是坐标系变换而不是local-frame状态。
+- 新几何层仅公开angle、yaw matrix、heading direction、XZ点world/local变换和XZ向量world/local旋转；点变换包含平移，向量变换只包含旋转，并支持batch-prefix anchor在时间维广播。
+- `utils.motion_process.recover_local_root()`改为调用`rotate_vectors_world_to_local()`派生current-heading-local速度；全局yaw增强的旋转矩阵改为调用统一`yaw_to_matrix()`，消除motion层重复几何公式。
+- `utils.inference.timeline`切换到`rotate_vectors_local_to_world()`，保留timeline对同一底层坐标协议的复用。
+- 将HumanML263 recovered quaternion的半角、符号解释迁入`tools/convert_motion_263_to_265.py`；运行时坐标模块不再理解263D source convention。
+- 更新VAE/body representation文档和migration guard，锁定`conditions → motion_process → coordinate_transform`依赖方向，并确认旧`local_frame.py`及trajectory-specific canonicalization不会回归。
+
+改动理由：
+
+- `local_frame`容易被理解为某种persistent local状态，而模块实际承担的是无表示所有权的坐标变换；`coordinate_transform`能准确表达其可被motion codec、runtime timeline和后续route compiler共同依赖的底层角色。
+- root5/local-root属于`motion_process`语义，HumanML quaternion属于离线source adapter语义；将两者从纯几何层分离可避免底层工具重新绑定具体动作表示。
+- 位置与速度若共用含糊的XZ变换接口，容易误给速度添加anchor translation；拆分point transform和vector rotation后接口直接约束正确几何语义。
+
+验证：
+
+- 定向回归：`49 passed`，覆盖coordinate transform、VAE/root contract、LDF condition、migration guards和VAE data pipeline。
+- 全仓`pytest -q`：`102 passed`。
+- `py_compile`覆盖coordinate transform、motion process、timeline、HumanML converter和新增测试，通过。
+- `git diff --check`通过。
+- 残留搜索确认不存在活动的`utils.local_frame`导入；HumanML quaternion解释只存在于离线转换工具。
+
+涉及文件：
+
+- `utils/coordinate_transform.py`（新增）、`utils/local_frame.py`（删除）
+- `utils/motion_process.py`、`utils/inference/timeline.py`
+- `tools/convert_motion_263_to_265.py`
+- `tests/test_coordinate_transform.py`、`tests/test_migration_guards.py`
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+
+尚未完成的后续事项：
+
+- `RootTimeline`本身仍包含旧body-recovery累积入口；本次只迁移其坐标依赖，后续runtime阶段需改为直接消费LDF committed physical root5。
+- route compiler尚未接线；未来world route到window-local typed observations应直接复用本次point/vector接口，不再增加另一套坐标公式。
+
+## 2026-07-15 · 删除旧traj batch辅助接口
+
+类型：旧接口物理删除 / 迁移守卫
+
+实际改动内容：
+
+- 删除无活动调用的`utils/traj_batch.py`，一并移除旧`root_to_traj_feats()`的`[x,z,cos,sin]`隐式轨迹视图和未接线的root XZ高斯平滑入口。
+- 在migration guard中固定该文件不得恢复，避免新版typed root observations重新依赖无mask、无坐标所有权的旧轨迹特征。
+
+改动理由：
+
+- 新版LDF使用root5 value与逐feature mask表达位置、heading等typed observations；旧4D打包接口会错误地把路径位置和推导heading绑定成同一种约束。
+- 当前Dataset、VAE、LDF、runtime和离线数据工具均不调用该文件；用户确认本阶段不保留或迁移其中的route smoothing与heading推导能力。
+
+验证：
+
+- `tests/test_migration_guards.py`：`18 passed`。
+- 全仓残留搜索除反回归断言外不存在`traj_batch`、`smooth_root_xz`或`root_to_traj_feats`。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `utils/traj_batch.py`（删除）
+- `tests/test_migration_guards.py`
+
+尚未完成的后续事项：
+
+- 若未来route compiler需要路径平滑或由路径推导heading，应基于typed root observation与显式valid mask重新设计，不恢复本次删除的接口。
+
+## 2026-07-15 · 统一strict-4 token/frame时间协议
+
+类型：公共时间合同重构 / 调用迁移 / mask语义拆分 / 测试与文档
+
+实际改动内容：
+
+- 将`utils/token_frame.py`重写为唯一的四帧一token协议所有者，只保留`FRAMES_PER_TOKEN=4`，删除可由调用方传入其他factor的旧接口和所有负索引静默clamp行为。
+- 新增严格的frame/token count、index、slice和commit boundary换算；非整数、负数和非四帧对齐输入均fail-fast。仅离线预处理可以显式调用`aligned_frame_floor()`截去不完整尾patch，模型、Dataset与runtime使用exact conversion。
+- 将frame mask拆成两种不可互换的规约：完整motion validity使用四帧AND，稀疏observation existence使用四帧OR；prefix token mask出现`True/False/True`空洞时明确报错。
+- 将motion codec、VAE/LDF contracts与模型、HumanML Dataset、VAE loss、timeline、预处理、latent statistics/tokenization和VAE eval迁移到统一接口，删除调用方自行`/4`、`*4`、`%4`推断时间边界的关键路径。
+- 更新VAE设计文档与migration guard，锁定`token_frame.py`拥有时间合同、`motion_process.py`拥有root5/body265物理表示的职责边界。
+
+改动理由：
+
+- 旧接口允许每个调用方传入`frames_per_token`，会让固定strict-4架构在运行时产生多个互不兼容的时间协议。
+- 旧frame count采用向上取整、负索引夹到零，会把不完整patch或非法window边界静默解释成有效token；这与VAE每个token必须完整对应四帧的模型合同冲突。
+- padding有效性要求四帧全部有效，而稀疏root observation只要求patch内存在任一观测；使用同一个OR helper会让含padding的motion token被错误计入loss或posterior统计。
+
+验证：
+
+- token/frame、migration、LDF condition、VAE contract/model/loss/data定向回归：`70 passed`。
+- 全仓`pytest -q`：`106 passed`。
+- `py_compile`覆盖本次修改的token contract、motion/condition、Dataset、模型、loss、预处理、统计与eval文件，通过。
+- 残留搜索确认旧`token_start_frame`、ceil token count、通用`frames_to_token_mask`等接口已无活动引用，且仅`utils/token_frame.py`直接定义`FRAMES_PER_TOKEN`。
+
+涉及文件：
+
+- `utils/token_frame.py`、`utils/motion_process.py`
+- `utils/conditions/{vae,ldf}.py`、`utils/inference/{timeline,geometry}.py`
+- `datasets/humanml3d.py`
+- `models/{vae_wan_1d,diffusion_forcing_wan}.py`、`models/tools/wan_vae_1d.py`
+- `utils/training/vae/losses.py`
+- `tools/{preprocess_humanml3d,preprocess_babel,build_motion_artifact,compute_vae_latent_stats,pretokenize_body_latents}.py`
+- `eval/vae/evaluate_reconstruction.py`
+- `tests/test_token_frame_contract.py`、`tests/test_migration_guards.py`
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+
+尚未完成的后续事项：
+
+- LDF真实训练与Web commit runtime尚未接线；它们后续必须直接复用本时间合同，不得重新引入可配置frames-per-token或首帧特殊token。
+- 当前`RootTimeline`仍是旧runtime遗留结构；本次只迁移其frame/token换算，后续route/window compiler重构时再审视其业务接口。
+
+## 2026-07-15 · 删除孤立弧长模块并整理初始化接口
+
+类型：旧模块物理删除 / 公共API命名迁移 / 代码风格与测试
+
+实际改动内容：
+
+- 删除没有任何活动调用和测试的`utils/path_arclength.py`；新版route仍通过`utils/inference/geometry.py`中的实际调用链执行时间采样与polyline弧长重采样。
+- 重写`utils/initialize.py`的模块说明、类型标注、常量、配置override解析、动态target校验、run snapshot和分布式timestamp注释，同时保留原配置合并、动态构造与run初始化行为。
+- 将含糊公共名统一迁移为行为导向命名：`Config → ProjectConfig`、`instantiate → instantiate_target`、`get_function → resolve_function`、`save_config_and_codes → save_run_snapshot`、`print_model_size → log_model_parameters`、`check_state_dict → log_state_dict_summary`、`get_shared_run_time → get_shared_run_timestamp`。
+- `log_state_dict_summary()`现在分别报告unexpected keys、missing parameters和missing buffers，并统一通过rank-zero logger输出；动态target缺少模块限定、目标不存在或目标不可调用时给出明确错误。
+- 同步迁移VAE训练入口、通用Lightning模块、VAE data factory、multi Dataset、T2M metric与migration测试；不保留旧名兼容别名。
+
+改动理由：
+
+- `path_arclength.py`属于未接线的旧手绘路径pipeline，并与当前`inference/geometry.py`的route几何能力重叠；保留两套弧长实现会让后续route compiler难以判断协议所有者。
+- 原`initialize.py`混用了`get/print/check`等无法表达副作用的名称，调用处看不出是动态导入、rank-zero日志还是完整源码快照。
+- 初始化模块是当前配置、Dataset、模型、optimizer、scheduler和训练run的活动依赖，不能像无调用旧模块一样直接删除；本次通过明确命名和边界改善可维护性而不拆散其现有bootstrap职责。
+
+验证：
+
+- initialize、migration、VAE training与multi Dataset定向回归：`31 passed`。
+- 全仓`pytest -q`：`101 passed`。
+- 修改文件`py_compile`通过，`git diff --check`通过。
+- 残留搜索确认不存在活动的旧initialize函数名；`path_arclength`只剩migration guard中的反回归路径断言。
+
+涉及文件：
+
+- `utils/path_arclength.py`（删除）
+- `utils/initialize.py`
+- `train_vae.py`
+- `utils/training/lightning_module.py`、`utils/training/vae/data.py`
+- `datasets/multi.py`、`metrics/t2m.py`
+- `tests/test_initialize.py`、`tests/test_migration_guards.py`
+
+尚未完成的后续事项：
+
+- `initialize.py`目前仍同时承载配置、factory与run bootstrap；若未来训练入口数量明显增加，可再拆为`config/factory/training experiment`模块，但当前不为纯目录美观增加额外迁移层。
+- route compiler若未来确实需要Douglas-Peucker简化、归一化arc-s或degenerate-path mask，应在typed route合同下重新实现并补测试，不恢复已删除的孤立模块。
+
+## 2026-07-15 · Visualization收敛为HumanML22轻量渲染
+
+类型：可视化架构清理 / 旧实现物理删除 / VAE eval迁移 / 测试
+
+实际改动内容：
+
+- 将`utils/visualization/skeleton.py`收敛为不可变`HUMANML22_CHAINS`与统一chain color常量，不再混合骨架定义、Pyrender scene、相机、mesh和视频编码。
+- 新增`utils/visualization/motion_video.py`，公开`render_joint_video([F,22,3])`与`render_motion_video(root5, body265)`两个固定语义入口；前者只负责固定正交视角投影和轻量ImageIO/PIL rasterization，后者通过canonical `recover_joint_positions()`恢复world joints。
+- 删除`utils/visualization/video.py`及无人调用的目录批渲染、FFprobe/FFmpeg composite、标题文字条功能；同时从旧`skeleton.py`删除已损坏的Pyrender 3D分支、root-only trajectory renderer和随机MP4 demo。
+- VAE reconstruction eval改为直接调用`render_joint_video()`，original与reconstruction继续共享explicit root恢复出的world trajectory与同一相机拟合协议。
+- 新renderer严格校验frame/joint shape、finite值、FPS、偶数画面尺寸和绘制参数，不再静默补齐或裁剪trajectory/mask；输出目录自动创建，writer在编码异常时也通过`finally`关闭。
+- `utils.visualization`改为轻量、无副作用导出；导入时不再加载Pyrender、Trimesh或Matplotlib。
+
+改动理由：
+
+- 当前VAE eval真实使用的只有HumanML22拓扑与轻量renderer，而旧3D路径调用`create_skeleton_trimesh()`时传入其签名不接受的`bone_colors`，实际不可运行。
+- 旧模块在设置`PYOPENGL_PLATFORM`前已经导入Pyrender，并让任何简单视频评测都承担OpenGL与Trimesh依赖；这会放大headless训练/评测环境的不稳定性。
+- 目录遍历、artifact布局和多视频comparison属于具体eval任务，不应由通用motion renderer拥有；root5/body265恢复与joint rasterization分层后接口所有权更清楚。
+
+验证：
+
+- visualization、VAE eval与migration定向回归在实现完成时：`34 passed`；随后当前工作区Dataset接口发生外部并行变化后，visualization与VAE eval复验：`15 passed`。
+- 使用ImageIO/FFmpeg真实写入两帧480×480 MP4烟测通过，文件大小5229 bytes并在验证后删除；同一进程确认导入`utils.visualization`未加载`pyrender`、`trimesh`或`matplotlib`。
+- 修改文件`py_compile`通过，`git diff --check`通过；残留搜索确认生产代码不存在旧Pyrender/composite/root-only renderer调用。
+- 全仓`pytest -q`未完成：收集阶段因本轮范围外、在验证期间同时发生的Dataset接口变化而出现两个ImportError——`datasets.humanml3d.collate_humanml3d`与`datasets.multi.collate_multi`当前不存在。本轮未修改或回滚这些并行改动。
+
+涉及文件：
+
+- `utils/visualization/skeleton.py`
+- `utils/visualization/motion_video.py`（新增）
+- `utils/visualization/video.py`（删除）
+- `utils/visualization/__init__.py`
+- `eval/vae/evaluate_reconstruction.py`
+- `tests/test_visualization.py`（新增）
+
+尚未完成的后续事项：
+
+- 若后续评测需要original/reconstruction横向拼接，应在`eval/vae`内新增任务级comparison工具和明确的FFmpeg依赖测试，不恢复通用visualization中的旧250行composite实现。
+- 全仓测试需要等待Dataset/collate并行重构稳定后重跑；当前visualization自身与其VAE eval调用链已经独立验证。
+
+## 2026-07-15 · 简化BodyVAE模型、checkpoint与显式cache边界
+
+类型：VAE架构简化 / 强协议删除 / checkpoint与runtime迁移 / 测试与文档
+
+实际改动内容：
+
+- 将`BodyVAE`收缩为以计算为中心的模型：构造函数直接读取普通motion/latent statistics NPZ，只保留shape、finite、positive-std检查；公共方法继续使用`encode/decode`表示raw latent、`tokenize/detokenize`表示normalized deterministic mu。
+- 删除模型中的architecture/tokenizer hash、statistics metadata和tokenizer identity。physical statistics仍是persistent buffers；训练后计算的latent mean/std保持non-persistent，因此训练checkpoint加载不会覆盖配置中的latent statistics。
+- 将`VAEDecoderState`简化为只含causal convolution caches；删除session UUID、token index、模型身份和snapshot事务。`BodyVAE.init_decoder_state()`、`decode_step()`与`detokenize_step()`显式接收并返回state，不恢复module-global cache或`first_chunk`开关。
+- 将VAE权重加载统一为`load_vae_checkpoint(model, checkpoint_path, use_ema=True)`：训练、评测、未来LDF和runtime直接读取Lightning训练checkpoint，默认应用EMA shadows、校验四个physical statistics buffer并冻结模型；旧checkpoint中的placeholder latent buffers在加载前移除。
+- 物理statistics工具改为只写四组mean/std数组；latent statistics工具改为直接从配置构建模型、从训练checkpoint加载EMA encoder并只写`mean/std`，继续保留posterior finite检查和完整train split扫描，不生成逐样本latent cache。
+- 删除`utils/vae_tokenizer.py`、`utils/training/vae/factory.py`、`utils/inference/vae_decoder.py`、`tools/export_vae_tokenizer.py`和`tools/pretokenize_body_latents.py`。配置直接target `models.vae_wan_1d.BodyVAE`，评测与stream metrics迁移到模型的显式state接口。
+- 删除`utils/motion_artifact.py`中的`VAEStatistics/LatentStatistics`强metadata对象；保留离线motion转换本身需要的contract/converter与确定性yaw辅助逻辑。
+- 更新VAE/data设计文档和README，明确EMA训练checkpoint是唯一权重来源、statistics是普通NPZ、cache只含计算状态；测试使用独立helper生成临时identity arrays，不向生产模型重新加入identity fallback。
+
+改动理由：
+
+- tokenizer bundle、artifact hash、yaw/context metadata和随机session身份没有改变VAE数学计算，却将模型、数据产品和runtime生命周期耦合在一起，显著增加研究迭代成本。
+- 直接加载训练checkpoint既避免旧代码在多个入口重复实现EMA逻辑，也不需要额外维护一份bundle；latent normalization通过non-persistent buffer与checkpoint权重自然分离。
+- 显式cache仍能避免旧版隐藏module cache造成的并发污染；去掉与卷积计算无关的事务字段后，state可以由调用方按普通研究代码方式复制和持有。
+
+验证：
+
+- VAE定向回归：`72 passed`。
+- 全仓`pytest -q`：`101 passed`；仅出现环境无法初始化NVML的PyTorch warning，不影响CPU测试结果。
+- `py_compile`覆盖BodyVAE、condition、checkpoint、训练data/module、statistics工具、VAE eval、stream metrics和新测试，通过。
+- `git diff --check`通过；活动代码与当前设计文档中不存在`vae_tokenizer`、`VAEDecoderSession`、training factory、tokenizer/architecture hash或`tokenizer_ema.pt`依赖。
+- 使用现有`step_299999.ckpt`、HumanML motion statistics和现有latent statistics实际构建并加载正式128D模型成功：EMA模型为eval/frozen，encoder与decoder causal context均为24 tokens。已有300k checkpoint参数及外部数据文件未被修改。
+
+涉及文件：
+
+- `models/vae_wan_1d.py`、`utils/conditions/vae.py`
+- `utils/training/vae/{checkpoint,data,lightning_module,__init__}.py`
+- `utils/motion_artifact.py`、`metrics/stream.py`、`eval/vae/evaluate_reconstruction.py`
+- `configs/{vae,vae_multi}.yaml`
+- `tools/{compute_vae_stats,compute_vae_latent_stats}.py`
+- 删除：`utils/vae_tokenizer.py`、`utils/training/vae/factory.py`、`utils/inference/vae_decoder.py`、`tools/export_vae_tokenizer.py`、`tools/pretokenize_body_latents.py`
+- `tests/{__init__,vae_helpers,test_vae_model,test_vae_tokenizer,test_vae_loss,test_vae_contract,test_vae_eval,test_vae_training,test_vae_data_pipeline,test_migration_guards}.py`
+- `README.md`、`docs/rearchitecture/{02_DATA_PIPELINE,02_VAE_AND_BODY_REPRESENTATION}.md`
+
+尚未完成的后续事项：
+
+- LDF在线encoder context sampler与HybridMotion batch尚未接线；后续直接构造带motion/latent stats的`BodyVAE`并调用公共checkpoint loader，不再增加tokenizer bundle层。
+- Web commit-time decode尚未接线；接线时由每条stream直接持有`VAEDecoderState`，cache归属由runtime对象生命周期保证。
+- 现有外部`tokenizer_ema.pt`不再被代码使用；本次没有删除或改写运行目录中的历史文件。
+
+## 2026-07-15 · 增加root5/body265到HumanML263的T2M评测适配器
+
+类型：评测表示转换 / round-trip验证 / 真实T2M embedding对比
+
+实际改动内容：
+
+- 新增`metrics/humanml.py`的`convert_root5_body265_to_humanml263()`，将显式root5与physical body265恢复为标准HumanML263：root半角forward transition、heading-local root displacement、root height、heading-canonical non-root positions、21-joint local rotation6d、heading-local joint displacement和contacts。
+- 适配器直接从22个global rotation矩阵按HumanML22父子关系恢复21个local rotations；positions与velocities使用HumanML quaternion方向转换，并自动消除任意全局translation/yaw对评测表示的影响。
+- 明确标准HumanML一行拥有到下一pose的forward transition：`F`帧physical pose严格产生`F-1`行263D。`tail="drop"`用于严格round-trip；`tail="approximate"`通过最后一次观测transition补齐长度，供与固定长度baseline做正式T2M横向比较时显式选择。
+- 新增`tools/compare_humanml_adapter.py`，在原始HumanML263数据上执行263 → root5/body265 → 263，分别统计root/position/rotation/velocity/contact误差，并使用与FloodDiffusion相同的T2M movement/motion encoder、mean/std计算embedding cosine、L2与FID漂移。
+- 新增round-trip、batch/approximate-tail和全局yaw不变性测试；VAE设计文档增加标准T2M评测边界，明确不为body265另训不可横向比较的FID encoder。
+
+改动理由：
+
+- FloodDiffusion的HumanML evaluator固定消费263D并在去掉4维contacts后将259D送入预训练movement encoder；直接将body265送入或重训新encoder都会失去与既有FID/R-Precision结果的可比性。
+- root5/body265保存physical absolute motion，而HumanML263保存heading-canonical pose与forward transition；显式适配器能将内部生成表示与公开评测表示隔离，并量化转换本身带来的偏差。
+- 最后一条forward transition依赖未来pose，不能从有限physical clip严格恢复；因此接口显式区分数学验证用drop与等长baseline比较用approximate，不静默混合两种语义。
+
+验证：
+
+- 适配器定向与相邻数据/migration测试：`30 passed`。
+- 全仓`pytest -q`最终复跑：`110 passed`；仅有环境无法初始化NVML的PyTorch warning。
+- `py_compile`覆盖适配器、比较工具和测试，通过；`git diff --check`通过。
+- 使用HumanML3D val split前128条真实`new_joint_vecs`及正式预训练T2M evaluator实测：
+  - `tail="drop"`：embedding cosine mean `0.99999994`，embedding L2 mean `0.00121323`，FID经非负数值截断为`0.0`；root/position/rotation/contact MAE分别约`1.43e-8/7.21e-9/4.33e-8/0`。
+  - exact-drop velocity MAE约`4.76e-6`，最大`0.06277`；检查显示偏差集中于少量原始263样本中velocity通道与其position forward difference本身不一致，而非root/pose逆变换漂移。
+  - `tail="approximate"`：embedding cosine mean `0.99999815`、L2 mean `0.00811251`、FID `1.4939e-4`，确认尾transition近似对等长T2M比较的影响很小。
+  - 将drop结果直接与未裁剪完整reference比较时，因T2M内部`length // 4`少一个movement token，embedding L2增至`0.06132`、FID为`0.0025899`；因此固定长度baseline横向比较应显式使用approximate tail，其适配偏差更小且长度一致。
+
+涉及文件：
+
+- `metrics/humanml.py`
+- `tools/compare_humanml_adapter.py`
+- `tests/test_humanml_adapter.py`
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 新版LDF真实生成评测尚未恢复；接线时严格round-trip测试使用drop，与既有固定长度baseline做标准指标比较时显式使用approximate tail，并继续复用FloodDiffusion原始T2M checkpoint与mean/std。
+- 正式结果需同时记录tail策略；不得把drop与approximate产生的不同有效长度混在同一组FID统计中，也不为此修改模型内部strict-4时间合同。
+
+## 2026-07-15 · root5/body265 Dataset与训练数据层重构
+
+类型：Dataset边界重构 / VAE与LDF collator实现 / artifact协议简化 / statistics与evaluation迁移 / 测试与文档
+
+实际改动内容：
+
+- 将`HumanML3DDataset`与`BABELDataset`改为两个互不继承的source Dataset；各自解析split、motion和`caption#tokens#start#end`文本，统一返回完整未裁剪的`dataset/name/root_motion/body_motion/body_feature_valid_mask/text_data` sample。Dataset不再执行crop、yaw、translation rebase、previous-root推导或padding；旧NPZ中的version/hash/FPS等多余metadata直接忽略。
+- `MultiDataset`收敛为子Dataset实例化与`ConcatDataset`组合，不再提供collate。VAE配置删除Dataset collate入口，并分别配置HumanML3D/BABEL的独立`text_path`，现有motion NPZ与原始texts可直接组合使用。
+- 在`utils/training/vae/data.py`实现`VAEWindowCollator`：train执行四帧对齐的随机长度/起点crop、同步全局yaw与XZ translation rebase，validation固定取确定性前缀且关闭随机增强；collator统一推导previous-root、frame/feature mask并完成不同长度batch padding，保持BodyVAE训练batch字段。
+- 新增`utils/training/ldf/data.py`与package导出，实现简单四帧对齐active window、固定`encoder_context_tokens × 4`左侧body context、clip起点不足时左零填充及context mask、active root/body/previous-root与padding mask。同一时间区间多caption在train随机选一个、validation取第一个；与active window相交后输出裁剪过的相对token区间。本轮未恢复`train_ldf.py`，也未加入OriginEpoch、future observation或history/generation noise。
+- 离线预处理NPZ改为只写`root_motion/body_motion/body_feature_valid_mask`三个字段；HumanML3D/BABEL构建器发布过滤后的split TXT并复制原始texts，不再写per-sample source SHA256、converter/contract/FPS metadata或额外build summary文件。已有完整target仍可被resumable构建跳过。
+- physical statistics与latent statistics改为遍历Dataset full sample；前者保留四点yaw quadrature，后者使用显式seed的普通`torch.Generator`生成yaw，不再使用sample identity hash。VAE reconstruction evaluation直接实例化Dataset，也支持显式传入单Dataset或`MultiDataset`进行评测。
+- 删除运行时`utils/motion_artifact.py`及condition/model中的artifact contract常量与`BodyVAE.contract_version`；保留root/body维度于`motion_process.py`、四帧时间常量于`token_frame.py`、263→265转换于`tools/`。没有恢复已删除的`utils/vae_tokenizer.py`。
+- 重写Dataset/VAE data测试并新增LDF data测试，覆盖旧metadata兼容、完整motion/text、BABEL独立性、Multi source identity、VAE随机/确定性crop与padding、LDF context/文本备选，以及单Dataset/Multi statistics和reconstruction smoke。更新数据架构、VAE表示文档与README，明确Dataset和training data的新所有权边界。
+
+改动理由：
+
+- source Dataset应只回答“磁盘上的一个完整样本是什么”，训练任务的窗口、增强、边界与batch形状不应反向污染HumanML3D/BABEL加载接口。
+- root5/body265 schema已经固定后，runtime hash/version血缘和重复manifest校验没有改变模型数学语义，却让模型、Dataset、statistics、evaluation与离线converter互相耦合；最小NPZ与普通seed更适合当前研究迭代。
+- VAE与LDF对同一完整motion需要不同视图：VAE需要随机重建crop，LDF还需要冻结encoder的左历史与文本token timeline。把两者放在各自training data模块后，MultiDataset可以稳定复用，也为后续LDF trainer恢复保留清晰接点。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m py_compile datasets/humanml3d.py datasets/babel.py datasets/multi.py utils/training/vae/data.py utils/training/ldf/data.py tools/build_motion_artifact.py tools/preprocess_humanml3d.py tools/preprocess_babel.py tools/compute_vae_stats.py tools/compute_vae_latent_stats.py eval/vae/evaluate_reconstruction.py`通过。
+- Dataset/VAE/LDF data定向回归：`16 passed`。
+- 全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`110 passed`。
+- 使用现有共享数据实际读取HumanML3D val首样本`[192,5]/[192,265]`与3条文本、BABEL val首样本`[52,5]/[52,265]`与2条文本，确认旧NPZ和独立原始text路径兼容；仅出现Matplotlib cache目录回退到`/tmp`的环境提示。
+- `git diff --check`通过；`rg`确认活动代码中不存在`utils.motion_artifact`、`collate_humanml3d`或`collate_multi`引用。
+
+涉及文件：
+
+- `datasets/{humanml3d,babel,multi,__init__}.py`
+- `utils/training/vae/{data,__init__}.py`
+- `utils/training/ldf/{data,__init__}.py`（新增）
+- `tools/{build_motion_artifact,preprocess_humanml3d,preprocess_babel,compute_vae_stats,compute_vae_latent_stats}.py`
+- `eval/vae/evaluate_reconstruction.py`
+- `models/vae_wan_1d.py`、`utils/conditions/{vae,__init__}.py`
+- `configs/{vae,vae_multi}.yaml`
+- `tests/{test_vae_data_pipeline,test_multi_dataset,test_ldf_data,test_vae_training,test_migration_guards}.py`
+- `README.md`、`docs/rearchitecture/{02_DATA_PIPELINE,02_VAE_AND_BODY_REPRESENTATION}.md`
+- 删除：`utils/motion_artifact.py`
+
+尚未完成的后续事项：
+
+- `train_ldf.py`仍保持migration guard；后续需要把当前LDF data batch接到冻结EMA `BodyVAE.encode_window/tokenize_window`、latent normalization与`HybridMotion`训练输入，本轮没有越过该边界。
+- OriginEpoch、future observation、history/generation noise和更强的epoch/DDP随机可复现策略仍待真实LDF训练协议确认；不应提前塞回Dataset。
+- 现有外部旧NPZ继续可读；若需要用最小schema重新发布全量数据，应显式清理/选择新的output目录后运行预处理，本轮未改写共享数据目录。
+
+## 2026-07-15 · HumanML3D Dataset回归旧版代码组织风格
+
+类型：Dataset可读性重构 / 注释与方法边界整理 / 回归测试
+
+实际改动内容：
+
+- 参考旧版`FloodDiffusion/datasets/humanml3d.py`的阅读顺序，将新版`HumanML3DDataset`组织为`__init__ → _load_file_list → load_motion/load_text → __getitem__ → _process`；恢复`file_list`、`motion_path`、`text_path`和`self.dataset`这些直观成员命名，并使用旧版熟悉的motion/text分块注释。
+- `_load_file_list()`只构建包含source identity和文件路径的轻量索引，不把全量body265数组预加载到内存；`_process()`在取样时懒加载完整motion、解析全部caption并组装统一sample。
+- `load_motion()`只读取root5/body265/feature-valid三个字段，继续忽略旧NPZ metadata；`load_text()`保留HumanML3D的`0#0`整段caption语义并把秒区间转换为frame区间。
+- 保持上一轮冻结的数据职责不变：Dataset不随机选择caption、不crop、不做yaw/rebase、不推导previous-root、不padding；这些处理仍属于VAE/LDF training collator。BABEL继续是独立Dataset，不恢复继承关系。
+- 测试增加轻量索引断言，确保`self.dataset`只保存`dataset/name/motion_path/text_path`，公开sample合同没有变化。
+
+改动理由：
+
+- 旧版最好的部分是一个类内即可顺序理解“索引、加载、处理、输出”的数据生命周期；此前新版将record、motion和text拆成多个module-level helper，虽然短但阅读时需要来回跳转，source Dataset的主线不够突出。
+- 直接照搬旧版的全量数组预加载、Dataset内随机裁剪和随机caption会破坏当前已确认的Dataset/training data边界；本次只继承其代码组织与注释方式，并保留body265所需的懒加载。
+
+验证：
+
+- HumanML3D/Multi定向回归：`11 passed`；包含旧metadata兼容、完整motion/text、轻量索引、VAE collator、Multi/statistics/evaluation smoke。
+- 本次重构后的全仓`pytest tests -q`：`110 passed`。
+- `datasets/humanml3d.py`的`py_compile`通过，`git diff --check`通过。
+- 使用现有HumanML3D val split实际读取1450条索引中的首样本`012698`：root `[192,5]`、body `[192,265]`、3条caption；仅出现Matplotlib cache回退到`/tmp`的环境提示。
+
+涉及文件：
+
+- `datasets/humanml3d.py`
+- `tests/test_vae_data_pipeline.py`
+
+尚未完成的后续事项：
+
+- BABEL当前已保持source独立和相同公开sample语义；若后续也希望统一阅读风格，可按同一方法骨架单独整理，但不应通过继承HumanML3D来减少代码。
+- 本轮没有改变公开Dataset参数或训练配置，不需要重建现有HumanML3D_motion数据。
+
+## 2026-07-15 · HumanML3D_motion文本自包含与VAE/LDF统一数据根目录
+
+类型：数据迁移 / Dataset配置统一 / VAE与LDF真实数据smoke test
+
+实际改动内容：
+
+- 明确`HumanML3D_motion/artifacts/<name>.npz`并非只保存body265，而是保存`root_motion [F,5]`、`body_motion [F,265]`和`body_feature_valid_mask [F,265]`三个训练张量；现存旧metadata继续由Dataset忽略，未为本次迁移重写约2.9万个motion artifact。
+- 将原始`HumanML3D/texts/*.txt`复制到`HumanML3D_motion/texts/`，使处理后数据根目录同时拥有motion、split和caption，不再要求HumanML配置跨目录读取原始数据集文本。
+- `configs/vae.yaml`及`configs/vae_multi.yaml`中的HumanML `text_path`统一改为相对路径`texts`；`HumanML3DDataset`相对于split/data根目录解析该路径。BABEL配置本轮未改动。
+- 更新数据架构文档，冻结自包含目录协议：NPZ只负责数值motion，TXT继续负责`caption#tokens#start#end`文本，文本不重复嵌入每个NPZ。VAE collator消费同一sample的motion字段并忽略文本；LDF collator消费相同motion以及解析后的`text_data`。
+- 更新配置测试，锁定HumanML单数据集与MultiDataset均使用相对`texts`路径。
+
+改动理由：
+
+- VAE和LDF应共享同一个“完整样本”Dataset，区别只存在于各自training collator：VAE不需要caption，LDF需要caption timeline；不应为两个任务复制motion或维护两套Dataset。
+- 将split、artifacts和texts放在同一个处理后数据根目录，可以整体移动、发布和配置数据集，避免motion来自`HumanML3D_motion`、文本却隐式来自`HumanML3D`的跨目录依赖。
+- 文本保持独立TXT可复用原始HumanML3D标注格式，并避免同一caption被重复写入motion NPZ；Dataset负责在读取时统一组装`text_data`。
+
+数据迁移结果：
+
+- 运行`tools.preprocess_humanml3d`迁移文本并重新发布过滤后的split；已有兼容artifact全部跳过：`converted=0`、`skipped=29046`、`copied_texts=29046`。
+- 发布后的split大小为train `23240`、val `1450`、test `4356`；过滤不足20帧样本train `144`、val `10`、test `26`，另过滤test非有限样本`2`。
+- 当前共享数据目录结构为`HumanML3D_motion/{train.txt,val.txt,test.txt,artifacts/,texts/,motion_stats.npz}`。
+
+验证：
+
+- 使用真实val数据通过统一`HumanML3DDataset`读取首样本`012698`：root `[192,5]`、body `[192,265]`、caption `3`条。
+- 同一sample经VAE collator得到root `[1,40,5]`、body `[1,40,265]`；经LDF collator得到active root `[1,40,5]`、`body_with_context [1,136,265]`和1条active text，确认24-token/96-frame encoder context与40-frame active window对齐。
+- 全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest -q`：`110 passed`；`git diff --check`通过。
+
+涉及文件与数据：
+
+- `configs/{vae,vae_multi}.yaml`
+- `tests/test_vae_training.py`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/texts/`及过滤后的split TXT
+
+尚未完成的后续事项：
+
+- `BABEL_motion`目前仍通过配置读取`BABEL_streamed/texts`；若需要与HumanML一致的可移植数据根目录，应单独迁移BABEL文本并改为相对`texts`。
+- LDF数据合同和collator已能消费统一sample，但`train_ldf.py`仍保持migration guard，需在冻结EMA VAE在线encode接线完成后恢复训练入口。
+
+## 2026-07-15 · 消除Dataset一次性module helper
+
+类型：Dataset接口简化 / 私有依赖清理 / BABEL风格对齐
+
+实际改动内容：
+
+- 删除`datasets/humanml3d.py`中只为类内流程服务的`_resolve_text_root()`与`_load_motion()`两个module-level函数；相对text目录解析直接放入`_load_file_list()`，NPZ读取与基础tensor合同检查直接放入`HumanML3DDataset.load_motion()`。
+- `HumanML3DDataset.load_motion()`不再转调第二层私有函数，代码从类入口即可顺序阅读；旧metadata忽略、完整motion懒加载和公开sample字段保持不变。
+- 为消除BABEL对HumanML3D私有实现的反向依赖，将`BABELDataset`同步整理为`_load_file_list/load_motion/load_text/_process`类内流程；BABEL不再导入HumanML3D的私有helper，也没有通过继承复用source逻辑。
+- 没有引入新的common/base Dataset文件，避免为了两段简单source IO再次增加间接层。
+
+改动理由：
+
+- 只被类方法转调一次的module helper没有形成可复用抽象，反而让一次NPZ读取跨两个函数跳转；路径解析只有几行，也更适合留在建立样本索引的上下文中。
+- BABEL直接导入HumanML3D的下划线函数虽然没有类继承，但仍形成隐藏耦合；两个source Dataset各自拥有少量明确IO逻辑比共享私有实现更容易修改和阅读。
+
+验证：
+
+- Dataset/VAE/LDF data定向回归：`24 passed`。
+- 全仓`pytest tests -q`：`110 passed`。
+- `datasets/humanml3d.py`与`datasets/babel.py`的`py_compile`通过，`git diff --check`通过。
+- `rg`确认`datasets/`中不存在`_resolve_text_root`、module-level `_load_motion`或从HumanML3D导入私有符号的代码。
+
+涉及文件：
+
+- `datasets/humanml3d.py`
+- `datasets/babel.py`
+
+尚未完成的后续事项：
+
+- 两个Dataset当前仍保留必要的字段、shape、四帧对齐与finite检查；若后续继续精简，应单独决定哪些错误由离线预处理保证，避免在“减少函数”任务中顺带改变坏数据的失败位置。
+
+## 2026-07-15 · BABEL与MultiDataset风格整理及Generate职责说明
+
+类型：Dataset可读性优化 / Multi组合逻辑简化 / 数据架构文档
+
+实际改动内容：
+
+- 将`BABELDataset`进一步对齐当前`HumanML3DDataset`的代码组织与注释：保留`file_list/motion_path/text_path/self.dataset`轻量索引、`load_motion/load_text/_process`类内生命周期、旧NPZ metadata忽略说明和完整分段caption输出；补充`_process()`职责注释。
+- 保持BABEL source语义：同时间区间的多个caption全部留在`text_data`，Dataset不随机选择、不裁剪；后续caption备选策略仍由LDF collator处理。
+- 简化`MultiDataset`：显式保存`split`，逐项只向source Dataset传递该项的target、对应split路径、motion/text路径与FPS，然后由`ConcatDataset`管理长度和索引；`dataset_lengths`直接读取各子Dataset长度，不再从累计边界反推。
+- Multi不提供collate、crop、padding或训练增强；不同任务继续使用VAE/LDF各自training data collator。
+- 在数据架构文档新增“为什么不保留`datasets/generate.py`”：明确旧`GenerateDataset`只是硬编码prompt/时长并创建全零feature/token的test请求生成器，不是拥有真实root5/body265与valid mask的数据源；未来固定prompt批量生成应归具体eval/inference request builder，而不是训练Dataset。
+- 测试补充BABEL轻量索引与Multi split断言；现有migration guard继续确保`datasets/generate.py`不返回。
+
+改动理由：
+
+- BABEL与HumanML3D共享公开sample合同，但应各自在一个文件内清楚表达source IO和文本语义；统一阅读顺序比共享私有helper或继承更直接。
+- 旧版Multi最重要的是子配置隔离，旧通用collate和config复制不适合当前任务专属collator边界；直接参数传递与`ConcatDataset`已足够。
+- 全零feature/token不能代表“待生成动作”的ground truth。将这种占位对象放进Dataset会污染statistics、reconstruction和LDF有效性mask，混淆数据事实与生成请求。
+
+验证：
+
+- Dataset/Multi/VAE/LDF/migration定向回归：`43 passed`。
+- 全仓`pytest tests -q`：`110 passed`。
+- `datasets/babel.py`与`datasets/multi.py`的`py_compile`通过，`git diff --check`通过。
+- 使用正式`configs/vae_multi.yaml`实际构建val MultiDataset：HumanML3D 1450条、BABEL 3645条、合计5095条；两侧首样本分别为body `[192,265]`/3条文本与`[52,265]`/2条文本。仅出现Matplotlib cache回退到`/tmp`的环境提示。
+- 活动Python/YAML代码中不存在`GenerateDataset`或`datasets.generate`引用。
+
+涉及文件：
+
+- `datasets/humanml3d.py`
+- `datasets/babel.py`
+- `datasets/multi.py`
+- `tests/test_multi_dataset.py`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+
+尚未完成的后续事项：
+
+- 若未来需要可复现的固定prompt生成集，应在具体eval目录定义typed generation request及其timeline，不恢复包含零动作占位的通用Dataset。
+- 本轮没有改变公开root5/body265 sample合同、配置路径或共享数据文件，不需要重新预处理数据。
+
+## 2026-07-15 · 纯VAE文本IO与训练基类清理
+
+类型：训练配置收敛 / Lightning基类简化 / 无效接口删除
+
+实际改动内容：
+
+- `configs/vae.yaml`将`text_path`显式设为`null`；`configs/vae_multi.yaml`中的HumanML3D和BABEL子配置也都设为`null`。Dataset公开sample合同不变，但纯VAE训练不再打开和解析未消费的caption TXT。
+- 删除两份VAE配置中未接通训练入口的`test_steps`、`test_meta_paths`和`test_batch_size`；正式重建测试继续由独立`eval/vae/`入口负责。
+- 将`BasicLightningModule`收敛为模型实例化、optimizer/scheduler、EMA、checkpoint和train/validation loss五项职责；删除旧LDF遗留的多validation-loader test路由、空metric/test/render hooks、tokenizer环境变量副作用、`FLOODNET_DEBUG`追踪和`ckpt_hash.txt`写入。
+- 统一缓存实际可训练参数供optimizer和EMA使用，并在fit/validation开始时显式移动EMA；train/val日志改用batch中的真实batch size，直接记录loss tensor，不再逐项调用`.item()`触发GPU同步。
+- 保留现有训练checkpoint的`state_dict + ema_state`格式以及物理statistics恢复检查；新增配置和源码回归断言，防止无效test接口与debug/hash副作用回流。
+- 数据架构文档明确：需要文本的任务设置`text_path: texts`，纯VAE设置`null`。
+
+改动理由：
+
+- VAE只重建root/body motion，加载caption会带来重复文件IO，却不参与collator、模型或loss；是否读取文本应由任务配置表达，而不是改变统一Dataset。
+- 当前训练基类只有VAE使用，旧LDF时期为inline test、render和状态hash保留的空扩展点已经没有调用方；删除这些分支可使正式训练控制流从入口直接读到train/validation语义。
+- 使用配置batch size会错误加权最后一个不足整批的batch，且`.item()`会造成不必要的设备同步；日志应使用运行时batch和原始tensor。
+
+验证：
+
+- Python `py_compile`通过：`utils/training/lightning_module.py`、`tests/test_vae_training.py`。
+- 最终工作区VAE配置、Dataset、Multi、checkpoint定向回归：`25 passed`。
+- 使用真实HumanML3D数据完成CPU Lightning单步train/validation、`last.ckpt`保存、全新module恢复和再次validation；确认VAE sample的`text_data=[]`、EMA checkpoint恢复成功。
+- 最终工作区全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`113 passed`。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `configs/{vae,vae_multi}.yaml`
+- `utils/training/lightning_module.py`
+- `tests/test_vae_training.py`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- `train_vae.py`的`train: false`分支仍沿用`test_ckpt`命名并允许空checkpoint；若继续保留该入口，应改成明确的validation checkpoint接口并在为空时失败，或完全交给`eval/vae/`。
+- `configs/paths_default.yaml`中的WandB凭据管理不属于本次两个改动项，仍应另行迁移为环境变量并轮换现有key。

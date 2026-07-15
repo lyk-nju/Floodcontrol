@@ -13,10 +13,14 @@ from typing import Any, Mapping
 
 import torch
 
-
-FRAMES_PER_TOKEN = 4
-ROOT_DIM = 5
-LOCAL_ROOT_DIM = 4
+from utils.motion_process import LOCAL_ROOT_DIM, ROOT_DIM
+from utils.token_frame import (
+    FRAMES_PER_TOKEN,
+    frame_count_to_token_count,
+    require_aligned_frame_count,
+    token_count_to_frame_count,
+    token_index_to_frame_start,
+)
 
 
 def _require_tensor(name: str, value: torch.Tensor, ndim: int) -> None:
@@ -354,68 +358,6 @@ def unnormalize_features(
     return values * std.to(values) + mean.to(values)
 
 
-def project_root_heading(root_physical: torch.Tensor) -> torch.Tensor:
-    """Return a copy with heading projected onto the unit circle."""
-    heading = root_physical[..., 3:5]
-    norm = heading.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    safe = heading / norm
-    fallback = torch.zeros_like(safe)
-    fallback[..., 0] = 1
-    safe = torch.where((heading.norm(dim=-1, keepdim=True) > 1e-8), safe, fallback)
-    return torch.cat([root_physical[..., :3], safe], dim=-1)
-
-
-def derive_local_root_motion(
-    root_motion_physical: torch.Tensor,
-    previous_root_frame: torch.Tensor | None,
-    *,
-    fps: float = 20.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Derive backward/current-heading-local root features.
-
-    Args:
-        root_motion_physical: ``[B,T,4,5]`` physical root samples.
-        previous_root_frame: physical ``[B,5]`` boundary or ``None`` at cold start.
-
-    Returns:
-        ``(values, feature_valid)`` with shape ``[B,T,4,4]``.
-    """
-    _require_tensor("root_motion_physical", root_motion_physical, 4)
-    if tuple(root_motion_physical.shape[2:]) != (FRAMES_PER_TOKEN, ROOT_DIM):
-        raise ValueError("root_motion_physical must be [B,T,4,5]")
-    batch, tokens = root_motion_physical.shape[:2]
-    flat = project_root_heading(root_motion_physical).reshape(batch, tokens * 4, 5)
-    cold_start = previous_root_frame is None
-    if cold_start:
-        previous = flat[:, :1].clone()
-    else:
-        _require_tensor("previous_root_frame", previous_root_frame, 2)
-        if tuple(previous_root_frame.shape) != (batch, ROOT_DIM):
-            raise ValueError("previous_root_frame must be [B,5]")
-        previous = project_root_heading(previous_root_frame)[:, None]
-    prior = torch.cat([previous, flat[:, :-1]], dim=1)
-
-    delta_x = flat[..., 0] - prior[..., 0]
-    delta_z = flat[..., 2] - prior[..., 2]
-    cos_yaw = flat[..., 3]
-    sin_yaw = flat[..., 4]
-    local_vx = (cos_yaw * delta_x - sin_yaw * delta_z) * float(fps)
-    local_vz = (sin_yaw * delta_x + cos_yaw * delta_z) * float(fps)
-
-    sin_delta = flat[..., 4] * prior[..., 3] - flat[..., 3] * prior[..., 4]
-    cos_delta = flat[..., 3] * prior[..., 3] + flat[..., 4] * prior[..., 4]
-    yaw_rate = torch.atan2(sin_delta, cos_delta) * float(fps)
-    values = torch.stack([yaw_rate, local_vx, local_vz, flat[..., 1]], dim=-1)
-    valid = torch.ones_like(values, dtype=torch.bool)
-    if cold_start:
-        valid[:, 0, :3] = False
-        values[:, 0, :3] = 0
-    return (
-        values.reshape(batch, tokens, FRAMES_PER_TOKEN, LOCAL_ROOT_DIM),
-        valid.reshape(batch, tokens, FRAMES_PER_TOKEN, LOCAL_ROOT_DIM),
-    )
-
-
 def _slice_and_pad(
     value: torch.Tensor | None,
     start: int,
@@ -450,10 +392,10 @@ def create_window_condition(
         raise ValueError("invalid window bounds")
     _check_pair("root_condition", root_condition_value, root_condition_mask)
     _check_pair("body_condition", body_condition_value, body_condition_mask)
-    frame_start = window_origin * FRAMES_PER_TOKEN
-    frame_count = window_tokens * FRAMES_PER_TOKEN
+    frame_start = token_index_to_frame_start(window_origin)
+    frame_count = token_count_to_frame_count(window_tokens)
     future_start = frame_start + frame_count
-    future_count = future_tokens * FRAMES_PER_TOKEN
+    future_count = token_count_to_frame_count(future_tokens)
     return {
         "text_context": list(text_context),
         "text_null_context": list(text_null_context),
@@ -491,9 +433,9 @@ def _root_to_tokens(value: torch.Tensor | None) -> torch.Tensor | None:
         return value
     if value.ndim != 3 or value.shape[-1] != ROOT_DIM:
         raise ValueError("root condition must be [B,F,5] or [B,T,4,5]")
-    if value.shape[1] % FRAMES_PER_TOKEN:
-        raise ValueError("root frame condition length must be divisible by four")
-    return value.reshape(value.shape[0], -1, FRAMES_PER_TOKEN, ROOT_DIM)
+    frames = require_aligned_frame_count(value.shape[1])
+    tokens = frame_count_to_token_count(frames)
+    return value.reshape(value.shape[0], tokens, FRAMES_PER_TOKEN, ROOT_DIM)
 
 
 def create_ldf_condition(window_condition: Mapping[str, Any]) -> LDFCondition:
@@ -579,7 +521,6 @@ def create_cfg_condition(condition: LDFCondition) -> dict[str, LDFCondition]:
 
 
 __all__ = [
-    "FRAMES_PER_TOKEN",
     "ROOT_DIM",
     "LOCAL_ROOT_DIM",
     "HybridMotion",
@@ -590,8 +531,6 @@ __all__ = [
     "create_cfg_condition",
     "create_ldf_condition",
     "create_window_condition",
-    "derive_local_root_motion",
     "normalize_features",
-    "project_root_heading",
     "unnormalize_features",
 ]

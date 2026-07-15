@@ -16,20 +16,20 @@ from typing import Iterable
 
 import numpy as np
 
-from utils.conditions.vae import CONTRACT_VERSION, FRAMES_PER_TOKEN
-from utils.motion_representation import (
-    HUMANML_DIM,
-    HUMANML_SOURCE_REPRESENTATION,
-    MOTION_CONVERTER_VERSION,
+from tools.convert_motion_263_to_265 import HUMANML_DIM
+from utils.token_frame import (
+    FRAMES_PER_TOKEN,
+    aligned_frame_floor,
+    require_aligned_frame_count,
 )
-from tools.motion_artifact import (
+from tools.build_motion_artifact import (
     artifact_is_current,
+    atomic_copy,
     atomic_write_text as _atomic_write_text,
     process_file,
 )
 
 
-SOURCE_REPRESENTATION = HUMANML_SOURCE_REPRESENTATION
 DEFAULT_SPLITS = ("train", "val", "test")
 
 
@@ -66,7 +66,7 @@ def _inspect_motion(path: Path) -> tuple[int, bool]:
         raise ValueError(
             f"HumanML3D source must be [F,{HUMANML_DIM}], got {feature.shape} at {path}"
         )
-    usable = int(feature.shape[0]) // FRAMES_PER_TOKEN * FRAMES_PER_TOKEN
+    usable = aligned_frame_floor(int(feature.shape[0]))
     return usable, bool(np.isfinite(feature).all())
 
 
@@ -83,10 +83,13 @@ def build_dataset(
 ) -> dict[str, object]:
     source_root, output = Path(source_root), Path(output)
     motion_root = source_root / "new_joint_vecs"
+    text_root = source_root / "texts"
     if not motion_root.is_dir():
         raise RuntimeError(
             f"HUMANML3D_DATA_REQUIRED: 263D source directory not found at {motion_root}"
         )
+    if not text_root.is_dir():
+        raise RuntimeError(f"HumanML3D text directory not found at {text_root}")
     if output.resolve() == source_root.resolve():
         raise ValueError(
             "output must not be the legacy HumanML3D root because source split "
@@ -98,8 +101,9 @@ def build_dataset(
     artifact_root = output / artifact_subdir
 
     min_frames = int(min_frames)
-    if min_frames < FRAMES_PER_TOKEN or min_frames % FRAMES_PER_TOKEN:
+    if min_frames < FRAMES_PER_TOKEN:
         raise ValueError("min_frames must be a positive multiple of four")
+    require_aligned_frame_count(min_frames)
 
     source_split_names: dict[str, list[str]] = {}
     missing_by_split: dict[str, list[str]] = {}
@@ -178,14 +182,16 @@ def build_dataset(
             executor.shutdown(wait=True, cancel_futures=True)
 
     output.mkdir(parents=True, exist_ok=True)
+    for name in unique_names:
+        source_text = text_root / f"{name}.txt"
+        if not source_text.is_file():
+            raise RuntimeError(f"HumanML3D text file not found at {source_text}")
+        atomic_copy(source_text, output / "texts" / source_text.name)
     for split, names in split_names.items():
         _atomic_write_text(
             output / f"{split}.txt", "".join(f"{name}\n" for name in names)
         )
     summary = {
-        "contract_version": CONTRACT_VERSION,
-        "converter_version": MOTION_CONVERTER_VERSION,
-        "source_representation": SOURCE_REPRESENTATION,
         "source_root": str(source_root.resolve()),
         "artifact_path": str(artifact_subdir),
         "fps": float(fps),
@@ -197,13 +203,11 @@ def build_dataset(
         },
         "too_short": {name: len(values) for name, values in too_short_by_split.items()},
         "unique_artifacts": len(tasks),
+        "copied_texts": len(unique_names),
         "converted": converted,
         "skipped": skipped,
         "converted_frames": total_frames,
     }
-    _atomic_write_text(
-        output / "build_summary.json", json.dumps(summary, indent=2, sort_keys=True) + "\n"
-    )
     return summary
 
 

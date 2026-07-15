@@ -5,10 +5,8 @@ import torch
 
 from typing import Dict, Iterable, List, Sequence
 
-from utils.motion_process import (
-    extract_root_trajectory_263_torch,
-    recover_joint_positions_263,
-)
+from utils.conditions.vae import BODY_CONTINUOUS_DIM, BODY_DIM, ROOT_DIM
+from utils.motion_process import recover_joint_positions
 
 
 def build_eval_summary(records: Sequence[Dict]) -> Dict:
@@ -31,14 +29,16 @@ def build_eval_summary(records: Sequence[Dict]) -> Dict:
     return summary
 
 
-def _to_feature_tensor(pred_feature: torch.Tensor | np.ndarray) -> torch.Tensor:
-    if torch.is_tensor(pred_feature):
-        feat = pred_feature.detach().float().cpu()
+def _to_motion_tensor(value: torch.Tensor | np.ndarray, dim: int) -> torch.Tensor:
+    if torch.is_tensor(value):
+        motion = value.detach().float().cpu()
     else:
-        feat = torch.from_numpy(np.asarray(pred_feature)).float()
-    if feat.ndim != 2:
-        raise ValueError(f"Expected feature tensor with shape (T, C), got {tuple(feat.shape)}")
-    return feat
+        motion = torch.from_numpy(np.asarray(value)).float()
+    if motion.ndim != 2 or motion.shape[-1] != dim:
+        raise ValueError(
+            f"Expected motion tensor with shape [F,{dim}], got {tuple(motion.shape)}"
+        )
+    return motion
 
 
 def decode_stream_chunks(
@@ -63,14 +63,16 @@ def decode_stream_chunks(
         if chunk.ndim == 2:
             chunk = chunk.unsqueeze(0)
         if state is None:
-            state = vae.init_decoder_state(chunk.shape[0], device=chunk.device, dtype=chunk.dtype)
+            state = vae.init_decoder_state(
+                chunk.shape[0], device=chunk.device, dtype=chunk.dtype
+            )
         token_outputs = []
         for token in range(chunk.shape[1]):
-            state, output = vae.stream_decode_step(
+            state, output = vae.detokenize_step(
                 chunk[:, token : token + 1],
                 root_chunk[:, token : token + 1],
-                state,
                 valid_chunk[:, token : token + 1],
+                state,
             )
             token_outputs.append(output.body_motion())
         decoded_chunk = torch.cat(token_outputs, dim=1)[0].float().detach().cpu()
@@ -86,12 +88,19 @@ def decode_stream_chunks(
 
 
 def compute_stream_boundary_metrics(
-    pred_feature: torch.Tensor | np.ndarray,
+    root_motion: torch.Tensor | np.ndarray,
+    body_motion: torch.Tensor | np.ndarray,
     chunk_frame_ends: Sequence[int],
-    joints_num: int = 22,
 ) -> Dict:
-    feat = _to_feature_tensor(pred_feature)
-    if feat.numel() == 0 or feat.shape[-1] != 263:
+    """Measure root and joint discontinuity at committed chunk boundaries."""
+    root = _to_motion_tensor(root_motion, ROOT_DIM)
+    body_dim = int(body_motion.shape[-1])
+    if body_dim not in (BODY_CONTINUOUS_DIM, BODY_DIM):
+        raise ValueError("body_motion must end in 261 or 265")
+    body = _to_motion_tensor(body_motion, body_dim)
+    if root.shape[0] != body.shape[0]:
+        raise ValueError("root_motion and body_motion must share frame length")
+    if root.numel() == 0:
         return {
             "root_jump_per_boundary": [],
             "joint_jump_per_boundary": [],
@@ -104,7 +113,7 @@ def compute_stream_boundary_metrics(
     valid_boundaries = [
         int(boundary)
         for boundary in chunk_frame_ends[:-1]
-        if 0 < int(boundary) < int(feat.shape[0])
+        if 0 < int(boundary) < int(root.shape[0])
     ]
     if not valid_boundaries:
         return {
@@ -116,8 +125,8 @@ def compute_stream_boundary_metrics(
             "n_boundaries": 0,
         }
 
-    root_xyz = extract_root_trajectory_263_torch(feat.unsqueeze(0))[0].cpu().numpy()
-    joints_xyz = recover_joint_positions_263(feat.numpy(), joints_num=joints_num)
+    root_xyz = root[:, :3].numpy()
+    joints_xyz = recover_joint_positions(root, body).numpy()
 
     root_jumps: List[float] = []
     joint_jumps: List[float] = []
@@ -143,36 +152,49 @@ def compute_stream_boundary_metrics(
 
 
 def compute_stream_vs_offline_metrics(
-    pred_stream_feature: torch.Tensor | np.ndarray,
-    pred_offline_feature: torch.Tensor | np.ndarray,
+    stream_root_motion: torch.Tensor | np.ndarray,
+    stream_body_motion: torch.Tensor | np.ndarray,
+    offline_root_motion: torch.Tensor | np.ndarray,
+    offline_body_motion: torch.Tensor | np.ndarray,
 ) -> Dict:
-    stream_feat = _to_feature_tensor(pred_stream_feature)
-    offline_feat = _to_feature_tensor(pred_offline_feature)
-    if stream_feat.numel() == 0 or offline_feat.numel() == 0:
+    """Compare explicit hybrid motion decoded through stream and offline paths."""
+    stream_root = _to_motion_tensor(stream_root_motion, ROOT_DIM)
+    offline_root = _to_motion_tensor(offline_root_motion, ROOT_DIM)
+    stream_body_dim = int(stream_body_motion.shape[-1])
+    offline_body_dim = int(offline_body_motion.shape[-1])
+    if stream_body_dim != offline_body_dim or stream_body_dim not in (
+        BODY_CONTINUOUS_DIM,
+        BODY_DIM,
+    ):
+        raise ValueError("stream/offline body motions must share dimension 261 or 265")
+    stream_body = _to_motion_tensor(stream_body_motion, stream_body_dim)
+    offline_body = _to_motion_tensor(offline_body_motion, offline_body_dim)
+    if stream_root.shape[0] != stream_body.shape[0]:
+        raise ValueError("stream root/body lengths differ")
+    if offline_root.shape[0] != offline_body.shape[0]:
+        raise ValueError("offline root/body lengths differ")
+    if stream_body.numel() == 0 or offline_body.numel() == 0:
         return {
             "feature_l2_mean": float("nan"),
             "feature_l2_max": float("nan"),
             "root_ade": float("nan"),
-            "length_delta": abs(int(stream_feat.shape[0]) - int(offline_feat.shape[0])),
+            "length_delta": abs(int(stream_body.shape[0]) - int(offline_body.shape[0])),
         }
 
-    aligned_len = min(int(stream_feat.shape[0]), int(offline_feat.shape[0]))
-    diff = stream_feat[:aligned_len] - offline_feat[:aligned_len]
+    aligned_len = min(int(stream_body.shape[0]), int(offline_body.shape[0]))
+    diff = stream_body[:aligned_len] - offline_body[:aligned_len]
     feature_l2 = diff.norm(dim=-1)
 
     result = {
         "feature_l2_mean": float(feature_l2.mean().item()),
         "feature_l2_max": float(feature_l2.max().item()),
-        "length_delta": abs(int(stream_feat.shape[0]) - int(offline_feat.shape[0])),
+        "length_delta": abs(int(stream_body.shape[0]) - int(offline_body.shape[0])),
     }
-
-    if stream_feat.shape[-1] == 263 and offline_feat.shape[-1] == 263:
-        stream_root = extract_root_trajectory_263_torch(stream_feat[:aligned_len].unsqueeze(0))[0]
-        offline_root = extract_root_trajectory_263_torch(offline_feat[:aligned_len].unsqueeze(0))[0]
-        root_diff = stream_root[:, [0, 2]] - offline_root[:, [0, 2]]
-        result["root_ade"] = float(root_diff.norm(dim=-1).mean().item())
-    else:
-        result["root_ade"] = float("nan")
+    root_diff = (
+        stream_root[:aligned_len, [0, 2]]
+        - offline_root[:aligned_len, [0, 2]]
+    )
+    result["root_ade"] = float(root_diff.norm(dim=-1).mean().item())
     return result
 
 

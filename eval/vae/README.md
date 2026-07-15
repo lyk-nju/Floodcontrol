@@ -31,6 +31,10 @@ saved as the reference. Each rolling window is also decoded offline from a
 fresh boundary; agreement between that result and token-by-token replay checks
 the cache implementation independently of the expected finite-history error.
 
+当前正式decoder的完整历史感受野为24 tokens。默认`history_tokens=10`
+故意衡量有限历史质量下降；将其设为24时，rolling输出必须与persistent
+stream在数值容差内一致，并作为强回归检查。
+
 ```bash
 python -m eval.vae.rolling --config eval/vae/rolling.yaml
 ```
@@ -72,3 +76,7 @@ joints. Direct stream must match full-sequence offline decode. Rolling replay
 must match offline decode of each identical truncated window. The default
 `1e-4` tolerance accounts for floating-point accumulation-order differences
 between full-sequence and token-by-token convolutions.
+
+Skating评估分别报告GT-contact position-derived、predicted-contact
+position-derived和GT-contact velocity-feature三个指标；crop首帧、padding和
+无效position/velocity transition不会进入均值。
