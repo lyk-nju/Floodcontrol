@@ -1,7 +1,13 @@
 import torch
-from torch.utils.data import Dataset
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader, Dataset
 
-from utils.training.ldf.data import LDFSpanCollator, MinimumFrameDataset
+from utils.training.ldf.data import (
+    LDFSpanCollator,
+    LengthBucketBatchSampler,
+    MinimumFrameDataset,
+    create_dataloaders,
+)
 
 
 def make_sample(frames=40, name="sample"):
@@ -161,6 +167,109 @@ def test_babel_span_compiles_one_prompt_per_motion_token(monkeypatch):
     assert prompt_timeline == ["walk"] + ["turn"] * 9
 
 
+def test_babel_arbitrary_frame_intervals_use_maximum_token_overlap():
+    sample = make_sample(40)
+    sample["dataset"] = "BABEL"
+    sample["text_data"] = [
+        {"text": "walk", "tokens": [], "start_frame": 0, "end_frame": 5},
+        {"text": "turn", "tokens": [], "start_frame": 5, "end_frame": 40},
+        # Equal overlap on token [4,8), but this shorter interval is more specific.
+        {"text": "step", "tokens": [], "start_frame": 4, "end_frame": 8},
+    ]
+    timeline = LDFSpanCollator(
+        min_frames=40,
+        max_frames=40,
+        encoder_context_tokens=0,
+        training=False,
+        cold_start=True,
+    )([sample])["prompt_timeline"][0]
+
+    assert timeline == ["walk", "step"] + ["turn"] * 8
+
+
+def test_length_bucket_sampler_does_not_mix_short_and_long_clips():
+    class BucketDataset(Dataset):
+        def __init__(self):
+            self.samples = [
+                make_sample(40, "40"),
+                make_sample(44, "44"),
+                make_sample(100, "100"),
+                make_sample(104, "104"),
+            ]
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, index):
+            return self.samples[index]
+
+    dataset = MinimumFrameDataset(BucketDataset(), min_frames=40)
+    sampler = LengthBucketBatchSampler(
+        dataset,
+        batch_size=2,
+        bucket_width_frames=20,
+        max_frames=200,
+        seed=3,
+    )
+    batches = list(sampler)
+    assert len(batches) == 2
+    assert all(
+        max(dataset.frame_counts[index] for index, _ in batch)
+        - min(dataset.frame_counts[index] for index, _ in batch)
+        < 20
+        for batch in batches
+    )
+
+
+def test_seeded_training_batch_reproduces_crop_caption_and_yaw():
+    sample = make_sample(56)
+    sample["dataset"] = "HumanML3D"
+    sample["_augmentation_seed"] = 91
+    sample["text_data"] = [
+        {"text": "first", "tokens": [], "start_frame": 0, "end_frame": 56},
+        {"text": "second", "tokens": [], "start_frame": 0, "end_frame": 56},
+    ]
+    collator = LDFSpanCollator(
+        min_frames=40,
+        max_frames=48,
+        encoder_context_tokens=2,
+        training=True,
+        random_yaw=True,
+        cold_start=False,
+    )
+    first = collator([sample])
+    second = collator([sample])
+    assert torch.equal(first["root_motion"], second["root_motion"])
+    assert torch.equal(first["body_motion"], second["body_motion"])
+    assert first["source_start_token"].tolist() == second["source_start_token"].tolist()
+    assert first["prompt_timeline"] == second["prompt_timeline"]
+
+
+def test_length_bucket_sampler_indices_flow_through_dataloader():
+    dataset = MinimumFrameDataset(VariableLengthDataset(), min_frames=40)
+    sampler = LengthBucketBatchSampler(
+        dataset,
+        batch_size=1,
+        bucket_width_frames=20,
+        max_frames=40,
+        seed=5,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=LDFSpanCollator(
+            min_frames=40,
+            max_frames=40,
+            encoder_context_tokens=0,
+            training=True,
+            cold_start=True,
+        ),
+    )
+    batch = next(iter(loader))
+    assert batch["name"] == ["valid"]
+    assert batch["root_motion"].shape == (1, 40, 5)
+
+
 def test_validation_probes_are_deterministic_for_cold_and_continuation():
     sample = make_sample(56)
     sample["dataset"] = "HumanML3D"
@@ -186,6 +295,40 @@ def test_validation_probes_are_deterministic_for_cold_and_continuation():
     second = continuation_collator([sample])
 
     assert cold["source_start_token"].tolist() == [0]
+    assert cold["context_token_count"].tolist() == [0]
     assert first["source_start_token"].tolist() == [2]
+    assert first["context_token_count"].tolist() == [2]
     assert torch.equal(first["root_motion"], second["root_motion"])
     assert first["prompt_timeline"][0] == ["first"] * 10
+
+
+def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
+    dataset = MinimumFrameDataset(VariableLengthDataset(), min_frames=40)
+    monkeypatch.setattr(
+        "utils.training.ldf.data.create_dataset", lambda _cfg, _split: dataset
+    )
+    cfg = OmegaConf.create(
+        {
+            "seed": 3,
+            "train": True,
+            "self_forcing": {"enabled": True},
+            "data": {
+                "min_frames": 40,
+                "max_frames": 40,
+                "random_yaw": False,
+                "cold_start_probability": 0.1,
+                "length_bucket_frames": 20,
+                "train_batch_size": 1,
+                "val_batch_size": 1,
+                "num_workers": 0,
+                "pin_memory": False,
+            },
+        }
+    )
+    train, validation = create_dataloaders(cfg, encoder_context_tokens=2)
+    assert train is not None
+    assert [next(iter(loader))["validation_probe"] for loader in validation] == [
+        "teacher_cold",
+        "teacher_continuation",
+        "self_forcing",
+    ]

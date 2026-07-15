@@ -9,7 +9,7 @@
 - CFG先组合唯一root velocity，再从唯一clean root派生local root，最后运行共享该root的Body CFG branches。
 - Body Stage不直接读取raw current/future root constraints；root constraint只通过Root Stage的clean/local root影响body。
 - 已物理删除ControlNet、专用轨迹编码器、FlexTraj、tiny专用模型、外置root planner和RootPlan runtime闭环。
-- 真实训练从独立checkpoint加载冻结EMA VAE与冻结UMT5，在线构造deterministic latent、逐token文本条件和root/body flow-v loss；Web模型加载在正式checkpoint合同冻结前仍以`BLOCKED_ON_LDF_CHECKPOINT` fail-fast。
+- 真实训练从独立checkpoint加载冻结EMA VAE，在线构造deterministic latent，并从冻结UMT5预先生成的caption table lookup逐token文本条件；训练进程不加载UMT5本体。Web模型加载在正式checkpoint合同冻结前仍以`BLOCKED_ON_LDF_CHECKPOINT` fail-fast。
 
 本文只回答新版 LDF 在代码层怎样组织，以及怎样在不丢失 FloodDiffusion 流式状态机的前提下，用 Root/Body 两阶段主干接管旧 FloodNet ControlNet 路径。物理 root 定义、VAE 协议、数据构造、active-window 坐标事务和训练超参数分别由其他文档负责。
 
@@ -106,7 +106,7 @@ attention / SDPA fallback
 non-causal self-attention
 有效 token lengths/padding
 显式 position IDs
-sample-aligned 或严格token-aligned text context
+sample-aligned 或 direct token-aligned text context
 ```
 
 它不再支持 `traj_emb`、`traj_seq_lens`、`traj_token_mask`、`latent_pad_len`、`traj_pad_len` 或 `controlnet_residuals`。

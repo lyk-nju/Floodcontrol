@@ -18,6 +18,7 @@ from utils.training.ldf.self_forcing import (
     run_self_forcing_rollout,
     sample_rollout_steps,
     sample_window_plan,
+    self_forcing_phase_progress,
 )
 
 
@@ -126,10 +127,14 @@ def test_training_steps_reuse_absolute_noise_and_keep_fixed_span_masks():
     second = build_ldf_training_step(step_index=1, **kwargs)
 
     assert first.inputs.history_mask.tolist() == [[True, True] + [False] * 8]
-    assert first.inputs.generation_mask.tolist() == [[False, False] + [True] * 8]
+    assert first.inputs.generation_mask.tolist() == [
+        [False, False] + [True] * 5 + [False] * 3
+    ]
     assert first.loss_mask.tolist() == [[False, False] + [True] * 5 + [False] * 3]
     assert second.loss_mask.tolist() == [[False] * 3 + [True] * 5 + [False] * 2]
-    assert second.inputs.generation_mask.tolist() == [[False] * 3 + [True] * 7]
+    assert second.inputs.generation_mask.tolist() == [
+        [False] * 3 + [True] * 5 + [False] * 2
+    ]
     assert first.inputs.timeline_position_ids.tolist() == [list(range(4, 14))]
     assert first.inputs.rope_position_ids.tolist() == [list(range(-2, 8))]
     # Token 8 is frontier noise in both steps; token 3 follows one fixed noise path.
@@ -247,3 +252,12 @@ def test_teacher_replay_is_configurable_without_changing_k_curriculum():
     assert sample_rollout_steps(
         0.8, generator=generator, teacher_replay={5: 0.0}
     ) == 5
+
+
+def test_self_forcing_curriculum_progress_is_relative_to_finetune_phase():
+    kwargs = {"phase_start_step": 300_000, "phase_steps": 200_000}
+    assert self_forcing_phase_progress(299_999, **kwargs) == 0.0
+    assert self_forcing_phase_progress(300_000, **kwargs) == 0.0
+    assert self_forcing_phase_progress(400_000, **kwargs) == 0.5
+    assert self_forcing_phase_progress(500_000, **kwargs) == 1.0
+    assert self_forcing_phase_progress(600_000, **kwargs) == 1.0

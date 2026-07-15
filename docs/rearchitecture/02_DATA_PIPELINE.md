@@ -38,7 +38,7 @@ HumanML3D root deltas + RIC positions + IK local rotations
 
 `HumanML3DDataset`与`BABELDataset`分别解析自己的split和`caption#tokens#start#end`文本，且不互相继承；统一返回完整未裁剪sample：`dataset/name/root_motion/body_motion/body_feature_valid_mask/text_data`。处理后的dataset root自包含split、`artifacts/`和`texts/`；需要文本的任务使用相对目录`text_path: texts`，纯VAE训练可显式设置`text_path: null`，避免读取未消费的caption。motion NPZ只保存三组tensor，文本保持独立TXT，不把字符串复制进每个NPZ。公开source identity固定为`HumanML3D`和`BABEL`，不从数据目录名推导，因此目录移动或重命名不会改变batch metadata。`MultiDataset`只实例化并concat子Dataset，不拥有collate。
 
-任务相关处理下沉到training data层：`utils/training/vae/data.py`负责VAE crop、translation rebase、同步yaw、previous-root和padding；LDF的`MinimumFrameDataset`先排除不足source-span最短长度的样本，避免短BABEL clip在随机batch中延迟报错。`LDFSpanCollator`再选择batch共享的40–200帧physical source span、真实VAE左context、previous root、source crop坐标和token prompt timeline。HumanML3D从覆盖当前span的caption备选中选择一条并重复到每个token；BABEL把四帧对齐的半开区间直接编译为每token一个prompt，区间重叠或未对齐会fail-fast。它不再决定H/active/frontier，也不做translation anchor、noise或self-forcing。10% true cold-start batch强制从sample起点开始、context为空且previous-root无效；普通continuation允许mid-clip crop并携带真实边界。
+任务相关处理下沉到training data层：`utils/training/vae/data.py`负责VAE crop、translation rebase、同步yaw、previous-root和padding；LDF的`MinimumFrameDataset`先排除不足source-span最短长度的样本，避免短BABEL clip在随机batch中延迟报错。训练loader通过长度分桶避免一个短clip把整批长动作压成短span；`LDFSpanCollator`再选择batch共享的40–200帧physical source span、真实VAE左context、previous root、source crop坐标和token prompt timeline。HumanML3D从覆盖当前span的caption备选中选择一条并重复到每个token；BABEL原始caption允许任意frame半开区间，每个四帧token按最大帧重叠选择caption，平局时优先更短区间和稳定原始顺序。它不再决定H/active/frontier，也不做translation anchor、noise或self-forcing。10% true cold-start batch强制从sample起点开始、context为空且previous-root无效；普通continuation允许mid-clip crop并携带真实边界。训练crop、caption和yaw由sampler提供的epoch/sample seed决定，使恢复到同一epoch和batch时重建相同增强。
 
 statistics和VAE reconstruction evaluation直接消费Dataset full sample，不读取artifact manifest。physical statistics仍用四个quarter-turn quadrature点匹配均匀yaw的一阶和逐维二阶矩；latent statistics改用显式seed的普通随机生成器，不再用sample hash决定yaw。
 
@@ -82,6 +82,14 @@ python -m tools.compute_ldf_root_stats \
   --max-frames 200 \
   --windows-per-sample 1 \
   --seed 1234
+
+python -m tools.pretokenize_t5_text \
+  --config configs/ldf.yaml \
+  --output ${RAW_DATA}/HumanML3D_motion/t5_text_embeddings.pt
+
+python -m tools.pretokenize_t5_text \
+  --config configs/ldf_multi.yaml \
+  --output ${RAW_DATA}/HumanML3D_BABEL_t5_text_embeddings.pt
 
 # 正式LDF训练直接从checkpoint加载EMA encoder并在线产生deterministic mu。
 ```

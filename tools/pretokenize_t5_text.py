@@ -307,6 +307,10 @@ def main():
     for batch in pbar:
         encoded = encoder(batch, device)
         for s, t in zip(batch, encoded):
+            if t.ndim != 2 or t.shape[-1] != 4096:
+                raise ValueError(f"UMT5 embedding for {s!r} must be [L,4096]")
+            if not bool(torch.isfinite(t).all()):
+                raise ValueError(f"UMT5 embedding for {s!r} contains non-finite values")
             emb_dict[s] = t.detach().cpu()
 
     encoder.model.cpu()

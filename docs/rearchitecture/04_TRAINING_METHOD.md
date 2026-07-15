@@ -49,11 +49,13 @@ L_latent_body_flow_v
 - 一个rollout只采样一次per-sample phase和absolute-token root/body Gaussian noise。active右移时只改变beta，同一token不会跳到另一条diffusion path。
 - translation anchor由初始H确定并在整个K步保持不变；region boundary移动不触发OriginEpoch rebase。
 - 前K-1步保持`model.train()`并在`torch.no_grad()`内运行，只用`x_beta+beta*v_pred`替换最左active token；最终一步保留梯度并只监督当前5-token active band。
-- teacher baseline使用K=1；fine-tune默认K=2/3/5，并支持20%/10%/10%的K=1 replay。replay概率是实验配置，不是模型协议。
+- teacher baseline使用K=1；fine-tune默认K=2/3/5，并支持20%/10%/10%的K=1 replay。curriculum进度从显式`phase_start_step`起算，并在`phase_steps`内从0推进到1，不使用包含baseline的全局训练进度。replay概率是实验配置，不是模型协议。
 
-训练实现分为`flow.py`的代数、`batch.py`的固定S输入合同和`self_forcing.py`的plan/state rollout。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ，通过冻结UMT5把`prompt_timeline[B][S]`编码成token-aligned context，并只保存/优化LDF。它不调用也不复制正式runtime的commit、roll或rebase状态机。
+训练实现分为`flow.py`的代数、`batch.py`的固定S输入合同和`self_forcing.py`的plan/state rollout。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ；冻结UMT5只在训练前运行一次并生成caption-to-embedding table，训练热路径按prompt字符串lookup token-aligned context，不在LDF GPU上加载11GB文本编码器。LDF checkpoint只保存LDF/EMA，但附带VAE/statistics/text路径与VAE统计用于resume前校验。它不调用也不复制正式runtime的commit、roll或rebase状态机。
 
-文本条件遵循FloodDiffusion的局部性：HumanML3D的一条动作caption在span内重复；BABEL的区间caption编译到对应token。Root/Body Stage的每个motion query只cross-attend自身prompt，不读取其他token的文本。训练以sample级text dropout构造空文本分布，推理CFG复用同一空文本语义。
+文本条件遵循FloodDiffusion的局部性：HumanML3D的一条动作caption在span内重复；BABEL的区间caption编译到对应token。Root/Body Stage的每个motion query直接cross-attend自身prompt；后续Transformer层仍可通过可见motion token之间的non-causal self-attention传播已经注入的文本信息，因此该协议是`direct token-aligned cross-attention`，不是严格文本隔离。pure-noise frontier不进入当前attention，未到达active band的未来prompt不能提前传播。训练以sample级text dropout构造空文本分布，推理CFG复用同一空文本语义。
+
+Validation使用固定seed的三个独立probe：teacher cold start固定`H=0,K=1`，teacher continuation固定中间crop和`H=5,K=1`；启用self-forcing后再增加固定`H=1,K=5` probe。phase、root/body noise和文本选择对同一batch保持确定，使checkpoint loss可横向比较。
 
 ## 当前待讨论问题
 

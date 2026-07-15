@@ -113,13 +113,19 @@ class LDFCondition:
             raise TypeError("text_context and text_null_context must be lists")
         text_features = self.text_context + self.text_null_context
         text_dim = None
+        finite_checked: set[int] = set()
         for index, value in enumerate(text_features):
             if not torch.is_tensor(value) or value.ndim != 2:
                 raise ValueError(
                     f"text context {index} must be a rank-2 tensor [L,C]"
                 )
-            if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
-                raise ValueError("text contexts must contain finite floating-point values")
+            if not value.is_floating_point():
+                raise ValueError("text contexts must contain floating-point values")
+            identity = id(value)
+            if identity not in finite_checked:
+                if not bool(torch.isfinite(value).all()):
+                    raise ValueError("text contexts must contain finite values")
+                finite_checked.add(identity)
             if value.shape[0] <= 0 or value.shape[1] <= 0:
                 raise ValueError("text contexts must have positive sequence and feature sizes")
             if text_dim is None:

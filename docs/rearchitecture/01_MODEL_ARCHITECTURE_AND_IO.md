@@ -95,7 +95,7 @@ coordinate/value types
 
 ### 删除状态
 
-上述旧模块删除门槛已经由新版forward、CFG、Hybrid stream与全仓残留搜索满足。真实LDF teacher-training已接入冻结EMA VAE、冻结UMT5、逐token prompt、flow-v loss、optimizer和EMA；Web runtime结构已经完成，但模型加载在正式LDF checkpoint冻结前以`BLOCKED_ON_LDF_CHECKPOINT` fail-fast。HumanML263只作为离线物理表示来源，不作为新版VAE或LDF的运行时接口。
+上述旧模块删除门槛已经由新版forward、CFG、Hybrid stream与全仓残留搜索满足。真实LDF teacher-training已接入冻结EMA VAE、离线UMT5 embedding lookup、逐token prompt、flow-v loss、optimizer和EMA；Web runtime结构已经完成，但模型加载在正式LDF checkpoint冻结前以`BLOCKED_ON_LDF_CHECKPOINT` fail-fast。HumanML263只作为离线物理表示来源，不作为新版VAE或LDF的运行时接口。
 
 ## 在线因果性不等于 LDF causal attention
 

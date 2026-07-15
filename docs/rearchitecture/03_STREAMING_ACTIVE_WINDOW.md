@@ -112,7 +112,7 @@ origin_xz += delta_physical
 
 `TextTimeline`使用严格半开区间`[start_token,end_token)`。相同文本只通过`TextEmbeddingCache`编码一次；cache保存CPU派生结果，不属于确定性snapshot状态。text update不能修改committed token，但可以在尚未commit的未来token预先安排。
 
-condition compiler可以预先解析完整window的prompt timeline，但Root/Body cross-attention会按motion token逐项选择自己的prompt，并由当前有效前缀mask屏蔽pure-noise tail。因此预先安排的未来caption不会通过“扩大seq_len”或共享文本序列提前泄漏到当前动作。
+condition compiler可以预先解析完整window的prompt timeline，但Root/Body cross-attention会按motion token逐项选择自己的prompt，并由当前有效前缀mask屏蔽pure-noise tail。可见token注入的prompt可以在后续层通过non-causal motion self-attention参与动作过渡；不可见future token则不能通过“扩大seq_len”或共享文本序列提前泄漏到当前动作。
 
 ### 7.2 Route
 

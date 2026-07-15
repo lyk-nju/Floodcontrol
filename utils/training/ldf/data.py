@@ -9,10 +9,12 @@ self-forcing state deliberately belong to the later training kernel.
 from __future__ import annotations
 
 import random
+from collections import defaultdict
+from math import ceil
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 from utils.initialize import instantiate_target
 from utils.motion_process import BODY_DIM, ROOT_DIM, rotate_motion_yaw, rotate_root_yaw
@@ -25,6 +27,7 @@ class MinimumFrameDataset(Dataset):
     def __init__(self, dataset: Dataset, *, min_frames: int):
         self.min_frames = int(min_frames)
         self.samples: list[tuple[Dataset, int]] = []
+        self.frame_counts: list[int] = []
         self.rejected_count = 0
         sources = dataset.datasets if isinstance(dataset, ConcatDataset) else [dataset]
         for source in sources:
@@ -41,6 +44,7 @@ class MinimumFrameDataset(Dataset):
                     frame_count = int(source[index]["root_motion"].shape[0])
                 if frame_count >= self.min_frames:
                     self.samples.append((source, index))
+                    self.frame_counts.append(frame_count)
                 else:
                     self.rejected_count += 1
         if not self.samples:
@@ -51,9 +55,78 @@ class MinimumFrameDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index: int | tuple[int, int]):
+        augmentation_seed = None
+        if isinstance(index, tuple):
+            index, augmentation_seed = index
         source, source_index = self.samples[index]
-        return source[source_index]
+        sample = source[source_index]
+        if augmentation_seed is None:
+            return sample
+        seeded = dict(sample)
+        seeded["_augmentation_seed"] = int(augmentation_seed)
+        return seeded
+
+
+class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
+    """Shuffle clips in length buckets before forming training batches."""
+
+    def __init__(
+        self,
+        dataset: MinimumFrameDataset,
+        *,
+        batch_size: int,
+        bucket_width_frames: int,
+        max_frames: int,
+        seed: int,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.bucket_width_frames = int(bucket_width_frames)
+        self.max_frames = int(max_frames)
+        self.seed = int(seed)
+        self.epoch = 0
+        # Lightning discovers set_epoch() through batch_sampler.sampler.
+        self.sampler = self
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if (
+            self.bucket_width_frames < FRAMES_PER_TOKEN
+            or self.bucket_width_frames % FRAMES_PER_TOKEN
+        ):
+            raise ValueError("bucket_width_frames must be a positive multiple of four")
+
+        self.buckets: dict[int, list[int]] = defaultdict(list)
+        for index, frame_count in enumerate(dataset.frame_counts):
+            capped = min(int(frame_count), self.max_frames)
+            self.buckets[capped // self.bucket_width_frames].append(index)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        batches: list[list[int]] = []
+        for indices in self.buckets.values():
+            order = torch.randperm(len(indices), generator=generator).tolist()
+            shuffled = [indices[position] for position in order]
+            batches.extend(
+                shuffled[start : start + self.batch_size]
+                for start in range(0, len(shuffled), self.batch_size)
+            )
+        order = torch.randperm(len(batches), generator=generator).tolist()
+        epoch = self.epoch
+        self.epoch += 1
+        for position in order:
+            yield [
+                (index, self.seed + epoch * 1_000_003 + index)
+                for index in batches[position]
+            ]
+
+    def __len__(self) -> int:
+        return sum(
+            ceil(len(indices) / self.batch_size) for indices in self.buckets.values()
+        )
 
 
 class LDFSpanCollator:
@@ -69,6 +142,7 @@ class LDFSpanCollator:
         random_yaw: bool = False,
         cold_start_probability: float = 0.1,
         cold_start: bool | None = None,
+        validation_probe: str | None = None,
     ):
         self.min_frames = int(min_frames)
         self.max_frames = int(max_frames)
@@ -78,6 +152,7 @@ class LDFSpanCollator:
         self.random_yaw = bool(random_yaw and training)
         self.cold_start_probability = float(cold_start_probability)
         self.cold_start = cold_start
+        self.validation_probe = validation_probe
 
         for name, value in (
             ("min_frames", self.min_frames),
@@ -92,14 +167,16 @@ class LDFSpanCollator:
         if not 0.0 <= self.cold_start_probability <= 1.0:
             raise ValueError("cold_start_probability must lie in [0,1]")
 
-    def _select_cold_start(self) -> bool:
+    def _select_cold_start(self, rng=random) -> bool:
         if self.cold_start is not None:
             return bool(self.cold_start)
         if not self.training:
             return True
-        return random.random() < self.cold_start_probability
+        return rng.random() < self.cold_start_probability
 
-    def _select_span_tokens(self, samples: list[dict[str, object]]) -> int:
+    def _select_span_tokens(
+        self, samples: list[dict[str, object]], rng=random
+    ) -> int:
         available = min(
             int(sample["root_motion"].shape[0]) // FRAMES_PER_TOKEN
             for sample in samples
@@ -114,7 +191,7 @@ class LDFSpanCollator:
                 f"LDF span requires at least {self.min_frames} frames; "
                 f"short batch contains {identities}"
             )
-        return random.randint(minimum, maximum) if self.training else maximum
+        return rng.randint(minimum, maximum) if self.training else maximum
 
     def _select_start_token(
         self,
@@ -122,19 +199,21 @@ class LDFSpanCollator:
         available_tokens: int,
         span_tokens: int,
         cold_start: bool,
+        rng=random,
     ) -> int:
         if cold_start:
             return 0
         maximum = available_tokens - span_tokens
         if self.training:
-            return random.randint(0, maximum)
+            return rng.randint(0, maximum)
         return maximum // 2
 
     def _select_caption(
         self,
         alternatives: list[dict[str, object]],
+        rng=random,
     ) -> dict[str, object]:
-        return random.choice(alternatives) if self.training else alternatives[0]
+        return rng.choice(alternatives) if self.training else alternatives[0]
 
     def _prompt_timeline(
         self,
@@ -143,13 +222,14 @@ class LDFSpanCollator:
         *,
         start_frame: int,
         span_frames: int,
+        rng=random,
     ) -> list[str]:
         """Compile source captions into one prompt for every motion token.
 
         HumanML3D describes one action clip, so one relevant caption is chosen
-        and repeated across the complete sampled span.  BABEL supplies a
-        piecewise action timeline; each four-frame token receives only the
-        caption whose interval owns that complete token.
+        and repeated across the complete sampled span. BABEL annotations may
+        end at arbitrary frames, so each four-frame token chooses the caption
+        with the largest frame overlap.
         """
 
         span_tokens = span_frames // FRAMES_PER_TOKEN
@@ -188,29 +268,39 @@ class LDFSpanCollator:
             if not candidates:
                 return [""] * span_tokens
             alternatives = max(candidates, key=lambda item: item[:-1])[-1]
-            text = str(self._select_caption(alternatives)["text"])
+            text = str(self._select_caption(alternatives, rng)["text"])
             return [text] * span_tokens
 
-        timeline = [""] * span_tokens
-        for (caption_start, caption_end), alternatives in sorted(grouped.items()):
-            overlap_start = max(start_frame, caption_start)
-            overlap_end = min(span_end, caption_end)
-            if overlap_start >= overlap_end:
-                continue
-            if caption_start % FRAMES_PER_TOKEN or caption_end % FRAMES_PER_TOKEN:
-                raise ValueError(
-                    f"{dataset} text intervals must align to four-frame tokens"
+        intervals = [
+            (caption_start, caption_end, order, alternatives)
+            for order, ((caption_start, caption_end), alternatives) in enumerate(
+                grouped.items()
+            )
+        ]
+        timeline = []
+        for token_index in range(span_tokens):
+            token_start = start_frame + token_index * FRAMES_PER_TOKEN
+            token_end = token_start + FRAMES_PER_TOKEN
+            candidates = []
+            for caption_start, caption_end, order, alternatives in intervals:
+                overlap = max(
+                    0,
+                    min(token_end, caption_end) - max(token_start, caption_start),
                 )
-            annotation = self._select_caption(alternatives)
-            first = max(0, (caption_start - start_frame) // FRAMES_PER_TOKEN)
-            last = min(span_tokens, (caption_end - start_frame) // FRAMES_PER_TOKEN)
-            text = str(annotation["text"])
-            for token_index in range(first, last):
-                if timeline[token_index] and timeline[token_index] != text:
-                    raise ValueError(
-                        f"{dataset} text intervals overlap at token {token_index}"
+                if overlap:
+                    candidates.append(
+                        (
+                            overlap,
+                            -(caption_end - caption_start),
+                            -order,
+                            alternatives,
+                        )
                     )
-                timeline[token_index] = text
+            if not candidates:
+                timeline.append("")
+                continue
+            alternatives = max(candidates, key=lambda item: item[:-1])[-1]
+            timeline.append(str(self._select_caption(alternatives, rng)["text"]))
         return timeline
 
     def _crop_sample(
@@ -219,6 +309,8 @@ class LDFSpanCollator:
         *,
         span_tokens: int,
         cold_start: bool,
+        rng=random,
+        torch_generator: torch.Generator | None = None,
     ) -> dict[str, object]:
         full_root = sample["root_motion"]
         full_body = sample["body_motion"]
@@ -228,6 +320,7 @@ class LDFSpanCollator:
             available_tokens=available_tokens,
             span_tokens=span_tokens,
             cold_start=cold_start,
+            rng=rng,
         )
         start = start_token * FRAMES_PER_TOKEN
         frames = span_tokens * FRAMES_PER_TOKEN
@@ -243,7 +336,11 @@ class LDFSpanCollator:
         previous = full_root[start - 1].clone() if start > 0 and not cold_start else None
 
         if self.random_yaw:
-            angle = torch.rand(1, device=joined_root.device) * (2.0 * torch.pi)
+            angle = torch.rand(
+                1,
+                device=joined_root.device,
+                generator=torch_generator,
+            ) * (2.0 * torch.pi)
             joined_root, joined_body = rotate_motion_yaw(
                 joined_root[None], joined_body[None], angle
             )
@@ -269,19 +366,36 @@ class LDFSpanCollator:
                 list(sample.get("text_data", [])),
                 start_frame=start,
                 span_frames=frames,
+                rng=rng,
             ),
         }
 
     def __call__(self, samples: list[dict[str, object]]) -> dict[str, object]:
         if not samples:
             raise ValueError("LDFSpanCollator requires a non-empty batch")
-        cold_start = self._select_cold_start()
-        span_tokens = self._select_span_tokens(samples)
+        seeds = [sample.get("_augmentation_seed") for sample in samples]
+        if any(seed is not None for seed in seeds) and not all(
+            seed is not None for seed in seeds
+        ):
+            raise ValueError("training samples must either all carry seeds or all omit them")
+        if all(seed is not None for seed in seeds):
+            batch_seed = sum(
+                (index + 1) * int(seed) for index, seed in enumerate(seeds)
+            ) % (2**63 - 1)
+            rng = random.Random(batch_seed)
+            torch_generator = torch.Generator().manual_seed(batch_seed)
+        else:
+            rng = random
+            torch_generator = None
+        cold_start = self._select_cold_start(rng)
+        span_tokens = self._select_span_tokens(samples, rng)
         spans = [
             self._crop_sample(
                 sample,
                 span_tokens=span_tokens,
                 cold_start=cold_start,
+                rng=rng,
+                torch_generator=torch_generator,
             )
             for sample in samples
         ]
@@ -322,7 +436,7 @@ class LDFSpanCollator:
                 previous[index] = item["previous_root_frame"]
                 previous_valid[index] = True
 
-        return {
+        output = {
             "root_motion": root,
             "body_motion": body,
             "body_feature_valid_mask": feature_valid,
@@ -342,6 +456,9 @@ class LDFSpanCollator:
             "name": [str(item["name"]) for item in spans],
             "prompt_timeline": [item["prompt_timeline"] for item in spans],
         }
+        if self.validation_probe is not None:
+            output["validation_probe"] = self.validation_probe
+        return output
 
 
 def create_dataset(cfg, split: str):
@@ -373,18 +490,25 @@ def create_dataloaders(
     cfg,
     *,
     encoder_context_tokens: int,
-) -> tuple[DataLoader | None, DataLoader]:
+) -> tuple[DataLoader | None, list[DataLoader]]:
     train_dataset = create_dataset(cfg, "train") if cfg.train else None
     val_dataset = create_dataset(cfg, "val")
     common = {
         "num_workers": int(cfg.data.num_workers),
         "pin_memory": bool(cfg.data.get("pin_memory", True)),
     }
-    train_loader = (
-        DataLoader(
+    train_loader = None
+    if train_dataset is not None:
+        batch_sampler = LengthBucketBatchSampler(
             train_dataset,
             batch_size=int(cfg.data.train_batch_size),
-            shuffle=True,
+            bucket_width_frames=int(cfg.data.get("length_bucket_frames", 20)),
+            max_frames=int(cfg.data.max_frames),
+            seed=int(cfg.get("seed", 0)),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
             collate_fn=LDFSpanCollator(
                 min_frames=cfg.data.min_frames,
                 max_frames=cfg.data.max_frames,
@@ -395,28 +519,37 @@ def create_dataloaders(
             ),
             **common,
         )
-        if train_dataset is not None
-        else None
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=int(cfg.data.val_batch_size),
-        shuffle=False,
-        collate_fn=LDFSpanCollator(
-            min_frames=cfg.data.min_frames,
-            max_frames=cfg.data.max_frames,
-            encoder_context_tokens=encoder_context_tokens,
-            training=False,
-            random_yaw=False,
-            cold_start=True,
-        ),
-        **common,
-    )
-    return train_loader, val_loader
+
+    def validation_loader(name: str, *, cold_start: bool) -> DataLoader:
+        return DataLoader(
+            val_dataset,
+            batch_size=int(cfg.data.val_batch_size),
+            shuffle=False,
+            collate_fn=LDFSpanCollator(
+                min_frames=cfg.data.min_frames,
+                max_frames=cfg.data.max_frames,
+                encoder_context_tokens=encoder_context_tokens,
+                training=False,
+                random_yaw=False,
+                cold_start=cold_start,
+                validation_probe=name,
+            ),
+            **common,
+        )
+
+    val_loaders = [
+        validation_loader("teacher_cold", cold_start=True),
+        validation_loader("teacher_continuation", cold_start=False),
+    ]
+    self_forcing = cfg.get("self_forcing")
+    if self_forcing is not None and bool(self_forcing.get("enabled", False)):
+        val_loaders.append(validation_loader("self_forcing", cold_start=False))
+    return train_loader, val_loaders
 
 
 __all__ = [
     "LDFSpanCollator",
+    "LengthBucketBatchSampler",
     "MinimumFrameDataset",
     "create_dataloaders",
     "create_dataset",

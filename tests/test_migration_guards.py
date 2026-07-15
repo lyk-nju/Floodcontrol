@@ -24,6 +24,12 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.data.min_frames == 40
     assert cfg.data.max_frames == 200
     assert cfg.data.cold_start_probability == 0.1
+    assert cfg.data.length_bucket_frames == 20
+    assert cfg.text_embeddings_path.endswith("HumanML3D_motion/t5_text_embeddings.pt")
+    assert cfg.validation.continuation_history_tokens == 5
+    assert cfg.validation.self_forcing_steps == 5
+    assert cfg.self_forcing.phase_start_step == 300000
+    assert cfg.self_forcing.phase_steps == 200000
     assert list(cfg.self_forcing.k_schedule) == [[0.0, 2], [0.4, 3], [0.7, 5]]
     assert cfg.self_forcing.teacher_replay[2] == 0.2
     for injected_name in (
@@ -46,6 +52,9 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     assert all(item.text_path == "texts" for item in cfg.data.datasets)
     assert cfg.model.params.text_len == cfg.text_encoder.text_len == 128
     assert cfg.self_forcing.enabled is False
+    assert cfg.text_embeddings_path.endswith(
+        "HumanML3D_BABEL_t5_text_embeddings.pt"
+    )
 
 
 def test_tiny_vae_config_instantiates_public_body_vae():

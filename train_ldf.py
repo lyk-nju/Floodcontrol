@@ -32,12 +32,7 @@ def _validate_training_config(cfg) -> None:
     _require_file(str(cfg.vae.checkpoint_path), "VAE_CHECKPOINT")
     _require_file(str(cfg.vae.params.motion_stats_path), "MOTION_STATISTICS")
     _require_file(str(cfg.vae.params.latent_stats_path), "LATENT_STATISTICS")
-    _require_file(str(cfg.text_encoder.checkpoint_path), "TEXT_ENCODER")
-    if not Path(str(cfg.text_encoder.tokenizer_path)).is_dir():
-        raise RuntimeError(
-            "TEXT_TOKENIZER_REQUIRED: directory not found at "
-            f"{cfg.text_encoder.tokenizer_path}"
-        )
+    _require_file(str(cfg.text_embeddings_path), "TEXT_EMBEDDINGS")
     if int(cfg.model.params.text_len) != int(cfg.text_encoder.text_len):
         raise ValueError("model.text_len and text_encoder.text_len must match")
 

@@ -42,9 +42,9 @@ training:
   text_dropout_probability: 0.1
 ```
 
-`min/max_frames`定义batch共享source span S，`chunk_size`是active band唯一来源，不在training配置中重复。首轮teacher baseline明确设置`self_forcing.enabled: false`；K schedule与teacher replay只在后续显式开启时生效。text长度128沿用FloodDiffusion论文设置，dropout和root/body loss权重仍是`TUNABLE`。fixed absolute-token noise、固定初始H anchor、逐token prompt可见性和只替换最左active token是训练协议。
+`min/max_frames`定义batch共享source span S，`length_bucket_frames`控制训练batch的长度分桶，`chunk_size`是active band唯一来源，不在training配置中重复。首轮teacher baseline明确设置`self_forcing.enabled: false`；K schedule与teacher replay只在后续显式开启时生效，进度由`phase_start_step/phase_steps`单独定义。text长度128沿用FloodDiffusion论文设置，dropout和root/body loss权重仍是`TUNABLE`。fixed absolute-token noise、固定初始H anchor、逐token prompt可见性和只替换最左active token是训练协议。
 
-`configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`从头训练同一LDF主干并拼接HumanML3D+BABEL，使用相同VAE/T5合同，但要求先计算混合训练集自己的root statistics。两个入口都使用单卡Lightning、LDF EMA，并从独立checkpoint加载冻结VAE；VAE/T5不进入LDF optimizer、EMA或checkpoint。
+`configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`从头训练同一LDF主干并拼接HumanML3D+BABEL，使用相同VAE/T5合同，但要求先计算混合训练集自己的root statistics和预编码文本表。两个入口都使用单卡Lightning、LDF EMA，并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。`text_embeddings_path`必须由`tools/pretokenize_t5_text.py`生成且包含空文本及训练/验证全部caption。
 
 root statistics必须通过同一配置的数据mixture与span sampler生成：
 

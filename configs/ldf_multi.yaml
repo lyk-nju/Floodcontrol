@@ -19,9 +19,14 @@ validation:
   validation_steps: 1000
   save_every_n_steps: 10000
   save_top_k: 20
+  seed: 4321
+  continuation_history_tokens: 5
+  self_forcing_steps: 5
+  self_forcing_history_tokens: 1
 
 # Compute this from the exact HumanML3D+BABEL training mixture before launch.
 root_stats_path: ${dirs.raw_data}/HumanML3D_BABEL_root_stats.npz
+text_embeddings_path: ${dirs.raw_data}/HumanML3D_BABEL_t5_text_embeddings.pt
 
 vae:
   target: models.vae_wan_1d.BodyVAE
@@ -58,6 +63,7 @@ data:
   max_frames: 200
   random_yaw: true
   cold_start_probability: 0.1
+  length_bucket_frames: 20
   train_batch_size: 16
   val_batch_size: 16
   num_workers: 16
@@ -78,6 +84,8 @@ loss:
 
 self_forcing:
   enabled: false
+  phase_start_step: 300000
+  phase_steps: 200000
   k_schedule:
     - [0.0, 2]
     - [0.4, 3]

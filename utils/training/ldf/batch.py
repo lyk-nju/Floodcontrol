@@ -130,10 +130,10 @@ def build_ldf_training_step(
     timeline = source_start[:, None] + positions
     rope = positions - active_start
     history_mask = positions < active_start
-    # Active and pure-noise frontier are both valid generation-region tokens.
-    # Only the separate loss mask restricts supervision to the five-token band.
-    generation_mask = ~history_mask
     loss_mask = (positions >= active_start) & (positions < active_end)
+    # Pure-noise frontier remains in persistent state for later rollout steps,
+    # but only history plus the current active band enters non-causal attention.
+    generation_mask = loss_mask
     noisy_motion = mix_fixed_noise(clean_motion, noise, beta)
     view = LDFStepView(
         step_index=int(step_index),

@@ -175,6 +175,26 @@ def sample_rollout_steps(
     return 1 if draw < replay_probability else rollout_steps
 
 
+def self_forcing_phase_progress(
+    global_step: int,
+    *,
+    phase_start_step: int,
+    phase_steps: int,
+) -> float:
+    """Measure curriculum progress relative to the self-forcing fine-tune phase."""
+
+    phase_start_step = int(phase_start_step)
+    phase_steps = int(phase_steps)
+    if phase_start_step < 0:
+        raise ValueError("phase_start_step must be non-negative")
+    if phase_steps <= 0:
+        raise ValueError("phase_steps must be positive")
+    return min(
+        1.0,
+        max(0.0, (int(global_step) - phase_start_step) / float(phase_steps)),
+    )
+
+
 def sample_window_plan(
     batch: dict[str, object],
     *,
@@ -369,4 +389,5 @@ __all__ = [
     "run_self_forcing_rollout",
     "sample_rollout_steps",
     "sample_window_plan",
+    "self_forcing_phase_progress",
 ]

@@ -2278,3 +2278,53 @@
 - 当前teacher baseline只训练文本条件与结构化root/body生成；span内root observation、span外future-root constraint的训练采样/dropout和constraint-CFG校准仍需单独设计，不应由本轮静默假设。
 - `configs/ldf_multi.yaml`需要先基于实际HumanML+BABEL训练mixture生成`HumanML3D_BABEL_root_stats.npz`；本轮没有伪造该statistics，也没有启动正式长训。
 - Web继续等待首个正式LDF checkpoint与loader合同；本轮未解除`BLOCKED_ON_LDF_CHECKPOINT`。
+
+## 2026-07-15 · LDF文本、验证、恢复训练与self-forcing可靠性修复
+
+改动类型：LDF数据编译 / 文本特征加载 / validation / self-forcing curriculum / checkpoint resume / 可复现采样 / 性能与测试
+
+实际改动内容：
+
+- BABEL prompt timeline不再要求原始caption边界四帧对齐。每个四帧motion token按实际frame overlap选择caption；重叠相同时优先更短区间，再按原始稳定顺序决定。现有同区间多caption仍保持train随机、validation取首条的语义。
+- 新增`LengthBucketBatchSampler`，按clip长度分桶后组成训练batch，避免一个短clip把同batch全部长clip限制为短span。sampler通过epoch/sample seed把crop、caption选择和yaw增强变成可恢复的确定性采样；Lightning侧的phase、Gaussian noise、text dropout和teacher replay由`global_step + rank`显式generator控制。
+- Validation由单一cold-start loader拆为固定`teacher_cold`和`teacher_continuation` probe；启用self-forcing时增加固定self-forcing probe。每个probe显式固定H、K和seed，因此phase与root/body noise可以重复，指标按probe分别记录。
+- self-forcing curriculum改为相对fine-tune阶段的`phase_start_step/phase_steps`进度，不再用包含teacher baseline的`global_step / max_steps`。
+- 新增轻量`TextEmbeddingLookup`。正式LDF训练只加载`tools/pretokenize_t5_text.py`生成的CPU caption table，不再把约11GB UMT5-XXL放到LDF训练GPU；预编码和加载两端都检查shape与finite，缺失caption立即失败。
+- LDF checkpoint新增训练边界metadata；resume在覆盖当前模型前比较root/local-root buffers、VAE physical/latent statistics以及VAE/statistics/text配置路径。旧checkpoint缺少metadata时只在四个LDF统计buffer完全一致后允许加载并给出warning。
+- `LDFCondition.validate()`按tensor identity去重finite扫描，保留逐项shape/dtype检查，避免HumanML重复prompt和self-forcing多步反复扫描同一个大tensor。
+- 修复训练kernel与既有设计文档的矛盾：pure-noise frontier继续保存在固定`HybridMotion`和fixed noise中，但`generation_mask`只暴露当前active band。当前forward只看到`history + active`，不可见future prompt不能通过non-causal self-attention提前传播。
+- 文档将文本语义准确表述为`direct token-aligned cross-attention`：每个motion query直接读取自身prompt，但已注入的文本信息可在后续层通过可见motion self-attention参与动作过渡，不宣称严格文本隔离。
+- HumanML和HumanML+BABEL配置增加文本embedding路径、length bucket、确定性validation和self-forcing phase字段；训练入口要求预编码文本文件，不再要求在线文本编码器进入训练进程。
+
+改动理由：
+
+- 任意frame文本标注属于Dataset事实，四帧token所有权应由LDF编译器根据重叠确定；即使当前14087个`BABEL_motion`文本文件全部恰好对齐，也不应把该偶然数据性质写成会崩溃的公共合同。
+- 随机validation无法可靠比较checkpoint，只测cold start也无法代表流式continuation；固定多probe将覆盖范围和数值可比性同时写死。
+- 完整resume会在constructor校验后覆盖模型buffers，因此统计比较必须发生在`load_state_dict()`之前。VAE latent坐标和文本特征坐标同样属于恢复训练边界，但不应重新进入LDF模型计算代码。
+- UMT5预编码不改变逐tokencross-attention语义，只移除固定语料上的重复11GB encoder加载和每batch重复计算。
+- self-forcing fine-tune从baseline checkpoint继续global step时，curriculum必须相对fine-tune阶段推进，否则会跳过预定的K=2阶段。
+
+验证：
+
+- 新增任意frame BABEL overlap、tie-break、length bucket、seeded augmentation、DataLoader seeded index、多validation loader、phase-relative progress、确定性noise、resume统计保护、VAE统计保护和文本lookup fail-fast测试。
+- LDF定向测试：`74 passed`。
+- 全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`170 passed`。
+- 修改Python文件`py_compile`通过。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/{data,text,batch,self_forcing,lightning_module,__init__}.py`
+- `utils/conditions/ldf.py`
+- `tools/pretokenize_t5_text.py`
+- `train_ldf.py`
+- `configs/{ldf,ldf_multi}.yaml`
+- `tests/{test_ldf_data,test_ldf_text,test_ldf_training,test_ldf_self_forcing,test_migration_guards}.py`
+- `docs/rearchitecture/{01_MODEL_ARCHITECTURE_AND_IO,02_DATA_PIPELINE,03_STREAMING_ACTIVE_WINDOW,04_TRAINING_METHOD,05_TRAINING_CONFIG,06_LDF_IMPLEMENTATION_DESIGN}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- `root_stats.npz`和两个T5 embedding table尚未在正式数据目录生成；配置继续保持`root_statistics_required`，因此本轮没有启动真实LDF长训。
+- span内root observation、span外future-root constraint训练采样/dropout及constraint-CFG校准仍需单独设计。
+- Web继续等待首个正式LDF checkpoint；本轮未解除`BLOCKED_ON_LDF_CHECKPOINT`。

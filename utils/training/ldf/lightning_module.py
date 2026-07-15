@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
 
-from models.tools.t5 import T5EncoderModel
 from utils.conditions.ldf import HybridMotion, LDFCondition
 from utils.initialize import instantiate_target
 from utils.motion_process import ROOT_DIM
@@ -26,6 +26,24 @@ from utils.training.ldf.self_forcing import (
     run_self_forcing_rollout,
     sample_rollout_steps,
     sample_window_plan,
+    self_forcing_phase_progress,
+)
+from utils.training.ldf.text import TextEmbeddingLookup
+
+
+_LDF_STATISTIC_NAMES = (
+    "root_mean",
+    "root_std",
+    "local_root_mean",
+    "local_root_std",
+)
+_VAE_STATISTIC_NAMES = (
+    "body_cont_mean",
+    "body_cont_std",
+    "local_root_mean",
+    "local_root_std",
+    "latent_mean",
+    "latent_std",
 )
 
 
@@ -47,7 +65,7 @@ def _load_root_statistics(path: str | Path) -> tuple[torch.Tensor, torch.Tensor]
 
 
 class LDFLightningModule(BasicLightningModule):
-    """Train hybrid root/body flow targets with frozen VAE and text encoders."""
+    """Train hybrid root/body flow targets with frozen VAE and text features."""
 
     def __init__(self, cfg):
         vae = instantiate_target(
@@ -94,7 +112,11 @@ class LDFLightningModule(BasicLightningModule):
         super().__init__(cfg, model=model)
         self.vae = vae
         self.vae.eval().requires_grad_(False)
-        self._text_encoder = None
+        self.text_embeddings = TextEmbeddingLookup(
+            cfg.text_embeddings_path,
+            expected_dim=int(cfg.model.params.text_dim),
+            expected_text_len=int(cfg.model.params.text_len),
+        )
 
         if self.model.latent_dim != self.vae.latent_dim:
             raise RuntimeError("LDF and VAE latent dimensions do not match")
@@ -111,28 +133,13 @@ class LDFLightningModule(BasicLightningModule):
             self.vae.eval()
         return self
 
-    def _get_text_encoder(self):
-        if self._text_encoder is None:
-            config = self.cfg.get("text_encoder")
-            if config is None:
-                raise RuntimeError(
-                    "LDF training requires a frozen text_encoder configuration"
-                )
-            self._text_encoder = T5EncoderModel(
-                text_len=int(config.text_len),
-                dtype=getattr(torch, str(config.get("dtype", "bfloat16"))),
-                device=self.device,
-                checkpoint_path=str(config.checkpoint_path),
-                tokenizer_path=str(config.tokenizer_path),
-            )
-        return self._text_encoder
-
     @torch.no_grad()
     def _encode_prompt_timeline(
         self,
         prompt_timeline: list[list[str]],
         *,
         apply_dropout: bool,
+        generator: torch.Generator | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         if not prompt_timeline or not prompt_timeline[0]:
             raise ValueError("prompt_timeline must be a non-empty [B][T] list")
@@ -149,14 +156,21 @@ class LDFLightningModule(BasicLightningModule):
         if not 0.0 <= dropout <= 1.0:
             raise ValueError("text_dropout_probability must lie in [0,1]")
         if apply_dropout and dropout:
-            dropped = torch.rand(len(timelines), device=self.device) < dropout
+            dropped = (
+                torch.rand(
+                    len(timelines),
+                    device=self.device,
+                    generator=generator,
+                )
+                < dropout
+            )
             for batch_index, should_drop in enumerate(dropped.tolist()):
                 if should_drop:
                     timelines[batch_index] = [""] * token_length
 
         flattened = [text for row in timelines for text in row]
         unique = list(dict.fromkeys(flattened + [""]))
-        encoded = self._get_text_encoder()(unique, self.device)
+        encoded = self.text_embeddings.lookup(unique)
         by_text = {text: value.detach() for text, value in zip(unique, encoded)}
         contexts = [by_text[text] for text in flattened]
         null = [by_text[""] for _ in timelines]
@@ -228,14 +242,36 @@ class LDFLightningModule(BasicLightningModule):
         motion.validate()
         return motion, token_valid
 
-    def _step(self, batch, is_training=True):
-        rollout_steps = 1
+    def _step(
+        self,
+        batch,
+        is_training=True,
+        *,
+        generator: torch.Generator | None = None,
+        rollout_steps_override: int | None = None,
+        initial_history_tokens: int | None = None,
+    ):
+        if generator is None and is_training:
+            generator = torch.Generator(device=self.device).manual_seed(
+                int(self.cfg.get("seed", 0))
+                + int(self.global_step) * 1_000_003
+                + int(getattr(self, "global_rank", 0))
+            )
+        rollout_steps = 1 if rollout_steps_override is None else int(
+            rollout_steps_override
+        )
         self_forcing = self.cfg.get("self_forcing")
-        if is_training and self_forcing is not None and bool(
-            self_forcing.get("enabled", False)
+        if (
+            rollout_steps_override is None
+            and is_training
+            and self_forcing is not None
+            and bool(self_forcing.get("enabled", False))
         ):
-            max_steps = max(1, int(self.cfg.trainer.max_steps))
-            progress = min(1.0, float(self.global_step) / float(max_steps))
+            progress = self_forcing_phase_progress(
+                int(self.global_step),
+                phase_start_step=int(self_forcing.phase_start_step),
+                phase_steps=int(self_forcing.phase_steps),
+            )
             schedule = [tuple(row) for row in self_forcing.k_schedule]
             replay = {
                 int(key): float(value)
@@ -243,6 +279,7 @@ class LDFLightningModule(BasicLightningModule):
             }
             rollout_steps = sample_rollout_steps(
                 progress,
+                generator=generator,
                 schedule=schedule,
                 teacher_replay=replay,
             )
@@ -252,6 +289,8 @@ class LDFLightningModule(BasicLightningModule):
             active_tokens=self.model.chunk_size,
             rollout_steps=rollout_steps,
             latent_dim=self.model.latent_dim,
+            generator=generator,
+            initial_history_tokens=initial_history_tokens,
         )
         anchored_batch = anchor_physical_batch(
             batch, plan.translation_anchor_xz
@@ -260,6 +299,7 @@ class LDFLightningModule(BasicLightningModule):
         contexts, null_contexts = self._encode_prompt_timeline(
             batch["prompt_timeline"],
             apply_dropout=is_training,
+            generator=generator,
         )
 
         def condition_builder(_view):
@@ -285,6 +325,104 @@ class LDFLightningModule(BasicLightningModule):
             root_weight=float(weights.get("root_weight", 1.0)),
             body_weight=float(weights.get("body_weight", 1.0)),
         )
+
+    def _training_contract(self) -> dict[str, object]:
+        paths = {
+            "vae_checkpoint_path": self.cfg.vae.checkpoint_path,
+            "motion_stats_path": self.cfg.vae.params.motion_stats_path,
+            "latent_stats_path": self.cfg.vae.params.latent_stats_path,
+            "root_stats_path": self.cfg.root_stats_path,
+            "text_embeddings_path": self.cfg.text_embeddings_path,
+        }
+        return {
+            "paths": {
+                name: str(Path(str(path)).expanduser().resolve())
+                for name, path in paths.items()
+            },
+            "vae_statistics": {
+                name: getattr(self.vae, name).detach().cpu().clone()
+                for name in _VAE_STATISTIC_NAMES
+            },
+        }
+
+    def on_save_checkpoint(self, checkpoint) -> None:
+        super().on_save_checkpoint(checkpoint)
+        checkpoint["ldf_training_contract"] = self._training_contract()
+
+    def on_load_checkpoint(self, checkpoint) -> None:
+        state = checkpoint.get("state_dict", {})
+        for name in _LDF_STATISTIC_NAMES:
+            if name not in state:
+                raise RuntimeError(f"LDF resume checkpoint is missing {name}")
+            if not torch.equal(
+                state[name].detach().cpu(), getattr(self.model, name).cpu()
+            ):
+                raise RuntimeError(f"LDF resume statistics mismatch for {name}")
+
+        saved_contract = checkpoint.get("ldf_training_contract")
+        current_contract = self._training_contract()
+        if saved_contract is None:
+            warnings.warn(
+                "legacy LDF checkpoint has no training contract; only model statistics "
+                "were validated",
+                stacklevel=2,
+            )
+        else:
+            if saved_contract.get("paths") != current_contract["paths"]:
+                raise RuntimeError("LDF resume VAE/statistics/text paths do not match")
+            saved_statistics = saved_contract.get("vae_statistics", {})
+            for name, current in current_contract["vae_statistics"].items():
+                saved = saved_statistics.get(name)
+                if not torch.is_tensor(saved) or not torch.equal(
+                    saved.cpu(), current
+                ):
+                    raise RuntimeError(f"LDF resume VAE statistics mismatch for {name}")
+        super().on_load_checkpoint(checkpoint)
+        if not torch.equal(
+            self.model.local_root_mean.cpu(), self.vae.local_root_mean.cpu()
+        ) or not torch.equal(
+            self.model.local_root_std.cpu(), self.vae.local_root_std.cpu()
+        ):
+            raise RuntimeError("resumed LDF local-root statistics do not match the VAE")
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        probe = str(batch.get("validation_probe", "teacher_cold"))
+        validation = self.cfg.get("validation") or {}
+        base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
+        generator = torch.Generator(device=self.device).manual_seed(
+            base_seed + int(dataloader_idx) * 1_000_003 + int(batch_idx)
+        )
+        if probe == "teacher_cold":
+            rollout_steps, history_tokens = 1, 0
+        elif probe == "teacher_continuation":
+            rollout_steps = 1
+            history_tokens = int(validation.get("continuation_history_tokens", 5))
+        elif probe == "self_forcing":
+            rollout_steps = int(validation.get("self_forcing_steps", 5))
+            history_tokens = int(validation.get("self_forcing_history_tokens", 1))
+        else:
+            raise ValueError(f"unknown validation probe {probe!r}")
+
+        with self.ema.average_parameters(self._trainable_parameters):
+            loss_dict = self._step(
+                batch,
+                is_training=False,
+                generator=generator,
+                rollout_steps_override=rollout_steps,
+                initial_history_tokens=history_tokens,
+            )
+        batch_size = int(batch["body_motion"].shape[0])
+        for key, value in loss_dict.items():
+            self.log(
+                f"val_loss/{probe}/{key}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+                add_dataloader_idx=False,
+            )
+        return loss_dict
 
 
 __all__ = ["LDFLightningModule"]

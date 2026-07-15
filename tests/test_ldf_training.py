@@ -53,13 +53,39 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
         root_mean=np.array([1.0, 2.0, 3.0, 0.0, 0.0], dtype=np.float32),
         root_std=np.array([2.0, 2.0, 2.0, 0.5, 0.5], dtype=np.float32),
     )
+    text_embeddings = tmp_path / "text_embeddings.pt"
+    torch.save(
+        {
+            "embeddings": {
+                "": torch.zeros(2, 8),
+                "walk": torch.ones(2, 8),
+                "turn": torch.full((2, 8), 2.0),
+                "sit": torch.full((2, 8), 3.0),
+            },
+            "text_dim": 8,
+            "text_len": 8,
+        },
+        text_embeddings,
+    )
     return OmegaConf.create(
         {
+            "seed": 7,
             "trainer": {"max_steps": 10},
+            "validation": {
+                "seed": 11,
+                "continuation_history_tokens": 1,
+                "self_forcing_steps": 2,
+                "self_forcing_history_tokens": 1,
+            },
             "training": {"text_dropout_probability": 0.0},
             "loss": {"root_weight": 1.0, "body_weight": 1.0},
-            "self_forcing": {"enabled": False},
+            "self_forcing": {
+                "enabled": False,
+                "phase_start_step": 10,
+                "phase_steps": 20,
+            },
             "root_stats_path": str(root_stats),
+            "text_embeddings_path": str(text_embeddings),
             "vae": {
                 "target": "models.vae_wan_1d.BodyVAE",
                 "checkpoint_path": str(checkpoint),
@@ -187,15 +213,6 @@ def test_create_clean_motion_rejects_per_sample_root_body_misalignment(tmp_path)
 
 def test_prompt_timeline_encoding_preserves_token_order_and_builds_null_branch(tmp_path):
     module = LDFLightningModule(_make_config(tmp_path)).eval()
-
-    class FakeTextEncoder:
-        def __call__(self, texts, device):
-            return [
-                torch.full((2, 8), float(index), device=device)
-                for index, _ in enumerate(texts)
-            ]
-
-    module._text_encoder = FakeTextEncoder()
     contexts, null = module._encode_prompt_timeline(
         [["walk", "walk", "turn"], ["sit", "turn", "sit"]],
         apply_dropout=False,
@@ -209,14 +226,8 @@ def test_prompt_timeline_encoding_preserves_token_order_and_builds_null_branch(t
     assert torch.equal(null[0], null[1])
 
 
-def test_complete_ldf_training_step_runs_with_online_deterministic_vae(tmp_path):
+def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_path):
     module = LDFLightningModule(_make_config(tmp_path)).train()
-
-    class FakeTextEncoder:
-        def __call__(self, texts, device):
-            return [torch.ones(2, 8, device=device) * index for index, _ in enumerate(texts)]
-
-    module._text_encoder = FakeTextEncoder()
     root = torch.zeros(1, 8, 5)
     root[..., 3] = 1.0
     batch = {
@@ -242,6 +253,68 @@ def test_complete_ldf_training_step_runs_with_online_deterministic_vae(tmp_path)
     losses["total"].backward()
     assert any(parameter.grad is not None for parameter in module.model.parameters())
     assert not any(parameter.grad is not None for parameter in module.vae.parameters())
+
+
+def test_validation_plan_and_noise_are_repeatable_with_fixed_generator(tmp_path):
+    module = LDFLightningModule(_make_config(tmp_path)).eval()
+    root = torch.zeros(1, 8, 5)
+    root[..., 3] = 1.0
+    batch = {
+        "root_motion": root,
+        "body_motion": torch.randn(1, 8, 265),
+        "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        "body_with_context": torch.randn(1, 8, 265),
+        "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        "context_token_count": torch.zeros(1, dtype=torch.long),
+        "previous_root_frame": torch.zeros(1, 5),
+        "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
+        "source_start_token": torch.zeros(1, dtype=torch.long),
+        "cold_start_mask": torch.ones(1, dtype=torch.bool),
+        "prompt_timeline": [["walk", "walk"]],
+    }
+    first = module._step(
+        batch,
+        is_training=False,
+        generator=torch.Generator().manual_seed(41),
+        rollout_steps_override=1,
+        initial_history_tokens=0,
+    )
+    second = module._step(
+        batch,
+        is_training=False,
+        generator=torch.Generator().manual_seed(41),
+        rollout_steps_override=1,
+        initial_history_tokens=0,
+    )
+    assert all(torch.equal(first[name], second[name]) for name in first)
+
+
+def test_ldf_resume_rejects_statistics_before_overwriting_model(tmp_path):
+    module = LDFLightningModule(_make_config(tmp_path / "source"))
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+
+    resumed = LDFLightningModule(_make_config(tmp_path / "source"))
+    resumed.on_load_checkpoint(checkpoint)
+    original = resumed.model.root_mean.clone()
+
+    bad_checkpoint = dict(checkpoint)
+    bad_checkpoint["state_dict"] = dict(checkpoint["state_dict"])
+    bad_checkpoint["state_dict"]["root_mean"] = original + 1.0
+    with pytest.raises(RuntimeError, match="statistics mismatch for root_mean"):
+        resumed.on_load_checkpoint(bad_checkpoint)
+    assert torch.equal(resumed.model.root_mean, original)
+
+
+def test_ldf_resume_rejects_changed_vae_statistics_contract(tmp_path):
+    module = LDFLightningModule(_make_config(tmp_path))
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+    checkpoint["ldf_training_contract"]["vae_statistics"]["latent_mean"] += 1
+
+    resumed = LDFLightningModule(_make_config(tmp_path))
+    with pytest.raises(RuntimeError, match="VAE statistics mismatch for latent_mean"):
+        resumed.on_load_checkpoint(checkpoint)
 
 
 def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
