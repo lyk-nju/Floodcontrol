@@ -5,6 +5,10 @@ import torch.nn as nn
 
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
 from utils.training.ldf.batch import build_ldf_training_step
+from utils.training.ldf.conditioning import (
+    create_xz_condition,
+    sample_xz_constraint_mask,
+)
 from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.flow import (
     build_span_beta,
@@ -234,6 +238,121 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step():
     losses = compute_velocity_loss(result.prediction, result.final_step)
     losses["total"].backward()
     assert model.scale.grad is not None
+
+
+def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
+    root = torch.zeros(1, 10, 4, 5)
+    root[..., 0] = torch.arange(10)[None, :, None]
+    root[..., 2] = root[..., 0] * 2
+    valid = torch.ones(1, 10, dtype=torch.bool)
+    text = [torch.zeros(1, 4) for _ in range(10)]
+    null = [torch.zeros(1, 4)]
+    conditions = []
+    constraint_mask = sample_xz_constraint_mask(
+        token_valid_mask=valid,
+        initial_active_start=2,
+        initial_active_end=7,
+        future_lookahead_tokens=2,
+        dense_probability=1.0,
+        waypoint_probability=0.0,
+        goal_probability=0.0,
+        max_waypoints=4,
+    )
+    kwargs = dict(
+        clean_root_motion=root,
+        token_valid_mask=valid,
+        constraint_mask=constraint_mask,
+        text_context=text,
+        text_null_context=null,
+        future_lookahead_tokens=2,
+    )
+
+    def builder(view):
+        condition = create_xz_condition(view=view, **kwargs)
+        conditions.append(condition)
+        return condition
+
+    clean = HybridMotion(root, torch.zeros(1, 10, 3))
+    plan = sample_window_plan(
+        {
+            "root_motion": root.flatten(1, 2),
+            "source_start_token": torch.tensor([4]),
+            "cold_start_mask": torch.tensor([False]),
+        },
+        active_tokens=5,
+        rollout_steps=2,
+        latent_dim=3,
+        initial_history_tokens=2,
+        phase_offset=torch.tensor([0.05]),
+        generator=torch.Generator().manual_seed(13),
+    )
+    run_self_forcing_rollout(
+        RecordingModel(),
+        SelfForcingState(clean),
+        plan,
+        previous_root_frame=torch.zeros(1, 5),
+        previous_root_valid_mask=torch.ones(1, dtype=torch.bool),
+        condition_builder=builder,
+    )
+
+    assert len(conditions) == 2
+    first_active = conditions[0].root_condition_mask.flatten(2).any(-1)
+    second_active = conditions[1].root_condition_mask.flatten(2).any(-1)
+    assert first_active.tolist() == [[False, False] + [True] * 5 + [False] * 3]
+    assert second_active.tolist() == [[False] * 3 + [True] * 5 + [False] * 2]
+    assert conditions[0].future_timeline_position_ids.tolist() == [[11, 12]]
+    assert conditions[1].future_timeline_position_ids.tolist() == [[12, 13]]
+
+
+def test_one_persistent_future_goal_becomes_active_during_self_forcing():
+    root = torch.zeros(1, 10, 4, 5)
+    root[..., 3] = 1.0
+    valid = torch.ones(1, 10, dtype=torch.bool)
+    constraint_mask = torch.zeros_like(root, dtype=torch.bool)
+    constraint_mask[:, 7, 2, 0] = True
+    constraint_mask[:, 7, 2, 2] = True
+    conditions = []
+
+    def builder(view):
+        condition = create_xz_condition(
+            clean_root_motion=root,
+            token_valid_mask=valid,
+            constraint_mask=constraint_mask,
+            view=view,
+            text_context=[torch.zeros(1, 4) for _ in range(10)],
+            text_null_context=[torch.zeros(1, 4)],
+            future_lookahead_tokens=2,
+        )
+        conditions.append(condition)
+        return condition
+
+    plan = sample_window_plan(
+        {
+            "root_motion": root.flatten(1, 2),
+            "source_start_token": torch.tensor([4]),
+            "cold_start_mask": torch.tensor([False]),
+        },
+        active_tokens=5,
+        rollout_steps=2,
+        latent_dim=3,
+        initial_history_tokens=2,
+        phase_offset=torch.tensor([0.05]),
+        generator=torch.Generator().manual_seed(13),
+    )
+    run_self_forcing_rollout(
+        RecordingModel(),
+        SelfForcingState(HybridMotion(root, torch.zeros(1, 10, 3))),
+        plan,
+        previous_root_frame=torch.zeros(1, 5),
+        previous_root_valid_mask=torch.ones(1, dtype=torch.bool),
+        condition_builder=builder,
+    )
+
+    assert not conditions[0].root_condition_mask.any()
+    assert conditions[0].future_timeline_position_ids.tolist() == [[11]]
+    assert conditions[0].future_root_condition_mask[0, 0, 2, 0]
+    assert conditions[1].root_condition_mask[0, 7, 2, 0]
+    assert conditions[1].future_root_condition_value is None
 
 
 def test_teacher_replay_is_configurable_without_changing_k_curriculum():

@@ -9,7 +9,12 @@ from datasets.humanml3d import HumanML3DDataset
 from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import write_statistics
 from utils.conditions.ldf import LDFCondition
-from utils.training.ldf.batch import anchor_physical_batch
+from utils.training.ldf.batch import LDFStepView, anchor_physical_batch
+from utils.training.ldf.conditioning import (
+    create_xz_condition,
+    sample_constraint_keep_mask,
+    sample_xz_constraint_mask,
+)
 from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.data import LDFSpanCollator
 from utils.training.ldf.lightning_module import LDFLightningModule
@@ -83,7 +88,17 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
                 "self_forcing_steps": 2,
                 "self_forcing_history_tokens": 1,
             },
-            "training": {"text_dropout_probability": 0.0},
+            "training": {
+                "text_dropout_probability": 0.0,
+                "constraint_dropout_probability": 0.0,
+                "future_root_lookahead_tokens": 2,
+                "constraint_sampling": {
+                    "dense_probability": 1.0,
+                    "waypoint_probability": 0.0,
+                    "goal_probability": 0.0,
+                    "max_waypoints": 4,
+                },
+            },
             "loss": {"root_weight": 1.0, "body_weight": 1.0},
             "self_forcing": {
                 "enabled": False,
@@ -232,6 +247,183 @@ def test_prompt_timeline_encoding_preserves_token_order_and_builds_null_branch(t
     assert torch.equal(null[0], null[1])
 
 
+def test_xz_condition_exposes_only_active_xz_and_post_active_lookahead():
+    root = torch.arange(2 * 8 * 4 * 5, dtype=torch.float32).reshape(2, 8, 4, 5)
+    token_valid = torch.tensor(
+        [[True] * 8, [True] * 7 + [False]], dtype=torch.bool
+    )
+    positions = torch.arange(10, 18)[None].expand(2, -1)
+    view = LDFStepView(
+        step_index=0,
+        history_end=2,
+        active_start=2,
+        active_end=5,
+        frontier_start=5,
+        timeline_position_ids=positions,
+        rope_position_ids=torch.arange(-2, 6)[None].expand(2, -1),
+        beta=torch.zeros(2, 8),
+    )
+    text = [torch.ones(1, 8) for _ in range(16)]
+    null = [torch.zeros(1, 8) for _ in range(2)]
+    constraint_mask = sample_xz_constraint_mask(
+        token_valid_mask=token_valid,
+        initial_active_start=2,
+        initial_active_end=5,
+        future_lookahead_tokens=2,
+        dense_probability=1.0,
+        waypoint_probability=0.0,
+        goal_probability=0.0,
+        max_waypoints=4,
+    )
+    constraint_mask[1] = False
+    condition = create_xz_condition(
+        clean_root_motion=root,
+        token_valid_mask=token_valid,
+        constraint_mask=constraint_mask,
+        view=view,
+        text_context=text,
+        text_null_context=null,
+        future_lookahead_tokens=2,
+    )
+
+    mask = condition.root_condition_mask
+    assert mask[0, 2:5, :, 0].all() and mask[0, 2:5, :, 2].all()
+    assert not mask[0, :, :, 1].any()
+    assert not mask[0, :, :, 3:].any()
+    assert not mask[0, :2].any() and not mask[0, 5:].any()
+    assert not mask[1].any()
+    assert torch.equal(condition.root_condition_value, root)
+    assert condition.future_root_condition_value.shape == (2, 2, 4, 5)
+    assert condition.future_timeline_position_ids.tolist() == [[15, 16], [0, 0]]
+    assert condition.future_valid_mask.tolist() == [[True, True], [False, False]]
+    assert condition.future_root_condition_mask[0, :, :, 0].all()
+    assert condition.future_root_condition_mask[0, :, :, 2].all()
+    assert not condition.future_root_condition_mask[..., 1].any()
+    assert not condition.future_root_condition_mask[..., 3:].any()
+
+
+def test_xz_sampling_supports_dense_waypoints_and_single_future_goal():
+    valid = torch.ones(1, 8, dtype=torch.bool)
+    common = dict(
+        token_valid_mask=valid,
+        initial_active_start=2,
+        initial_active_end=5,
+        future_lookahead_tokens=2,
+        max_waypoints=4,
+    )
+    dense = sample_xz_constraint_mask(
+        **common,
+        dense_probability=1.0,
+        waypoint_probability=0.0,
+        goal_probability=0.0,
+        generator=torch.Generator().manual_seed(1),
+    )
+    assert dense[:, 2:, :, 0].all()
+    assert dense[:, 2:, :, 2].all()
+    assert not dense[:, :2].any()
+
+    waypoints = sample_xz_constraint_mask(
+        **common,
+        dense_probability=0.0,
+        waypoint_probability=1.0,
+        goal_probability=0.0,
+        generator=torch.Generator().manual_seed(2),
+    )
+    selected_waypoint_frames = int(waypoints[..., 0].sum().item())
+    assert 1 <= selected_waypoint_frames <= 4
+    assert not waypoints[:, :2].any()
+    assert not waypoints[:, 7:].any()
+
+    goal = sample_xz_constraint_mask(
+        **common,
+        dense_probability=0.0,
+        waypoint_probability=0.0,
+        goal_probability=1.0,
+        generator=torch.Generator().manual_seed(3),
+    )
+    assert not goal[:, :5].any()
+    assert int(goal[..., 0].sum().item()) == 1
+    assert int(goal[:, 5:7, :, 0].sum().item()) == 1
+    for mask in (dense, waypoints, goal):
+        assert torch.equal(mask[..., 0], mask[..., 2])
+        assert not mask[..., 1].any()
+        assert not mask[..., 3:].any()
+
+
+def test_goal_sampling_without_future_falls_back_to_one_active_waypoint():
+    goal = sample_xz_constraint_mask(
+        token_valid_mask=torch.ones(1, 5, dtype=torch.bool),
+        initial_active_start=2,
+        initial_active_end=5,
+        future_lookahead_tokens=2,
+        dense_probability=0.0,
+        waypoint_probability=0.0,
+        goal_probability=1.0,
+        max_waypoints=4,
+        generator=torch.Generator().manual_seed(4),
+    )
+    assert int(goal[..., 0].sum().item()) == 1
+    assert int(goal[:, 2:5, :, 0].sum().item()) == 1
+
+
+def test_sparse_future_constraints_are_packed_by_absolute_position():
+    root = torch.randn(2, 8, 4, 5)
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    mask = torch.zeros_like(root, dtype=torch.bool)
+    mask[0, 5, 1, 0] = mask[0, 5, 1, 2] = True
+    mask[0, 7, 3, 0] = mask[0, 7, 3, 2] = True
+    mask[1, 6, 0, 0] = mask[1, 6, 0, 2] = True
+    positions = torch.arange(10, 18)[None].expand(2, -1)
+    view = LDFStepView(
+        step_index=0,
+        history_end=2,
+        active_start=2,
+        active_end=5,
+        frontier_start=5,
+        timeline_position_ids=positions,
+        rope_position_ids=torch.arange(-2, 6)[None].expand(2, -1),
+        beta=torch.zeros(2, 8),
+    )
+    condition = create_xz_condition(
+        clean_root_motion=root,
+        token_valid_mask=valid,
+        constraint_mask=mask,
+        view=view,
+        text_context=[torch.zeros(1, 8) for _ in range(16)],
+        text_null_context=[torch.zeros(1, 8) for _ in range(2)],
+        future_lookahead_tokens=3,
+    )
+    assert condition.future_timeline_position_ids.tolist() == [[15, 17], [16, 0]]
+    assert condition.future_valid_mask.tolist() == [[True, True], [True, False]]
+    assert condition.future_root_condition_mask[0, 0, 1, 0]
+    assert condition.future_root_condition_mask[0, 1, 3, 2]
+    assert condition.future_root_condition_mask[1, 0, 0, 0]
+    assert not condition.future_root_condition_mask[1, 1].any()
+
+
+def test_constraint_dropout_is_per_sample_and_independent_of_text_dropout():
+    device = torch.device("cpu")
+    assert sample_constraint_keep_mask(
+        3,
+        dropout_probability=0.0,
+        device=device,
+        apply_dropout=True,
+    ).tolist() == [True, True, True]
+    assert sample_constraint_keep_mask(
+        3,
+        dropout_probability=1.0,
+        device=device,
+        apply_dropout=True,
+    ).tolist() == [False, False, False]
+    # Validation always preserves constraints, regardless of the train dropout rate.
+    assert sample_constraint_keep_mask(
+        3,
+        dropout_probability=1.0,
+        device=device,
+        apply_dropout=False,
+    ).tolist() == [True, True, True]
+
+
 def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_path):
     module = LDFLightningModule(_make_config(tmp_path)).train()
     root = torch.zeros(1, 8, 5)
@@ -249,6 +441,14 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         "cold_start_mask": torch.ones(1, dtype=torch.bool),
         "prompt_timeline": [["walk", "walk"]],
     }
+    seen_conditions = []
+    original_forward = module.model.forward
+
+    def recording_forward(inputs):
+        seen_conditions.append(inputs.condition)
+        return original_forward(inputs)
+
+    module.model.forward = recording_forward
     losses = module._step(batch, is_training=True)
     assert set(losses) == {
         "anchor_root_flow_v",
@@ -256,6 +456,13 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         "total",
     }
     assert torch.isfinite(losses["total"])
+    assert len(seen_conditions) == 1
+    condition = seen_conditions[0]
+    assert condition.root_condition_mask[:, 0, :, 0].all()
+    assert condition.root_condition_mask[:, 0, :, 2].all()
+    assert not condition.root_condition_mask[:, 0, :, 1].any()
+    assert condition.future_valid_mask.tolist() == [[True]]
+    assert condition.future_timeline_position_ids.tolist() == [[1]]
     losses["total"].backward()
     assert any(parameter.grad is not None for parameter in module.model.parameters())
     assert not any(parameter.grad is not None for parameter in module.vae.parameters())

@@ -8,7 +8,7 @@ import warnings
 import numpy as np
 import torch
 
-from utils.conditions.ldf import HybridMotion, LDFCondition
+from utils.conditions.ldf import HybridMotion
 from utils.initialize import instantiate_target
 from utils.motion_process import ROOT_DIM
 from utils.token_frame import (
@@ -21,6 +21,11 @@ from utils.token_frame import (
 from utils.training.lightning_module import BasicLightningModule
 from utils.training.vae.checkpoint import load_vae_checkpoint
 from utils.training.ldf.batch import anchor_physical_batch
+from utils.training.ldf.conditioning import (
+    create_xz_condition,
+    sample_constraint_keep_mask,
+    sample_xz_constraint_mask,
+)
 from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.self_forcing import (
     SelfForcingState,
@@ -296,17 +301,53 @@ class LDFLightningModule(BasicLightningModule):
         anchored_batch = anchor_physical_batch(
             batch, plan.translation_anchor_xz
         )
-        clean_motion, _ = self._create_clean_motion(anchored_batch)
+        clean_motion, token_valid = self._create_clean_motion(anchored_batch)
         contexts, null_contexts = self._encode_prompt_timeline(
             batch["prompt_timeline"],
             apply_dropout=is_training,
             generator=generator,
         )
 
-        def condition_builder(_view):
-            return LDFCondition(
+        training_config = self.cfg.get("training") or {}
+        constraint_keep = sample_constraint_keep_mask(
+            clean_motion.batch_size,
+            dropout_probability=float(
+                training_config.get("constraint_dropout_probability", 0.0)
+            ),
+            device=clean_motion.root_motion.device,
+            generator=generator,
+            apply_dropout=is_training,
+        )
+        future_lookahead_tokens = int(
+            training_config.get("future_root_lookahead_tokens", 0)
+        )
+        sampling = training_config.get("constraint_sampling") or {}
+        constraint_mask = sample_xz_constraint_mask(
+            token_valid_mask=token_valid,
+            initial_active_start=plan.initial_history_tokens,
+            initial_active_end=(
+                plan.initial_history_tokens + plan.active_tokens
+            ),
+            future_lookahead_tokens=future_lookahead_tokens,
+            dense_probability=float(sampling.get("dense_probability", 0.5)),
+            waypoint_probability=float(
+                sampling.get("waypoint_probability", 0.25)
+            ),
+            goal_probability=float(sampling.get("goal_probability", 0.25)),
+            max_waypoints=int(sampling.get("max_waypoints", 4)),
+            generator=generator,
+        )
+        constraint_mask &= constraint_keep[:, None, None, None]
+
+        def condition_builder(view):
+            return create_xz_condition(
+                clean_root_motion=clean_motion.root_motion,
+                token_valid_mask=token_valid,
+                constraint_mask=constraint_mask,
+                view=view,
                 text_context=contexts,
                 text_null_context=null_contexts,
+                future_lookahead_tokens=future_lookahead_tokens,
             )
 
         result = run_self_forcing_rollout(

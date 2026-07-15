@@ -212,6 +212,11 @@ class LDFCondition:
                 raise TypeError("future_valid_mask must be bool")
             if not _is_prefix_mask(self.future_valid_mask):
                 raise ValueError("future_valid_mask must be prefix-valid for packed attention")
+            mask_valid = self.future_root_condition_mask.flatten(2).any(dim=-1)
+            if not torch.equal(mask_valid, self.future_valid_mask):
+                raise ValueError(
+                    "future_valid_mask must exactly match constrained future tokens"
+                )
             for positions, valid in zip(
                 self.future_timeline_position_ids, self.future_valid_mask
             ):

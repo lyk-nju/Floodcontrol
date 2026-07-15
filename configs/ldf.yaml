@@ -31,7 +31,7 @@ text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion/t5_text_embeddings.pt
 
 vae:
   target: models.vae_wan_1d.BodyVAE
-  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_022912_vae_body265/step_299999.ckpt
+  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/last.ckpt
   params:
     latent_dim: 128
     hidden_dim: 512
@@ -41,7 +41,7 @@ vae:
     dropout: 0.0
     fps: 20.0
     motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
-    latent_stats_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_022912_vae_body265/latent_stats.npz
+    latent_stats_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/latent_stats.npz
 
 data:
   target: datasets.humanml3d.HumanML3DDataset
@@ -69,6 +69,13 @@ text_encoder:
 
 training:
   text_dropout_probability: 0.1
+  constraint_dropout_probability: 0.1
+  future_root_lookahead_tokens: 20
+  constraint_sampling:
+    dense_probability: 0.5
+    waypoint_probability: 0.25
+    goal_probability: 0.25
+    max_waypoints: 4
 
 loss:
   root_weight: 1.0

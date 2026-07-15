@@ -1,6 +1,6 @@
 # 05 训练配置与实验矩阵
 
-状态：`TEACHER_BASELINE_CONFIGURED / ROOT_STATS_REFRESH_REQUIRED`
+状态：`TRAJECTORY_CONDITIONED_TEACHER_BASELINE_READY`
 
 本文只有在模型、数据、runtime 和训练方法文档的相关条目冻结后才开始填写。它记录可执行配置，不反向定义语义协议。
 
@@ -43,9 +43,16 @@ text_encoder:
 
 training:
   text_dropout_probability: 0.1
+  constraint_dropout_probability: 0.1
+  future_root_lookahead_tokens: 20
+  constraint_sampling:
+    dense_probability: 0.5
+    waypoint_probability: 0.25
+    goal_probability: 0.25
+    max_waypoints: 4
 ```
 
-`min/max_frames`定义训练batch共享source span S，`length_bucket_frames`控制训练batch的长度分桶；`validation.continuation_span_frames`单独定义continuation probe的active physical span，确保源clip前面始终有真实历史。`chunk_size`是active band唯一来源，不在training配置中重复。首轮teacher baseline明确设置`self_forcing.enabled: false`；K schedule与teacher replay只在后续显式开启时生效，进度由`phase_start_step/phase_steps`单独定义。text长度128沿用FloodDiffusion论文设置，dropout和root/body loss权重仍是`TUNABLE`。fixed absolute-token noise、固定初始H anchor、逐token prompt可见性和只替换最左active token是训练协议。
+`min/max_frames`定义训练batch共享source span S，`length_bucket_frames`控制训练batch的长度分桶；`validation.continuation_span_frames`单独定义continuation probe的active physical span，确保源clip前面始终有真实历史。`chunk_size`是active band唯一来源，不在training配置中重复。首轮teacher baseline明确设置`self_forcing.enabled: false`；K schedule与teacher replay只在后续显式开启时生效，进度由`phase_start_step/phase_steps`单独定义。text长度128沿用FloodDiffusion论文设置。`future_root_lookahead_tokens=20`表示future XZ最多查看4秒；约束按50% dense trajectory、25% 1–4个frame-level waypoints、25%单一future goal采样。`constraint_dropout_probability=0.1`随后独立清空整份XZ计划，与text dropout共同覆盖四种CFG条件组合。三种模式概率必须和为1，且goal没有真实future时显式退化为active waypoint。dropout和root/body loss权重仍是`TUNABLE`。fixed absolute-token noise、固定初始H anchor、逐token prompt可见性、persistent sparse/dense XZ计划和只替换最左active token共同构成当前训练协议。
 
 `configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`拼接HumanML3D+BABEL，并与baseline共享HumanML3D canonical root statistics、VAE physical/latent statistics和模型合同。这样无论multi模型从头训练还是从HumanML checkpoint继续训练，normalized root语义都不会随数据mixture变化；multi配置只切换Dataset与包含BABEL caption的联合T5表。两个入口都使用单卡Lightning、LDF EMA，并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。`text_embeddings_path`必须由`tools/pretokenize_t5_text.py`生成，包含空文本及训练/验证全部caption和离线内容`content_id`。resume同时校验路径、数值statistics与文本内容身份。
 
@@ -55,7 +62,7 @@ canonical root statistics只通过HumanML配置与正式span sampler生成一次
 python -m tools.compute_ldf_root_stats --config configs/ldf.yaml
 ```
 
-工具默认写入HumanML配置的`root_stats_path`，并复用min/max span、chunk size、cold-start概率和短样本过滤。`ldf_multi.yaml`直接引用同一文件，不再根据BABEL mixture重算或切换归一化尺度。确认统计产物后，人工把对应配置的`status`从`root_statistics_required`切到`training_ready`；`train_ldf.py`不会仅凭同名旧文件存在就静默启动。
+工具默认写入HumanML配置的`root_stats_path`，并复用min/max span、chunk size、cold-start概率和短样本过滤。`ldf_multi.yaml`直接引用同一文件，不再根据BABEL mixture重算或切换归一化尺度。当前canonical统计已经生成，两份配置均为`training_ready`；`train_ldf.py`除检查所有外部文件外，还强制要求正数XZ lookahead和合法的text/constraint dropout。
 
 ## 开始填写前的门槛
 

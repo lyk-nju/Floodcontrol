@@ -298,6 +298,11 @@ class RootTransformer(TransformerStage):
             future_mask = condition.future_root_condition_mask.to(
                 device=noisy.root_motion.device, dtype=torch.bool
             )
+            # A feature mask is an information boundary, not only metadata.
+            # Values in unobserved root channels must never reach the projection.
+            future_value = torch.where(
+                future_mask, future_value, torch.zeros_like(future_value)
+            )
             future = self.future_projection(
                 torch.cat([future_value.flatten(2), future_mask.flatten(2).float()], dim=-1)
             )

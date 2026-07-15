@@ -144,6 +144,20 @@ def test_future_timeline_positions_cannot_overlap_current_window():
         inputs.validate()
 
 
+def test_future_valid_mask_must_match_observed_constraint_tokens():
+    text, null = _text()
+    condition = LDFCondition(
+        text_context=text,
+        text_null_context=null,
+        future_root_condition_value=torch.zeros(1, 2, 4, 5),
+        future_root_condition_mask=torch.zeros(1, 2, 4, 5, dtype=torch.bool),
+        future_timeline_position_ids=torch.tensor([[4, 5]]),
+        future_valid_mask=torch.tensor([[True, False]]),
+    )
+    with pytest.raises(ValueError, match="exactly match constrained future tokens"):
+        condition.validate(batch_size=1, token_length=4, latent_dim=8)
+
+
 def test_previous_root_frame_and_validity_mask_are_paired():
     text, null = _text()
     inputs = LDFInput(

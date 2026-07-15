@@ -6,6 +6,11 @@ from utils.training.ldf.batch import (
     anchor_physical_batch,
     build_ldf_training_step,
 )
+from utils.training.ldf.conditioning import (
+    create_xz_condition,
+    sample_constraint_keep_mask,
+    sample_xz_constraint_mask,
+)
 from utils.training.ldf.data import (
     LDFSpanCollator,
     LengthBucketBatchSampler,
@@ -39,12 +44,15 @@ __all__ = [
     "TextEmbeddingLookup",
     "anchor_physical_batch",
     "build_ldf_training_step",
+    "create_xz_condition",
     "compute_velocity_loss",
     "create_dataloaders",
     "create_dataset",
     "resolve_self_forcing_k",
     "run_self_forcing_rollout",
     "sample_rollout_steps",
+    "sample_constraint_keep_mask",
+    "sample_xz_constraint_mask",
     "sample_window_plan",
     "self_forcing_phase_progress",
 ]

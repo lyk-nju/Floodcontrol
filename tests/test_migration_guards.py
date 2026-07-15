@@ -25,6 +25,13 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.data.max_frames == 200
     assert cfg.data.cold_start_probability == 0.1
     assert cfg.data.length_bucket_frames == 20
+    assert cfg.training.text_dropout_probability == pytest.approx(0.1)
+    assert cfg.training.constraint_dropout_probability == pytest.approx(0.1)
+    assert cfg.training.future_root_lookahead_tokens == 20
+    assert cfg.training.constraint_sampling.dense_probability == pytest.approx(0.5)
+    assert cfg.training.constraint_sampling.waypoint_probability == pytest.approx(0.25)
+    assert cfg.training.constraint_sampling.goal_probability == pytest.approx(0.25)
+    assert cfg.training.constraint_sampling.max_waypoints == 4
     assert cfg.text_embeddings_path.endswith("HumanML3D_motion/t5_text_embeddings.pt")
     assert cfg.validation.continuation_span_frames == 40
     assert cfg.validation.continuation_history_tokens == 5
@@ -46,6 +53,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
 def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     cfg = load_config(str(ROOT / "configs" / "ldf_multi.yaml"))
     human_cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    _validate_training_config(cfg)
     assert cfg.status == "training_ready"
     assert cfg.data.target == "datasets.multi.MultiDataset"
     assert [item.target for item in cfg.data.datasets] == [
@@ -60,6 +68,9 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     )
     assert cfg.root_stats_path == human_cfg.root_stats_path
     assert cfg.validation.continuation_span_frames == 40
+    assert cfg.training.constraint_dropout_probability == pytest.approx(0.1)
+    assert cfg.training.future_root_lookahead_tokens == 20
+    assert cfg.training.constraint_sampling == human_cfg.training.constraint_sampling
 
 
 def test_tiny_vae_config_instantiates_public_body_vae():
@@ -184,7 +195,34 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     assert "create_dataloaders" in source
     assert "BLOCKED_ON_LDF_TRAINING" not in source
     cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
-    with pytest.raises(RuntimeError, match="LDF_ROOT_STATISTICS_REQUIRED"):
+    _validate_training_config(cfg)
+    assert cfg.training.constraint_dropout_probability == pytest.approx(0.1)
+    assert cfg.training.future_root_lookahead_tokens == 20
+
+
+def test_training_entry_rejects_missing_xz_lookahead():
+    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg.config.training.future_root_lookahead_tokens = 0
+    with pytest.raises(RuntimeError, match="LDF_XZ_CONSTRAINT_REQUIRED"):
+        _validate_training_config(cfg)
+
+
+def test_training_entry_rejects_invalid_constraint_dropout():
+    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg.config.training.constraint_dropout_probability = 1.1
+    with pytest.raises(ValueError, match="constraint_dropout_probability"):
+        _validate_training_config(cfg)
+
+
+def test_training_entry_rejects_invalid_constraint_sampling():
+    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg.config.training.constraint_sampling.goal_probability = 0.5
+    with pytest.raises(ValueError, match="must sum to one"):
+        _validate_training_config(cfg)
+
+    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg.config.training.constraint_sampling.max_waypoints = 0
+    with pytest.raises(ValueError, match="max_waypoints"):
         _validate_training_config(cfg)
 
 

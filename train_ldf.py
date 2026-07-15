@@ -24,9 +24,8 @@ def _require_file(path: str, name: str) -> None:
 def _validate_training_config(cfg) -> None:
     if str(cfg.status) != "training_ready":
         raise RuntimeError(
-            "LDF_ROOT_STATISTICS_REQUIRED: regenerate root_stats.npz with the "
-            "current fixed-span/anchor sampler, then explicitly set "
-            "status: training_ready"
+            "LDF_TRAINING_NOT_READY: finish the required data/statistics/model "
+            "migration, then explicitly set status: training_ready"
         )
     _require_file(str(cfg.root_stats_path), "ROOT_STATISTICS")
     _require_file(str(cfg.vae.checkpoint_path), "VAE_CHECKPOINT")
@@ -35,6 +34,41 @@ def _validate_training_config(cfg) -> None:
     _require_file(str(cfg.text_embeddings_path), "TEXT_EMBEDDINGS")
     if int(cfg.model.params.text_len) != int(cfg.text_encoder.text_len):
         raise ValueError("model.text_len and text_encoder.text_len must match")
+    training = cfg.get("training") or {}
+    for name in (
+        "text_dropout_probability",
+        "constraint_dropout_probability",
+    ):
+        probability = float(training.get(name, 0.0))
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"training.{name} must lie in [0,1]")
+    lookahead = int(training.get("future_root_lookahead_tokens", 0))
+    if lookahead <= 0:
+        raise RuntimeError(
+            "LDF_XZ_CONSTRAINT_REQUIRED: "
+            "training.future_root_lookahead_tokens must be positive"
+        )
+    sampling = training.get("constraint_sampling") or {}
+    probabilities = [
+        float(sampling.get(name, -1.0))
+        for name in (
+            "dense_probability",
+            "waypoint_probability",
+            "goal_probability",
+        )
+    ]
+    if any(value < 0.0 or value > 1.0 for value in probabilities):
+        raise ValueError(
+            "training.constraint_sampling probabilities must lie in [0,1]"
+        )
+    if abs(sum(probabilities) - 1.0) > 1e-6:
+        raise ValueError(
+            "training.constraint_sampling probabilities must sum to one"
+        )
+    if int(sampling.get("max_waypoints", 0)) <= 0:
+        raise ValueError(
+            "training.constraint_sampling.max_waypoints must be positive"
+        )
 
 
 def _create_run_directory(cfg) -> tuple[str, Path]:

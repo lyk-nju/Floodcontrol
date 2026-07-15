@@ -82,6 +82,31 @@ def test_constraint_view_does_not_mutate_noisy_state():
     assert torch.equal(inputs.noisy_motion.root_motion, root_before)
 
 
+def test_changing_active_xz_condition_changes_root_prediction():
+    torch.manual_seed(5)
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=4)
+    mask = torch.zeros_like(inputs.noisy_motion.root_motion, dtype=torch.bool)
+    mask[..., 0] = True
+    mask[..., 2] = True
+    first_value = torch.zeros_like(inputs.noisy_motion.root_motion)
+    second_value = first_value.clone()
+    second_value[..., 0] = 1.5
+    second_value[..., 2] = -0.75
+
+    def predict(value):
+        condition = LDFCondition(
+            inputs.condition.text_context,
+            inputs.condition.text_null_context,
+            root_condition_value=value,
+            root_condition_mask=mask,
+        )
+        conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
+        return model(conditioned).velocity.root_motion
+
+    assert not torch.allclose(predict(first_value), predict(second_value))
+
+
 def test_body_heading_is_derived_from_clean_root():
     model = make_model()
     inputs = make_input(batch=1, tokens=4)
@@ -174,6 +199,78 @@ def test_future_root_is_packed_after_the_visible_motion_prefix():
     assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 3, 4]]
     assert captured["text_query_indices"].tolist() == [[0, 1, 2, -1, -1]]
     assert not output.velocity.root_motion[:, 3].any()
+
+
+def test_future_root_mask_blocks_unobserved_features_before_projection():
+    model = make_model().eval()
+    future = torch.arange(20, dtype=torch.float32).reshape(1, 1, 4, 5)
+    future_mask = torch.zeros_like(future, dtype=torch.bool)
+    future_mask[..., 0] = True
+    future_mask[..., 2] = True
+    condition = LDFCondition(
+        text_context=[torch.zeros(1, 8) for _ in range(2)],
+        text_null_context=[torch.zeros(1, 8)],
+        future_root_condition_value=future,
+        future_root_condition_mask=future_mask,
+        future_timeline_position_ids=torch.tensor([[2]]),
+        future_valid_mask=torch.tensor([[True]]),
+    )
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(
+            torch.zeros(1, 2, 4, 5), torch.zeros(1, 2, 8)
+        ),
+        beta=torch.full((1, 2), 0.5),
+        history_mask=torch.zeros(1, 2, dtype=torch.bool),
+        generation_mask=torch.ones(1, 2, dtype=torch.bool),
+        timeline_position_ids=torch.tensor([[0, 1]]),
+        rope_position_ids=torch.tensor([[0, 1]]),
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=condition,
+    )
+    captured = {}
+
+    def capture_projection(self, value):
+        captured["projection_input"] = value.clone()
+        return value.new_zeros(*value.shape[:-1], self.out_features)
+
+    model.root_transformer.future_projection.forward = types.MethodType(
+        capture_projection, model.root_transformer.future_projection
+    )
+    model(inputs)
+
+    projected_value = captured["projection_input"][..., :20].reshape(1, 1, 4, 5)
+    assert torch.equal(projected_value[..., 0], future[..., 0])
+    assert torch.equal(projected_value[..., 2], future[..., 2])
+    assert not projected_value[..., 1].any()
+    assert not projected_value[..., 3:].any()
+
+
+def test_changing_future_xz_lookahead_changes_root_prediction():
+    torch.manual_seed(17)
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=3)
+    future_mask = torch.zeros(1, 2, 4, 5, dtype=torch.bool)
+    future_mask[..., 0] = True
+    future_mask[..., 2] = True
+    first_value = torch.zeros(1, 2, 4, 5)
+    second_value = first_value.clone()
+    second_value[..., 0] = 2.0
+    second_value[..., 2] = -1.0
+
+    def predict(value):
+        condition = LDFCondition(
+            inputs.condition.text_context,
+            inputs.condition.text_null_context,
+            future_root_condition_value=value,
+            future_root_condition_mask=future_mask,
+            future_timeline_position_ids=torch.tensor([[3, 4]]),
+            future_valid_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
+        conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
+        return model(conditioned).velocity.root_motion
+
+    assert not torch.allclose(predict(first_value), predict(second_value))
 
 
 def test_local_root_uses_per_sample_previous_root_validity():

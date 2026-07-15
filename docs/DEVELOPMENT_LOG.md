@@ -2443,6 +2443,41 @@
 - 当前164325 checkpoint只在HumanML3D训练；BABEL前10个样本的平均重建误差约为HumanML3D的两倍，且`11995_5`明显更困难。是否训练multi VAE应在扩大分层validation样本后决定，不能只根据这20个可视化样本作最终结论。
 - 本轮没有删除旧版未分模型的本地eval产物；它们不受Git跟踪，也不会影响新的model-scoped目录。若需要释放空间，可在确认旧结果无保留价值后单独清理。
 
+## 2026-07-16 · 164325 VAE latent statistics与LDF配置切换
+
+改动类型：正式数据扫描 / VAE-LDF checkpoint边界 / LDF配置
+
+实际改动内容：
+
+- 使用`20260715_164325_vae_body265/last.ckpt`的EMA encoder和deterministic posterior `mu`重新扫描HumanML3D完整train split，共处理`23240/23240`个样本；按当前统计工具的固定`yaw_seed=0`顺序采样全局yaw增强。
+- 将128D latent mean/std原子写入`/data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/latent_stats.npz`。当前协议只保存`mean/std`，checkpoint与statistics配对由配置所有，与`02_VAE_AND_BODY_REPRESENTATION.md`一致。
+- `configs/ldf.yaml`和`configs/ldf_multi.yaml`同时从022912 VAE切换到164325的`last.ckpt`与新生成的`latent_stats.npz`；两条LDF训练线现在共享同一HumanML-trained VAE latent坐标系。
+
+改动理由：
+
+- latent statistics属于具体冻结EMA encoder的输出分布，不能继续沿用022912模型生成的mean/std；checkpoint和latent normalization必须作为同一不可拆分配置边界迁移。
+- `ldf_multi`本轮按明确要求继续使用HumanML训练得到的共享VAE，因此也必须使用该VAE在HumanML train上生成的statistics，不能混用旧模型或另一个数据分布的统计量。
+
+验证：
+
+- 正式扫描成功完成`23240/23240`个HumanML train样本并写入目标NPZ。
+- 新NPZ SHA256为`6a30d2f41787ad5548fe91df52d62add12ab80319d75f863986d006c067349d2`；`mean/std`形状均为`[128]`、dtype为float32、全部finite，std全部为正且范围为`[1.05748, 2.67038]`。
+- 分别从`configs/ldf.yaml`和`configs/ldf_multi.yaml`构造`BodyVAE`并加载164325 `last.ckpt`的EMA权重成功；两者均确认`latent_statistics_ready=True`且模型处于冻结eval状态。
+- 全仓`MPLCONFIGDIR=/tmp/matplotlib /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`177 passed, 1 warning`；warning仅为测试沙箱无法初始化NVML。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `configs/ldf.yaml`
+- `configs/ldf_multi.yaml`
+- `docs/DEVELOPMENT_LOG.md`
+- 外部生成产物：`/data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/latent_stats.npz`
+
+尚未完成的后续事项：
+
+- `ldf_multi`当前有意使用HumanML latent statistics；若以后训练真正的HumanML+BABEL multi VAE，必须用那个新EMA encoder重新扫描约定的数据mixture并再次整体切换checkpoint/statistics，不能复用本文件。
+- 本轮只切换VAE及latent statistics，没有启动正式LDF训练，也没有改动root statistics或T5 embedding artifacts。
+
 ## 2026-07-16 · 生成HumanML3D与BABEL训练所需T5文本表
 
 改动类型：离线文本预编码工具修复 / 正式数据产物生成 / 配置接线验证
@@ -2479,3 +2514,135 @@
 
 - 本轮只补齐文本embedding表；正式LDF启动仍需检查并生成配置要求的root statistics等剩余训练前产物。
 - 本轮未运行全仓pytest；工具修复由两次真实UMT5生成、正式loader加载和27项相关测试覆盖。
+
+## 2026-07-16 · 生成canonical HumanML3D LDF root statistics
+
+改动类型：正式训练数据产物 / normalization协议冻结 / LDF配置与文档
+
+实际改动内容：
+
+- 使用当前`tools.compute_ldf_root_stats`的fixed-span/anchor采样器遍历22,418个满足最短长度的HumanML3D训练样本，每个样本按固定seed采一个40–200帧四帧对齐窗口，并复用10% cold start、随机初始H、history末帧XZ anchor和均匀random-yaw训练分布。
+- 先生成并验证临时NPZ，再通过同目录pending文件原子替换`HumanML3D_motion/root_stats.npz`，没有在统计过程中直接覆盖正式文件。
+- 冻结HumanML3D root statistics为canonical normalization：`ldf.yaml`和`ldf_multi.yaml`共同引用同一文件。加入BABEL时只切换Dataset和联合T5表，不再重算或切换root尺度，从而保持从HumanML checkpoint继续训练时的数值语义。
+- 两份正式配置的VAE checkpoint、motion/latent/root statistics和T5表前置路径均通过训练入口校验后，将状态从`root_statistics_required`切换为`training_ready`；本轮没有实际启动训练。
+- 数据与训练配置文档同步移除“HumanML+BABEL单独计算root stats”的旧协议，并增加配置测试锁定共享路径。
+
+改动理由：
+
+- global root的统计分布必须匹配LDF实际fixed-span translation anchor与random-yaw处理；旧文件早于当前采样协议，不能仅凭同名文件存在继续使用。
+- 原版FloodDiffusion让HumanML与BABEL共享同一VAE latent尺度；Floodcontrol同样保持一套canonical root/local/latent normalization，避免数据mixture或fine-tune阶段改变模型输入输出含义。
+
+验证：
+
+- 正式文件只含`root_mean/root_std [5] float32`，所有值finite且std严格为正；SHA256为`97460eab919e02569502ce84cabce1670a3677dd9031e87e4aa36449132a72cd`。
+- `root_mean=[0.0006808192, 0.91795015, -0.0039776308, 0.0038573092, 0.0005940247]`。
+- `root_std=[0.56822836, 0.15350504, 0.56570762, 0.70656031, 0.70764202]`。
+- 将两份配置以`training_ready`送入`train_ldf._validate_training_config()`，全部前置文件检查通过且解析到同一root stats路径。
+- `tests/test_ldf_statistics.py tests/test_migration_guards.py`：`25 passed`。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `configs/{ldf,ldf_multi}.yaml`
+- `docs/rearchitecture/{02_DATA_PIPELINE,05_TRAINING_CONFIG}.md`
+- `tests/test_migration_guards.py`
+- `docs/DEVELOPMENT_LOG.md`
+- 外部数据产物：`/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/root_stats.npz`
+
+尚未完成的后续事项：
+
+- 本轮未启动HumanML或HumanML+BABEL正式LDF训练；配置现已解除statistics迁移守卫，可在最终训练超参数和运行资源确认后启动。
+- 需要在首轮BABEL联合训练中监控normalized root的极值与标准差，确认canonical HumanML尺度没有产生异常outlier；监控结果不应通过训练中途切换stats来修复。
+- 本轮未运行全仓pytest；统计/迁移定向测试、两份真实配置前置校验与产物数值校验已经完成。
+
+## 2026-07-16 · LDF active/future XZ轨迹条件训练接线
+
+改动类型：核心训练协议修复 / Root Stage轨迹控制 / constraint CFG训练分布
+
+实际改动内容：
+
+- 新增`utils/training/ldf/conditioning.py`，从translation-anchored、random-yaw增强后的normalized clean root编译训练条件。当前active band只暴露root feature 0/2，即每帧XZ；root y与heading不进入当前轨迹条件。
+- 将active band之后最多`future_root_lookahead_tokens=20`个真实token编译为future XZ condition，携带absolute timeline position并按每个sample的有效span自然缩短。短样本尾部不使用假零未来。
+- `LDFLightningModule`现在对每个sample独立采样text dropout和constraint dropout；constraint决定在一个self-forcing rollout内保持不变，所有step复用同一决定。正式配置的两者均为0.1。
+- Root Stage继续使用branch-local只读masked input view；persistent noisy state、clean prediction和history不被hard replace。Body Stage不直接读取raw active/future XZ，只读取唯一Root Stage结果派生的local root与heading。
+- future root value在进入`future_projection`前按feature mask清零，阻止未观测的root y/cos/sin通过数值张量泄漏。`LDFCondition`同时要求`future_valid_mask`与实际含约束的future token严格一致。
+- `train_ldf.py`新增正式训练守卫：text/constraint dropout必须位于`[0,1]`，`future_root_lookahead_tokens`必须为正；没有XZ lookahead的text-only配置不能标记为`training_ready`。
+- 两份LDF配置均加入`constraint_dropout_probability: 0.1`与`future_root_lookahead_tokens: 20`。README及训练方法、训练配置、模型实现文档同步记录新的真实训练路径。
+
+改动理由：
+
+- 将root提升为LDF内部结构化生成变量，只解决了“谁生成root”与“Body怎样依赖root”，并不会自动让模型学会服从用户XZ轨迹。没有把active/future trajectory condition送入训练，Root Transformer仍只是text-to-root生成器，不是轨迹控制器。
+- 此前实现把model-core、condition schema和training bridge拆成阶段后，错误地把“模型已经能接收constraint”当成“轨迹控制已经完成”，并在root statistics就绪后过早将配置标成`training_ready`。验收条件也只覆盖了condition dataclass/CFG公式，没有要求“训练batch真实出现constraint”和“改变XZ会改变Root预测”。这是里程碑定义与验收标准的架构失误，不是ARDY方法不需要该条件。
+- Floodcontrol参考ARDY的核心目标正是让root/trajectory成为模型内部生成与条件建模的一部分，因此active XZ、future lookahead和独立constraint dropout必须属于首个teacher baseline，而不能推迟到可选的后续finetune。
+
+验证：
+
+- condition测试确认active mask只覆盖当前active band的XZ，future mask只覆盖后续lookahead的XZ，constraint dropout按sample生效且validation不丢条件。
+- self-forcing测试确认active/future范围随step同步右移，constraint keep/drop决定在rollout内保持不变。
+- 模型回归分别确认改变active XZ和改变future XZ都会改变Root Stage预测；未masked的future y/heading数值不会进入projection。
+- 训练bridge smoke test确认真实`_step()`同时构造active XZ与future XZ，loss可反传LDF且冻结VAE无梯度。
+- 两份正式配置均通过训练入口前置校验。
+- `MPLCONFIGDIR=/tmp/matplotlib /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`186 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+- 全仓Python文件`py_compile`通过，`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/{conditioning,lightning_module,__init__}.py`
+- `utils/conditions/ldf.py`
+- `models/diffusion_forcing_wan.py`
+- `train_ldf.py`
+- `configs/{ldf,ldf_multi}.yaml`
+- `tests/{test_ldf_training,test_ldf_self_forcing,test_ldf_forward,test_ldf_conditions,test_migration_guards}.py`
+- `README.md`
+- `docs/rearchitecture/{04_TRAINING_METHOD,05_TRAINING_CONFIG,06_LDF_IMPLEMENTATION_DESIGN}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮完成的是监督训练bridge，不代表已经训练出可用轨迹控制checkpoint；正式LDF长训尚未启动。
+- 当前条件是dense active XZ与最多4秒future XZ；稀疏waypoint、heading约束、lookahead长度和dropout概率需要在保持同一condition合同下单独消融。
+- Web/runtime仍等待正式LDF checkpoint loader和真实route timeline到`LDFCondition`的端到端控制验证，不能把合成forward敏感性测试等同于在线控制质量。
+
+## 2026-07-16 · LDF dense trajectory、sparse waypoint与future goal混合采样
+
+改动类型：轨迹控制训练分布 / 稀疏条件编译 / self-forcing约束生命周期
+
+实际改动内容：
+
+- 将LDF训练约束从单一dense active/future XZ扩展为三种按sample采样的模式：50% dense trajectory、25% sparse waypoints、25% single future goal。所有模式只观察root x/z，不暴露root y或heading。
+- sparse waypoint在`[B,T,4,5]`的frame维随机选择1–4个帧，选择一个token不会自动暴露其中全部四帧；future goal清空首个active band内的约束，只选择一个严格位于其后的future frame。短span没有真实future frame时明确退化为一个active waypoint，不静默变成无约束样本。
+- 每个batch先采样一次absolute XZ mask，再在整个self-forcing rollout内复用。当前step仅编译落入active band的帧；其后的稀疏约束按absolute timeline position压紧打包为future tokens。窗口右移时同一个goal会从future条件自然迁入active条件，不重新采样。
+- 保留独立sample-level constraint dropout，并在mode采样后清空整份absolute mask；因此无约束样本只由CFG dropout产生，不与短样本fallback混淆。
+- `train_ldf.py`新增mode概率和值域校验：三种概率均位于`[0,1]`且和为1，`max_waypoints`必须为正。HumanML和HumanML+BABEL配置统一冻结为`0.5/0.25/0.25`与最多4个waypoints。
+- README和LDF训练方法、配置、实现文档同步记录frame-level sparse mask、packed future token和persistent constraint plan语义。
+
+改动理由：
+
+- dense path following只训练“沿完整轨迹走”，不能充分覆盖ARDY式“给一个稀疏waypoint或远期goal，让模型自己补全中间动作”的使用方式。将三种条件密度放进同一teacher baseline，才能让Root Stage同时学习路径跟随、稀疏插值和目标导向规划。
+- 约束必须绑定absolute motion frame并在rollout内持久化；若每个self-forcing step重新采样，模型看到的任务会随窗口变化，单一goal也无法从future token连续迁移到active observation。
+- constraint dropout与条件稀疏度承担不同职责：前者为CFG提供无约束分支，后者定义控制任务。显式分离可以避免把“没有future可采”错误解释成CFG无条件样本。
+
+验证：
+
+- 新增测试覆盖三种强制采样模式、frame-level XZ配对、1–4 waypoint上限、无future fallback、不同batch样本的稀疏future压紧打包和padding。
+- self-forcing回归确认dense范围随active窗口移动，并确认同一个single future goal在下一step保持absolute identity并迁入active mask。
+- 配置测试确认两份正式配置共享相同采样合同，并对概率和不为1、`max_waypoints<=0`执行fail-fast。
+- 定向LDF条件/forward/self-forcing/训练/迁移测试：`70 passed`。
+- 全仓`MPLCONFIGDIR=/tmp/matplotlib /home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`191 passed, 1 warning`；warning仅为测试环境无法初始化NVML。
+- 全仓Python文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/{conditioning,lightning_module,__init__}.py`
+- `train_ldf.py`
+- `configs/{ldf,ldf_multi}.yaml`
+- `tests/{test_ldf_training,test_ldf_self_forcing,test_migration_guards}.py`
+- `README.md`
+- `docs/rearchitecture/{04_TRAINING_METHOD,05_TRAINING_CONFIG,06_LDF_IMPLEMENTATION_DESIGN}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮沿用root/body flow-v监督，没有同时增加masked root constraint-adherence或ARDY式额外goal loss；应先观察混合采样baseline的goal error，再将该loss作为独立消融引入。
+- 50%/25%/25%、最多4个waypoints和20-token lookahead是首轮训练默认值，不是已经验证的最优超参数。
+- 尚未启动正式LDF训练，也尚未用真实在线route验证稀疏goal控制质量。
