@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import types
 
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from omegaconf import OmegaConf
+from torch.multiprocessing.spawn import ProcessRaisedException
 
 from models.diffusion_forcing_wan import LDF
 from eval.ldf_training import LDFEvaluationCallback
@@ -16,18 +20,42 @@ from metrics.trajectory import (
 )
 from tests.vae_helpers import make_vae
 from utils.conditions.ldf import HybridMotion, LDFPrediction
+from utils.training.ldf.evaluation import artifacts as evaluation_artifacts
 from utils.training.ldf.evaluation.artifacts import save_dense_xz_sample
 from utils.training.ldf.evaluation.generation import (
     compile_evaluation_prompt,
     generate_evaluation_sequence,
 )
-from utils.training.ldf.evaluation.runner import LDFEvaluationRunner
+from utils.training.ldf.evaluation.runner import (
+    LDFEvaluationRunner,
+    _all_gather_objects,
+    _distributed_barrier,
+)
 
 
 class _TextEmbeddings:
     @staticmethod
     def lookup(texts):
         return [torch.zeros(1, 4) for _ in texts]
+
+
+def _distributed_collective_worker(rank: int, world_size: int, init_file: str) -> None:
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        gathered = _all_gather_objects({"rank": rank, "samples": [rank, rank + 2]})
+        assert gathered == [
+            {"rank": 0, "samples": [0, 2]},
+            {"rank": 1, "samples": [1, 3]},
+        ]
+        _distributed_barrier()
+    finally:
+        dist.destroy_process_group()
 
 
 def _zero_prediction(self, inputs, **kwargs):
@@ -88,7 +116,7 @@ def test_generation_evaluation_is_composed_as_an_entrypoint_callback():
 
     callback.on_fit_start(types.SimpleNamespace(is_global_zero=True), module)
     callback.on_fit_start(types.SimpleNamespace(is_global_zero=False), module)
-    assert coverage_calls == [module]
+    assert coverage_calls == [module, module]
 
     callback.on_validation_epoch_end(
         types.SimpleNamespace(sanity_checking=False, is_global_zero=True),
@@ -103,7 +131,58 @@ def test_generation_evaluation_is_composed_as_an_entrypoint_callback():
         types.SimpleNamespace(sanity_checking=False, is_global_zero=False),
         module,
     )
-    assert calls == [module]
+    assert calls == [module, module]
+
+
+def test_generation_evaluation_shards_samples_without_loading_peer_motion():
+    class MetadataDataset:
+        def __init__(self):
+            self.dataset = [
+                {"dataset": "HumanML3D", "name": f"sample_{index}"}
+                for index in range(7)
+            ]
+            self.loaded = []
+
+        def __len__(self):
+            return len(self.dataset)
+
+        def __getitem__(self, index):
+            self.loaded.append(index)
+            return dict(self.dataset[index])
+
+    cfg = OmegaConf.create({"validation": {"generation": {"enabled": False}}})
+    assignments = []
+    for rank in range(3):
+        dataset = MetadataDataset()
+        runner = LDFEvaluationRunner(cfg)
+        runner._dataset = dataset
+        shard, total = runner._selected_sample_shard(
+            types.SimpleNamespace(global_rank=rank, world_size=3),
+            limit=0,
+            dataset_name="HumanML3D",
+        )
+        indices = [index for index, _ in shard]
+        assert total == 7
+        assert dataset.loaded == indices
+        assignments.extend(indices)
+    assert sorted(assignments) == list(range(7))
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_generation_evaluation_collectives_run_in_two_real_processes(tmp_path):
+    world_size = 2
+    try:
+        mp.spawn(
+            _distributed_collective_worker,
+            args=(world_size, str(tmp_path / "ddp_init")),
+            nprocs=world_size,
+            join=True,
+        )
+    except ProcessRaisedException as error:
+        message = str(error)
+        if "Operation not permitted" in message or "Cannot resolve" in message:
+            pytest.skip("sandbox does not permit the Gloo loopback transport")
+        raise
 
 
 def test_evaluation_text_coverage_fails_before_training_for_missing_probe_prompt():
@@ -232,6 +311,77 @@ def test_dense_xz_artifacts_follow_floodnet_layout(tmp_path):
     assert (expected / "sample.json").is_file()
     assert (tmp_path / "HumanML3D" / "feature" / "dense_xz_stream" / "step_010000" / "sample.npz").is_file()
     assert json.loads((expected / "sample.json").read_text())["invalid"] is None
+
+
+def test_dense_xz_video_contains_generated_motion_and_trajectory_panel(
+    tmp_path,
+    monkeypatch,
+):
+    frames = [
+        np.full((128, 128, 3), fill_value=value, dtype=np.uint8)
+        for value in (32, 64)
+    ]
+    written: dict[str, list[np.ndarray]] = {}
+
+    class Reader:
+        def __iter__(self):
+            return iter(frames)
+
+        def close(self):
+            return None
+
+    class Writer:
+        def __init__(self, path):
+            self.path = str(path)
+            written[self.path] = []
+
+        def append_data(self, frame):
+            written[self.path].append(np.asarray(frame).copy())
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        evaluation_artifacts,
+        "render_motion_video",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        evaluation_artifacts.imageio,
+        "get_reader",
+        lambda path: Reader(),
+    )
+    monkeypatch.setattr(
+        evaluation_artifacts.imageio,
+        "get_writer",
+        lambda path, fps: Writer(path),
+    )
+
+    target_root = torch.zeros(2, 5)
+    target_root[:, 0] = torch.tensor([0.0, 1.0])
+    predicted_root = torch.zeros(2, 5)
+    predicted_root[:, 2] = torch.tensor([0.0, 1.0])
+    body = torch.zeros(2, 265)
+    video_path = tmp_path / "video.mp4"
+    composite_path = tmp_path / "composite.mp4"
+    evaluation_artifacts.render_comparison_video(
+        target_root=target_root,
+        target_body=body,
+        predicted_root=predicted_root,
+        predicted_body=body,
+        predicted_video_path=video_path,
+        composite_path=composite_path,
+        caption="walk along the route",
+        fps=20.0,
+    )
+
+    video_frame = written[str(video_path)][0]
+    composite_frame = written[str(composite_path)][0]
+    assert video_frame.shape == (160, 256, 3)
+    assert composite_frame.shape == (160, 384, 3)
+    trajectory_panel = video_frame[32:, 128:]
+    assert np.any(np.all(trajectory_panel == (20, 150, 20), axis=-1))
+    assert np.any(np.all(trajectory_panel == (210, 40, 40), axis=-1))
 
 
 @pytest.mark.parametrize(

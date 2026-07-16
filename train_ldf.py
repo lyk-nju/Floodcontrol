@@ -103,10 +103,6 @@ def _validate_training_config(cfg) -> None:
     t2m = validation.get("t2m") or {}
     generation_enabled = bool(generation.get("enabled", False))
     if generation_enabled:
-        if int(cfg.trainer.devices) != 1:
-            raise ValueError(
-                "training-time generation evaluation currently requires one device"
-            )
         validation_steps = int(validation.validation_steps)
         generation_steps = int(generation.get("steps", 0))
         if generation_steps <= 0 or generation_steps % validation_steps:
@@ -182,7 +178,14 @@ def _create_run_directory(cfg) -> tuple[str, Path]:
     OmegaConf.update(cfg.config, "save_dir", str(save_dir))
     OmegaConf.update(cfg.config, "run_time", run_time)
     rank_zero_info(f"Save dir: {save_dir}, exp_name: {cfg.exp_name}")
-    save_run_snapshot(cfg, save_dir)
+    process_rank = int(
+        os.environ.get(
+            "RANK",
+            os.environ.get("GLOBAL_RANK", os.environ.get("LOCAL_RANK", "0")),
+        )
+    )
+    if process_rank == 0:
+        save_run_snapshot(cfg, save_dir)
     return run_time, save_dir
 
 
@@ -248,8 +251,13 @@ def main() -> None:
         callbacks.append(LDFEvaluationCallback(cfg.config))
     if cfg.train:
         callbacks.append(_create_checkpoint_callback(cfg, save_dir))
+    trainer_config = OmegaConf.to_container(cfg.trainer, resolve=True)
+    # LDF owns length-bucket training sharding and exact validation sharding.
+    # Letting Lightning inject another DistributedSampler would either
+    # duplicate sharding or fail on the resumable batch sampler.
+    trainer_config["use_distributed_sampler"] = False
     trainer = Trainer(
-        **cfg.trainer,
+        **trainer_config,
         logger=logger,
         callbacks=callbacks,
         default_root_dir=str(save_dir),

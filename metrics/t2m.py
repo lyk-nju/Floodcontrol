@@ -50,6 +50,7 @@ class T2MMetrics(Metric):
         self.add_state("text_embeddings", default=[], dist_reduce_fx=None)
         self.add_state("recmotion_embeddings", default=[], dist_reduce_fx=None)
         self.add_state("gtmotion_embeddings", default=[], dist_reduce_fx=None)
+        self.add_state("sample_indices", default=[], dist_reduce_fx=None)
 
         # T2M Evaluator
         self._get_t2m_evaluator(self.cfg)
@@ -122,8 +123,8 @@ class T2MMetrics(Metric):
         # Use current device for metrics (CUDA if available, to match model device)
         metrics_device = self.device
 
-        # Jump in sanity check stage and no embeddings
-        if sanity_flag or not self.recmotion_embeddings:
+        # Sanity checking is identical on every rank and needs no collective.
+        if sanity_flag:
             # Return dummy values for sanity check
             if self.evaluate_text:
                 for metric in self.Matching_metrics:
@@ -133,7 +134,9 @@ class T2MMetrics(Metric):
             metrics["gt_Diversity"] = torch.tensor(0.0, device=metrics_device)
             return metrics
 
-        # Gather embeddings from all GPUs
+        # Gather before checking emptiness: a valid shard may be empty when the
+        # world size exceeds the local sample count.  Returning early on that
+        # rank would deadlock peers inside all_gather_object().
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
 
@@ -162,9 +165,35 @@ class T2MMetrics(Metric):
                 self.text_embeddings = [
                     emb for rank_embs in gathered_text for emb in rank_embs
                 ]
+            gathered_indices = [None] * world_size
+            torch.distributed.all_gather_object(gathered_indices, self.sample_indices)
+            self.sample_indices = [
+                int(index)
+                for rank_indices in gathered_indices
+                for index in rank_indices
+            ]
+
+        if not self.recmotion_embeddings:
+            if self.evaluate_text:
+                for metric in self.Matching_metrics:
+                    metrics[metric] = torch.tensor(0.0, device=metrics_device)
+            metrics["FID"] = torch.tensor(0.0, device=metrics_device)
+            metrics["Diversity"] = torch.tensor(0.0, device=metrics_device)
+            metrics["gt_Diversity"] = torch.tensor(0.0, device=metrics_device)
+            return metrics
 
         # Now use the global embeddings (already on CPU)
         count_seq = len(self.recmotion_embeddings)
+        if (
+            len(self.sample_indices) != count_seq
+            or len(set(self.sample_indices)) != count_seq
+        ):
+            raise RuntimeError("T2M distributed sample indices are missing or duplicated")
+        global_order = sorted(range(count_seq), key=self.sample_indices.__getitem__)
+        self.recmotion_embeddings = [self.recmotion_embeddings[i] for i in global_order]
+        self.gtmotion_embeddings = [self.gtmotion_embeddings[i] for i in global_order]
+        if self.evaluate_text:
+            self.text_embeddings = [self.text_embeddings[i] for i in global_order]
 
         # Cat cached batches and shuffle
         shuffle_idx = torch.randperm(count_seq)
@@ -291,10 +320,25 @@ class T2MMetrics(Metric):
         lengths_ref: List[int],
         lengths_rst: List[int],
         text_tokens: List[List[str]] = None,
+        sample_indices: List[int] | None = None,
     ):
+        batch_size = len(lengths_ref)
+        if len(lengths_rst) != batch_size:
+            raise ValueError(
+                "reference and result lengths must have the same batch size"
+            )
+        if sample_indices is None:
+            start = len(self.sample_indices)
+            sample_indices = list(range(start, start + batch_size))
+        if len(sample_indices) != batch_size:
+            raise ValueError("sample_indices must match the T2M batch size")
+        self.sample_indices.extend(int(index) for index in sample_indices)
+
         # T2m motion encoder
         align_idx = np.argsort(lengths_ref)[::-1].copy()
-        feats_ref = feats_ref[align_idx]
+        feats_ref = feats_ref.index_select(
+            0, torch.as_tensor(align_idx, device=feats_ref.device)
+        )
         lengths_ref = np.array(lengths_ref)[align_idx]
         gtmotion_embeddings = self.get_motion_embeddings(feats_ref, lengths_ref)
         cache = [0] * len(lengths_ref)
@@ -304,7 +348,9 @@ class T2MMetrics(Metric):
         self.gtmotion_embeddings.extend(cache)
 
         align_idx = np.argsort(lengths_rst)[::-1].copy()
-        feats_rst = feats_rst[align_idx]
+        feats_rst = feats_rst.index_select(
+            0, torch.as_tensor(align_idx, device=feats_rst.device)
+        )
         lengths_rst = np.array(lengths_rst)[align_idx]
         recmotion_embeddings = self.get_motion_embeddings(feats_rst, lengths_rst)
         cache = [0] * len(lengths_rst)

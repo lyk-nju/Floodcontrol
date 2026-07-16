@@ -15,15 +15,19 @@ class LDFEvaluationCallback(Callback):
         self.runner = LDFEvaluationRunner(cfg)
 
     def on_fit_start(self, trainer, pl_module) -> None:
-        if trainer.is_global_zero:
-            self.runner.validate_text_coverage(pl_module)
+        # Every rank validates its local lookup before entering generation
+        # collectives.  A rank-local failure must stop the whole DDP job rather
+        # than leave peers waiting in a later all-gather.
+        self.runner.validate_text_coverage(pl_module)
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
-        if trainer.sanity_checking or not trainer.is_global_zero:
+        if trainer.sanity_checking:
             return
         # Callback hooks run before the module hook. BasicLightningModule has
         # already installed EMA weights in on_validation_start and restores
         # them in its own on_validation_epoch_end after this callback returns.
+        # All ranks participate.  The runner shards generation work and keeps
+        # summaries/logger writes rank-zero-only.
         self.runner.maybe_run(pl_module)
 
 

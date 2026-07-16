@@ -8,12 +8,14 @@ self-forcing state deliberately belong to the later training kernel.
 
 from __future__ import annotations
 
+import os
 import random
 from collections import defaultdict
 from math import ceil
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 from utils.initialize import instantiate_target
@@ -24,6 +26,28 @@ from utils.training.ldf.self_forcing import validate_self_forcing_config
 
 _SEED_MASK = (1 << 64) - 1
 _LENGTH_BUCKET_FRAMES = 20
+
+
+def _distributed_rank_world() -> tuple[int, int]:
+    """Resolve rank lazily because DataLoaders are built before Trainer setup."""
+
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank()), int(dist.get_world_size())
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    rank = int(
+        os.environ.get(
+            "RANK",
+            os.environ.get(
+                "GLOBAL_RANK",
+                os.environ.get("SLURM_PROCID", os.environ.get("LOCAL_RANK", "0")),
+            ),
+        )
+    )
+    if not 0 <= rank < world_size:
+        raise RuntimeError(
+            f"invalid distributed data rank {rank} for world size {world_size}"
+        )
+    return rank, world_size
 
 
 def _mix_seed(values: list[int]) -> int:
@@ -107,7 +131,7 @@ class MinimumFrameDataset(Dataset):
 
 
 class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
-    """Shuffle clips in length buckets before forming training batches."""
+    """Build equal-step, per-rank batches while preserving length buckets."""
 
     def __init__(
         self,
@@ -117,12 +141,24 @@ class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
         bucket_width_frames: int,
         max_frames: int,
         seed: int,
+        rank: int | None = None,
+        num_replicas: int | None = None,
     ) -> None:
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.bucket_width_frames = int(bucket_width_frames)
         self.max_frames = int(max_frames)
         self.seed = int(seed)
+        if (rank is None) != (num_replicas is None):
+            raise ValueError("rank and num_replicas must be provided together")
+        self.rank = None if rank is None else int(rank)
+        self.num_replicas = (
+            None if num_replicas is None else int(num_replicas)
+        )
+        if self.num_replicas is not None and (
+            self.num_replicas <= 0 or not 0 <= self.rank < self.num_replicas
+        ):
+            raise ValueError("invalid explicit distributed sampler identity")
         self.epoch = 0
         # Lightning discovers set_epoch() through batch_sampler.sampler.
         self.sampler = self
@@ -139,31 +175,100 @@ class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
             capped = min(int(frame_count), self.max_frames)
             self.buckets[capped // self.bucket_width_frames].append(index)
 
+    def _rank_world(self) -> tuple[int, int]:
+        if self.num_replicas is not None:
+            return int(self.rank), int(self.num_replicas)
+        return _distributed_rank_world()
+
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def __iter__(self):
+        rank, world_size = self._rank_world()
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         batches: list[list[int]] = []
         for indices in self.buckets.values():
             order = torch.randperm(len(indices), generator=generator).tolist()
             shuffled = [indices[position] for position in order]
-            batches.extend(
-                shuffled[start : start + self.batch_size]
-                for start in range(0, len(shuffled), self.batch_size)
-            )
+            if world_size == 1:
+                batches.extend(
+                    shuffled[start : start + self.batch_size]
+                    for start in range(0, len(shuffled), self.batch_size)
+                )
+                continue
+
+            global_batch_size = self.batch_size * world_size
+            for start in range(0, len(shuffled), global_batch_size):
+                global_batch = shuffled[start : start + global_batch_size]
+                if len(global_batch) < global_batch_size:
+                    missing = global_batch_size - len(global_batch)
+                    global_batch.extend(
+                        shuffled[position % len(shuffled)]
+                        for position in range(missing)
+                    )
+                rank_start = rank * self.batch_size
+                batches.append(
+                    global_batch[rank_start : rank_start + self.batch_size]
+                )
         order = torch.randperm(len(batches), generator=generator).tolist()
         epoch = self.epoch
         for position in order:
             yield [
-                (index, self.seed + epoch * 1_000_003 + index)
-                for index in batches[position]
+                (
+                    index,
+                    self.seed + epoch * 1_000_003 + index
+                    if world_size == 1
+                    else _mix_seed(
+                        [self.seed, epoch, rank, position, slot, index]
+                    ),
+                )
+                for slot, index in enumerate(batches[position])
             ]
 
     def __len__(self) -> int:
+        _, world_size = self._rank_world()
+        effective_batch_size = self.batch_size * world_size
         return sum(
-            ceil(len(indices) / self.batch_size) for indices in self.buckets.values()
+            ceil(len(indices) / effective_batch_size)
+            for indices in self.buckets.values()
         )
+
+
+class DistributedShardSampler(Sampler[int]):
+    """Assign validation samples exactly once without Lightning sampler injection."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        rank: int | None = None,
+        num_replicas: int | None = None,
+    ) -> None:
+        self.dataset = dataset
+        if (rank is None) != (num_replicas is None):
+            raise ValueError("rank and num_replicas must be provided together")
+        self.rank = None if rank is None else int(rank)
+        self.num_replicas = (
+            None if num_replicas is None else int(num_replicas)
+        )
+        if self.num_replicas is not None and (
+            self.num_replicas <= 0 or not 0 <= self.rank < self.num_replicas
+        ):
+            raise ValueError("invalid explicit distributed sampler identity")
+
+    def _rank_world(self) -> tuple[int, int]:
+        if self.num_replicas is not None:
+            return int(self.rank), int(self.num_replicas)
+        return _distributed_rank_world()
+
+    def __iter__(self):
+        rank, world_size = self._rank_world()
+        return iter(range(rank, len(self.dataset), world_size))
+
+    def __len__(self) -> int:
+        rank, world_size = self._rank_world()
+        remaining = len(self.dataset) - rank
+        return 0 if remaining <= 0 else ceil(remaining / world_size)
 
 
 class ResumableDataLoader(DataLoader):
@@ -670,7 +775,7 @@ def create_dataloaders(
         return DataLoader(
             dataset,
             batch_size=int(cfg.data.val_batch_size),
-            shuffle=False,
+            sampler=DistributedShardSampler(dataset),
             collate_fn=LDFSpanCollator(
                 min_frames=cfg.data.min_frames,
                 max_frames=cfg.data.max_frames,
@@ -704,6 +809,7 @@ def create_dataloaders(
 
 
 __all__ = [
+    "DistributedShardSampler",
     "LDFSpanCollator",
     "LengthBucketBatchSampler",
     "MinimumFrameDataset",

@@ -4,6 +4,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
 from utils.training.ldf.data import (
+    DistributedShardSampler,
     LDFSpanCollator,
     LengthBucketBatchSampler,
     MinimumFrameDataset,
@@ -246,6 +247,61 @@ def test_length_bucket_sampler_epoch_is_owned_by_set_epoch():
     second = list(sampler)
     assert first == second
     assert sampler.epoch == 7
+
+
+def test_length_bucket_sampler_builds_equal_nonoverlapping_ddp_steps():
+    class TenSampleDataset(Dataset):
+        def __init__(self):
+            self.samples = [make_sample(40, str(index)) for index in range(10)]
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, index):
+            return self.samples[index]
+
+    dataset = MinimumFrameDataset(TenSampleDataset(), min_frames=40)
+    samplers = [
+        LengthBucketBatchSampler(
+            dataset,
+            batch_size=2,
+            bucket_width_frames=20,
+            max_frames=40,
+            seed=7,
+            rank=rank,
+            num_replicas=2,
+        )
+        for rank in range(2)
+    ]
+    rank_batches = [list(sampler) for sampler in samplers]
+    assert [len(batches) for batches in rank_batches] == [3, 3]
+    assert all(len(batch) == 2 for batches in rank_batches for batch in batches)
+    all_indices = [
+        index
+        for batches in rank_batches
+        for batch in batches
+        for index, _ in batch
+    ]
+    # Ten real samples fill twelve distributed slots.  The final two slots are
+    # deterministic padding, while every real sample remains represented.
+    assert len(all_indices) == 12
+    assert set(all_indices) == set(range(10))
+    seeds_by_index = {}
+    for batches in rank_batches:
+        for batch in batches:
+            for index, augmentation_seed in batch:
+                seeds_by_index.setdefault(index, set()).add(augmentation_seed)
+    assert any(len(seeds) > 1 for seeds in seeds_by_index.values())
+
+
+def test_distributed_validation_sampler_covers_each_sample_once():
+    dataset = list(range(7))
+    shards = [
+        list(DistributedShardSampler(dataset, rank=rank, num_replicas=3))
+        for rank in range(3)
+    ]
+    assert [len(shard) for shard in shards] == [3, 2, 2]
+    assert sorted(index for shard in shards for index in shard) == list(range(7))
 
 
 def test_ordered_seed_mixer_avoids_previous_weighted_sum_collision():

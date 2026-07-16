@@ -3454,3 +3454,88 @@
 尚未完成的后续事项：
 
 - 未运行真实GPU VAE重建任务；本轮只改变模块所有权和入口路径，CUDA stream/rolling数值仍沿用既有实现与测试合同。
+
+## 2026-07-16 · LDF训练期生成评测支持DDP
+
+改动类型：分布式训练 / 生成评测分片 / 全局指标聚合
+
+实际改动内容：
+
+- 删除`train_ldf.py`对训练期生成评测的单设备限制；`trainer.devices > 1`与`strategy: ddp`现在是合法配置。
+- 自定义length-bucket batch sampler现在按全局同bucket batch切分rank shard，并对尾部做确定性padding，确保每卡batch size和step数一致；validation sampler对sample做无重复strided分片。
+- Trainer固定关闭Lightning sampler自动注入，避免自定义resumable batch sampler被二次包装或在DDP setup时报错；训练启动的source snapshot也只由global rank 0写入。
+- `LDFEvaluationCallback`在所有rank进入相同的EMA和评测作用域，不再只让global-zero执行可能包含collective的runner。
+- dense-XZ、stream、rolling和视频生成按稳定的全局sample index做round-robin分片；每个rank只加载并生成自己的motion shard。
+- dense-XZ的轻量record和video path通过distributed object collective汇总；sample artifact由所有者rank写入唯一目录，只有rank 0写全局summary和W&B。
+- 完整HumanML T2M评测在每个rank的本地GPU运行motion/text evaluator，随后汇总CPU embedding并按全局validation index恢复顺序，再计算FID、Matching Score、R-Precision和Diversity；空本地shard也必须参加collective。
+- 评测前后只保存和恢复当前DDP进程的CUDA device RNG，不再读取或覆盖节点上的全部GPU RNG state。
+- 普通train/validation loss原本已使用`sync_dist=True`，本轮保持其既有全局归约语义。
+- 文档补充DDP数据流、rank-zero写入边界以及多机共享`save_dir`要求。
+
+改动理由：
+
+- 旧入口仅通过`devices == 1`保护heavy evaluation；直接删除检查会导致非zero rank跳过collective、T2M只评rank-zero shard或多rank重复写summary。
+- 分片必须基于与world size无关的全局sample顺序，否则不同卡数会改变T2M的R-Precision分组和diversity随机输入，无法公平比较checkpoint。
+- 生成本身仍按单个`InferenceSession`逐token运行；DDP只并行不同sample，因此不改变stream/rolling、三角调度、commit或VAE decoder state语义。
+
+验证：
+
+- 新增真实两进程CPU/Gloo测试，验证object all-gather和barrier；不允许loopback socket的sandbox会明确skip该项。
+- 新增7-sample/3-rank分片测试，确认无重叠、无遗漏，并且每个rank不加载peer motion artifact。
+- 新增10-sample/2-rank length-bucket测试和7-sample/3-rank validation sampler测试，确认训练step等长、per-device batch完整且validation无重复遗漏。
+- 配置迁移测试确认8设备DDP与训练期dense-XZ/T2M同时启用时可通过入口校验。
+- LDF data/evaluation与migration guard定向测试：`64 passed, 1 skipped`（该次sandbox拒绝Gloo loopback；同一真实两进程测试在完整测试中通过）。
+- 全仓测试：`245 passed`。
+- 修改文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `train_ldf.py`
+- `eval/ldf_training.py`
+- `utils/training/ldf/data.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `metrics/t2m.py`
+- `tests/test_ldf_data.py`
+- `tests/test_ldf_evaluation.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `README.md`
+
+尚未完成的后续事项：
+
+- 本机没有执行真实多GPU/NCCL的完整LDF生成任务；已验证两进程collective和全仓合同。另一台服务器首次DDP运行应重点确认各rank都进入generation eval、共享输出目录可见，以及rank 0只产生一份summary/W&B记录。
+
+## 2026-07-16 · LDF dense-XZ视频增加轨迹面板
+
+改动类型：训练期可视化 / dense-XZ评测artifact
+
+实际改动内容：
+
+- 将dense-XZ probe的`video/`从单独生成骨架改为“生成动作 + 俯视XZ轨迹”两栏视频。
+- `composite/`继续输出对比信息，并统一为“GT动作 + 生成动作 + 俯视XZ轨迹”三栏视频。
+- 轨迹面板完整绘制目标与生成XZ路径：目标为绿色、生成结果为红色，当前帧位置使用同色圆点标记。
+- 抽取统一的视频面板组合函数，保证标题区、面板高度和RGB输出格式一致。
+- 文档明确`video/`与`composite/`的职责，以及历史MP4不会被自动重写。
+
+改动理由：
+
+- 原`video/`只调用骨架渲染器，无法从训练期视频直接判断轨迹条件、目标路径和实际跟踪误差；轨迹只存在于不够直观的`composite/`中。
+- 两栏默认视频适合快速浏览动作状态与控制效果，三栏composite则保留完整GT对照，二者不改变生成、指标或artifact数值语义。
+
+验证：
+
+- LDF evaluation定向测试：`11 passed`；新增测试确认两栏/三栏尺寸以及绿色目标、红色生成轨迹像素均存在。
+- 使用现有HumanML3D dense-XZ生成artifact重渲染20帧真实MP4，编码后`video`为`960×512`、`composite`为`1440×512`，两种布局均可正常读取。
+- 全仓测试：`243 passed`。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/evaluation/artifacts.py`
+- `tests/test_ldf_evaluation.py`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+
+尚未完成的后续事项：
+
+- 已经写入历史checkpoint目录的旧视频保持原样；需要重新运行相应generation evaluation才能生成带轨迹面板的新视频。

@@ -107,6 +107,33 @@ def _trajectory_panel(
     return image
 
 
+def _compose_video_frame(
+    images: tuple[Image.Image, ...],
+    labels: tuple[str, ...],
+    *,
+    title_height: int = 32,
+) -> np.ndarray:
+    """Place equally high RGB panels under one shared title row."""
+
+    if not images or len(images) != len(labels):
+        raise ValueError("video frame images and labels must be non-empty and aligned")
+    heights = {image.height for image in images}
+    if len(heights) != 1:
+        raise ValueError("video frame panels must share one height")
+    canvas = Image.new(
+        "RGB",
+        (sum(image.width for image in images), images[0].height + int(title_height)),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    x_offset = 0
+    for image, label in zip(images, labels, strict=True):
+        canvas.paste(image, (x_offset, int(title_height)))
+        draw.text((x_offset + 12, 8), str(label)[:80], fill="black")
+        x_offset += image.width
+    return np.asarray(canvas, dtype=np.uint8)
+
+
 def render_comparison_video(
     *,
     target_root: torch.Tensor,
@@ -118,25 +145,28 @@ def render_comparison_video(
     caption: str,
     fps: float,
 ) -> None:
-    """Render generated motion plus a GT/generated/trajectory comparison video."""
+    """Render generated+trajectory and GT/generated/trajectory videos."""
 
     predicted_video_path = Path(predicted_video_path)
     composite_path = Path(composite_path)
     predicted_video_path.parent.mkdir(parents=True, exist_ok=True)
     composite_path.parent.mkdir(parents=True, exist_ok=True)
-    render_motion_video(
-        predicted_root,
-        predicted_body,
-        predicted_video_path,
-        fps=fps,
-    )
-
     with tempfile.TemporaryDirectory(prefix="floodcontrol_eval_") as temporary:
         target_path = Path(temporary) / "target.mp4"
+        predicted_motion_path = Path(temporary) / "predicted.mp4"
         render_motion_video(target_root, target_body, target_path, fps=fps)
+        render_motion_video(
+            predicted_root,
+            predicted_body,
+            predicted_motion_path,
+            fps=fps,
+        )
         target_reader = imageio.get_reader(str(target_path))
-        predicted_reader = imageio.get_reader(str(predicted_video_path))
-        writer = imageio.get_writer(str(composite_path), fps=float(fps))
+        predicted_reader = imageio.get_reader(str(predicted_motion_path))
+        predicted_writer = imageio.get_writer(
+            str(predicted_video_path), fps=float(fps)
+        )
+        composite_writer = imageio.get_writer(str(composite_path), fps=float(fps))
         target_xz = target_root.detach().cpu().numpy()[:, [0, 2]]
         predicted_xz = predicted_root.detach().cpu().numpy()[:, [0, 2]]
         try:
@@ -151,30 +181,23 @@ def render_comparison_video(
                     frame_index=frame_index,
                     size=target_image.size,
                 )
-                canvas = Image.new(
-                    "RGB",
-                    (
-                        target_image.width + predicted_image.width + panel.width,
-                        target_image.height + 32,
-                    ),
-                    "white",
+                predicted_writer.append_data(
+                    _compose_video_frame(
+                        (predicted_image, panel),
+                        ("Generated", str(caption)),
+                    )
                 )
-                canvas.paste(target_image, (0, 32))
-                canvas.paste(predicted_image, (target_image.width, 32))
-                canvas.paste(panel, (target_image.width + predicted_image.width, 32))
-                draw = ImageDraw.Draw(canvas)
-                draw.text((12, 8), "Ground truth", fill="black")
-                draw.text((target_image.width + 12, 8), "Generated", fill="black")
-                draw.text(
-                    (target_image.width * 2 + 12, 8),
-                    str(caption)[:80],
-                    fill="black",
+                composite_writer.append_data(
+                    _compose_video_frame(
+                        (target_image, predicted_image, panel),
+                        ("Ground truth", "Generated", str(caption)),
+                    )
                 )
-                writer.append_data(np.asarray(canvas, dtype=np.uint8))
         finally:
             target_reader.close()
             predicted_reader.close()
-            writer.close()
+            predicted_writer.close()
+            composite_writer.close()
 
 
 def save_dense_xz_sample(

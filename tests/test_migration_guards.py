@@ -250,6 +250,7 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     source = inspect.getsource(train_main)
     assert "LDFLightningModule" in source
     assert "create_dataloaders" in source
+    assert 'trainer_config["use_distributed_sampler"] = False' in source
     assert "BLOCKED_ON_LDF_TRAINING" not in source
     cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
     _validate_training_config(cfg)
@@ -257,6 +258,12 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     assert cfg.training.window.max_tokens == 50
     assert cfg.training.window.generation_tokens == 5
     assert cfg.training.max_horizon_token == 45
+
+    # Scheduled dense-XZ/video/T2M evaluation is sharded by the training
+    # callback and therefore remains legal for a multi-device DDP run.
+    cfg.config.trainer.devices = 8
+    cfg.config.trainer.strategy = "ddp"
+    _validate_training_config(cfg)
 
 
 def test_training_entry_rejects_missing_xz_lookahead():

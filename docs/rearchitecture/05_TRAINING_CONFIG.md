@@ -84,9 +84,9 @@ validation:
 
 WandB的key/entity仍由共享环境配置提供，但实验级project由各训练配置所有：`vae*.yaml`显式使用`VAE_Flood`，`ldf*.yaml`显式使用`Floodcontrol`，避免共享路径配置改变某一类实验的冻结recipe。
 
-`configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`拼接HumanML3D+BABEL，并与baseline共享HumanML3D canonical root statistics、VAE physical/latent statistics和模型合同。这样无论multi模型从头训练还是从HumanML checkpoint继续训练，normalized root语义都不会随数据mixture变化；multi配置只切换Dataset与包含BABEL caption的联合T5表。两个入口都使用单卡Lightning、LDF EMA，并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`，后者覆盖全部正式split，而不依赖当前训练或评测配置。`tools/pretokenize_t5_text.py`据此生成包含空文本、完整数据集caption和离线内容`content_id`的表。resume同时校验路径、数值statistics与文本内容身份。
+`configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`拼接HumanML3D+BABEL，并与baseline共享HumanML3D canonical root statistics、VAE physical/latent statistics和模型合同。这样无论multi模型从头训练还是从HumanML checkpoint继续训练，normalized root语义都不会随数据mixture变化；multi配置只切换Dataset与包含BABEL caption的联合T5表。两个入口默认使用单卡Lightning，也支持将`trainer.devices`设为多卡并使用`strategy: ddp`；普通loss validation、dense-XZ/video和完整T2M均走同一DDP作业，不需要关闭训练期生成评测。LDF使用EMA并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`，后者覆盖全部正式split，而不依赖当前训练或评测配置。`tools/pretokenize_t5_text.py`据此生成包含空文本、完整数据集caption和离线内容`content_id`的表。resume同时校验路径、数值statistics与文本内容身份。
 
-训练DataLoader内部固定使用20-frame（1秒）长度bucket减少batch右侧padding。这是20 FPS项目合同下的加载实现细节，不改变crop、窗口或样本分布，因此不暴露为正式YAML实验参数。
+训练DataLoader内部固定使用20-frame（1秒）长度bucket减少batch右侧padding。这是20 FPS项目合同下的加载实现细节，不改变crop或窗口语义，因此不暴露为正式YAML实验参数。DDP时sampler先构造`per_device_batch_size * world_size`的全局同长度batch，再为每个rank切分自己的per-device batch；不足一个全局batch的bucket会确定性重复少量样本，使所有rank拥有完全相同的step数。validation使用无重复的strided rank shard。由于这两条sampler都由项目显式拥有，Trainer固定`use_distributed_sampler: false`，禁止Lightning再次注入一层DistributedSampler。
 
 正式YAML不再暴露`contract_validation_every_n_steps`。`debug: false`时只执行structure validation；需要定位动态合同问题时设置`debug: true`，代码会在debug路径执行完整plan/input检查并承担相应GPU同步开销。
 

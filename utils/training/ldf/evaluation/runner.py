@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from lightning.pytorch.utilities import rank_zero_info
 
 from metrics.humanml import convert_root5_body265_to_humanml263
@@ -61,6 +62,51 @@ def _frame_count(sample: dict[str, object], maximum: int) -> int:
     if frames <= 0:
         raise ValueError("evaluation sample has no complete four-frame token")
     return frames
+
+
+def _distributed_rank_world(module) -> tuple[int, int]:
+    """Return the active process identity without requiring DDP in tests."""
+
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank()), int(dist.get_world_size())
+    return int(getattr(module, "global_rank", 0)), max(
+        1, int(getattr(module, "world_size", 1))
+    )
+
+
+def _all_gather_objects(value: object) -> list[object]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return [value]
+    gathered: list[object] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, value)
+    return gathered
+
+
+def _distributed_barrier() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _peek_sample_identity(source, index: int) -> tuple[str, str] | None:
+    """Read source/name metadata without loading a complete motion artifact."""
+
+    if isinstance(source, (list, tuple)):
+        item = source[index]
+        if isinstance(item, dict) and "dataset" in item and "name" in item:
+            return str(item["dataset"]), str(item["name"])
+        return None
+    samples = getattr(source, "samples", None)
+    if isinstance(samples, list) and index < len(samples):
+        entry = samples[index]
+        if isinstance(entry, tuple) and len(entry) == 2:
+            nested_source, nested_index = entry
+            return _peek_sample_identity(nested_source, int(nested_index))
+    records = getattr(source, "dataset", None)
+    if isinstance(records, list) and index < len(records):
+        record = records[index]
+        if isinstance(record, dict) and "dataset" in record and "name" in record:
+            return str(record["dataset"]), str(record["name"])
+    return None
 
 
 class LDFEvaluationRunner:
@@ -133,6 +179,53 @@ class LDFEvaluationRunner:
             raise RuntimeError("generation evaluation selected no validation samples")
         return selected
 
+    def _selected_sample_shard(
+        self,
+        module,
+        *,
+        dataset=None,
+        limit: int,
+        dataset_name: str | None = None,
+        sample_ids: list[str] | None = None,
+    ) -> tuple[list[tuple[int, dict[str, object]]], int]:
+        """Select globally, but load only the samples owned by this DDP rank."""
+
+        rank, world_size = _distributed_rank_world(module)
+        requested = set(str(value) for value in (sample_ids or []))
+        found: set[str] = set()
+        selected: list[tuple[int, dict[str, object]]] = []
+        selected_count = 0
+        source = self._validation_dataset() if dataset is None else dataset
+        for source_index in range(len(source)):
+            identity = _peek_sample_identity(source, source_index)
+            sample = None
+            if identity is None:
+                sample = source[source_index]
+                identity = (str(sample["dataset"]), str(sample["name"]))
+            source_name, sample_name = identity
+            if dataset_name is not None and source_name != dataset_name:
+                continue
+            if requested and sample_name not in requested:
+                continue
+            found.add(sample_name)
+            global_index = selected_count
+            if global_index % world_size == rank:
+                if sample is None:
+                    sample = source[source_index]
+                selected.append((global_index, sample))
+            selected_count += 1
+            if limit > 0 and selected_count >= limit:
+                break
+        if requested:
+            missing = requested - found
+            if missing:
+                raise RuntimeError(
+                    f"evaluation sample ids were not found: {sorted(missing)}"
+                )
+        if selected_count == 0:
+            raise RuntimeError("generation evaluation selected no validation samples")
+        return selected, selected_count
+
     def validate_text_coverage(self, module) -> None:
         """Fail before training when scheduled evaluation prompts are not encoded."""
 
@@ -178,7 +271,8 @@ class LDFEvaluationRunner:
         }
 
     def _log(self, module, metrics: dict[str, float], *, step: int) -> None:
-        if metrics and module.logger is not None:
+        rank, _ = _distributed_rank_world(module)
+        if rank == 0 and metrics and module.logger is not None:
             module.logger.log_metrics(metrics, step=int(step))
 
     def _log_videos(
@@ -189,7 +283,8 @@ class LDFEvaluationRunner:
         key: str,
         step: int,
     ) -> None:
-        if not paths or module.logger is None:
+        rank, _ = _distributed_rank_world(module)
+        if rank != 0 or not paths or module.logger is None:
             return
         try:
             import wandb
@@ -209,19 +304,21 @@ class LDFEvaluationRunner:
         config = self._generation_config(validation)
         dense = validation.dense_xz
         probe = str(dense.probe)
-        samples = self._selected_samples(
+        samples, sample_count = self._selected_sample_shard(
+            module,
             dataset=self._probe_dataset(probe),
             limit=0,
         )
         segment_frames = int(dense.get("segment_frames", 20))
-        video_samples = int(dense.get("video_samples", len(samples)))
+        video_samples = int(dense.get("video_samples", sample_count))
         maximum_frames = int(self.cfg.data.max_frames)
         base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
+        rank, _ = _distributed_rank_world(module)
 
         for mode in config["modes"]:
-            by_dataset: dict[str, list[dict[str, Any]]] = {}
-            videos: list[Path] = []
-            for sample_index, sample in enumerate(samples):
+            local_records: list[dict[str, Any]] = []
+            local_videos: list[str] = []
+            for sample_index, sample in samples:
                 frames = _frame_count(sample, maximum_frames)
                 target_root = sample["root_motion"][:frames]
                 target_body = sample["body_motion"][:frames]
@@ -271,12 +368,16 @@ class LDFEvaluationRunner:
                             "caption": generated.prompt.caption,
                         }
                     )
-                    by_dataset.setdefault(str(sample["dataset"]), []).append(record)
+                    local_records.append(record)
                     sample_id = str(sample["name"])
                     if config["num_runs"] > 1:
                         sample_id = f"{sample_id}_run{run_index}"
                     probe = f"dense_xz_{mode}"
-                    should_render = bool(config["render"] and sample_index < video_samples and run_index == 0)
+                    should_render = bool(
+                        config["render"]
+                        and sample_index < video_samples
+                        and run_index == 0
+                    )
                     dirs = save_dense_xz_sample(
                         save_dir=self.cfg.save_dir,
                         dataset=str(sample["dataset"]),
@@ -308,7 +409,9 @@ class LDFEvaluationRunner:
                                 caption=generated.prompt.caption,
                                 fps=float(module.model.fps),
                             )
-                            videos.append(dirs["composite"] / f"{sample_id}.mp4")
+                            local_videos.append(
+                                str(dirs["composite"] / f"{sample_id}.mp4")
+                            )
                         except Exception as error:
                             warnings.warn(
                                 f"dense XZ artifacts saved but video rendering failed for "
@@ -316,52 +419,72 @@ class LDFEvaluationRunner:
                                 stacklevel=2,
                             )
 
-            for dataset, records in by_dataset.items():
-                summary = summarize_dense_xz_records(records)
-                summary.update({"mode": mode, "probe": "dense_xz"})
-                metric_dir = evaluation_artifact_dirs(
-                    self.cfg.save_dir,
-                    dataset,
-                    f"dense_xz_{mode}",
-                    step_tag,
-                )["metrics"]
-                write_json(
-                    metric_dir / "summary.json",
-                    {"summary": summary, "samples": records},
-                )
-                self._log(
+            gathered_records = _all_gather_objects(local_records)
+            gathered_videos = _all_gather_objects(local_videos)
+            if rank == 0:
+                by_dataset: dict[str, list[dict[str, Any]]] = {}
+                for rank_records in gathered_records:
+                    for record in rank_records:
+                        by_dataset.setdefault(str(record["dataset"]), []).append(record)
+                for dataset, records in by_dataset.items():
+                    records.sort(
+                        key=lambda value: (
+                            str(value["name"]), int(value["run_index"])
+                        )
+                    )
+                    summary = summarize_dense_xz_records(records)
+                    summary.update({"mode": mode, "probe": "dense_xz"})
+                    metric_dir = evaluation_artifact_dirs(
+                        self.cfg.save_dir,
+                        dataset,
+                        f"dense_xz_{mode}",
+                        step_tag,
+                    )["metrics"]
+                    write_json(
+                        metric_dir / "summary.json",
+                        {"summary": summary, "samples": records},
+                    )
+                    self._log(
+                        module,
+                        _scalar_metrics(
+                            summary, f"eval/dense_xz/{mode}/{dataset}"
+                        ),
+                        step=step,
+                    )
+                    rank_zero_info(
+                        f"[dense-xz][{mode}][{dataset}][{step_tag}] "
+                        f"ADE={summary.get('ade_mean', float('nan')):.4f} "
+                        f"FDE={summary.get('fde_mean', float('nan')):.4f}"
+                    )
+                videos = [
+                    Path(path)
+                    for rank_paths in gathered_videos
+                    for path in rank_paths
+                ]
+                videos.sort(key=str)
+                self._log_videos(
                     module,
-                    _scalar_metrics(
-                        summary, f"eval/dense_xz/{mode}/{dataset}"
-                    ),
+                    paths=videos,
+                    key=f"eval/dense_xz/{mode}/videos",
                     step=step,
                 )
-                rank_zero_info(
-                    f"[dense-xz][{mode}][{dataset}][{step_tag}] "
-                    f"ADE={summary.get('ade_mean', float('nan')):.4f} "
-                    f"FDE={summary.get('fde_mean', float('nan')):.4f}"
-                )
-            self._log_videos(
-                module,
-                paths=videos,
-                key=f"eval/dense_xz/{mode}/videos",
-                step=step,
-            )
+            _distributed_barrier()
 
     def _run_t2m(self, module, *, step: int, step_tag: str) -> None:
         validation = self.cfg.validation
         config = self._generation_config(validation)
-        samples = self._selected_samples(
+        samples, sample_count = self._selected_sample_shard(
+            module,
             limit=0,
             dataset_name="HumanML3D",
         )
         maximum_frames = int(self.cfg.data.max_frames)
         base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
+        rank, _ = _distributed_rank_world(module)
 
         for mode in config["modes"]:
-            metric = T2MMetrics(self.cfg.metrics.t2m)
-            metric.eval()
-            for sample in samples:
+            metric = T2MMetrics(self.cfg.metrics.t2m).to(module.device).eval()
+            for sample_index, sample in samples:
                 frames = _frame_count(sample, maximum_frames)
                 seed = _stable_seed(
                     base_seed,
@@ -385,12 +508,12 @@ class LDFEvaluationRunner:
                     sample["root_motion"][:frames],
                     sample["body_motion"][:frames],
                     tail="drop",
-                ).detach().cpu()
+                ).detach().to(module.device)
                 predicted = convert_root5_body265_to_humanml263(
                     generated.root_motion,
                     generated.body_motion,
                     tail="drop",
-                ).detach().cpu()
+                ).detach().to(module.device)
                 length = int(reference.shape[0])
                 metric.update(
                     reference[None],
@@ -398,7 +521,11 @@ class LDFEvaluationRunner:
                     [length],
                     [length],
                     [list(generated.prompt.tokens)],
+                    sample_indices=[sample_index],
                 )
+            metric_seed = _stable_seed(base_seed, "t2m_metric", mode, step)
+            torch.random.default_generator.manual_seed(metric_seed)
+            np.random.seed(metric_seed % (2**32))
             values = metric.compute(False)
             summary = {
                 key: float(value.detach().cpu().item())
@@ -406,27 +533,29 @@ class LDFEvaluationRunner:
             }
             summary.update(
                 {
-                    "num_samples": len(samples),
+                    "num_samples": sample_count,
                     "mode": mode,
                     "split": "val",
                 }
             )
-            metric_dir = evaluation_artifact_dirs(
-                self.cfg.save_dir,
-                "HumanML3D",
-                f"t2m_{mode}",
-                step_tag,
-            )["metrics"]
-            write_json(metric_dir / "summary.json", {"summary": summary})
-            self._log(
-                module,
-                _scalar_metrics(summary, f"eval/t2m/{mode}/HumanML3D"),
-                step=step,
-            )
-            rank_zero_info(
-                f"[t2m][{mode}][{step_tag}] "
-                f"FID={summary.get('FID', float('nan')):.4f}"
-            )
+            if rank == 0:
+                metric_dir = evaluation_artifact_dirs(
+                    self.cfg.save_dir,
+                    "HumanML3D",
+                    f"t2m_{mode}",
+                    step_tag,
+                )["metrics"]
+                write_json(metric_dir / "summary.json", {"summary": summary})
+                self._log(
+                    module,
+                    _scalar_metrics(summary, f"eval/t2m/{mode}/HumanML3D"),
+                    step=step,
+                )
+                rank_zero_info(
+                    f"[t2m][{mode}][{step_tag}] "
+                    f"FID={summary.get('FID', float('nan')):.4f}"
+                )
+            _distributed_barrier()
 
     def maybe_run(self, module) -> None:
         if not self.enabled:
@@ -444,20 +573,24 @@ class LDFEvaluationRunner:
         if not generation_due and not t2m_due:
             return
         step_tag = f"step_{step:06d}"
+        _distributed_barrier()
 
         python_state = random.getstate()
         numpy_state = np.random.get_state()
         torch_state = torch.random.get_rng_state()
-        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        cuda_device = module.device if module.device.type == "cuda" else None
+        cuda_state = (
+            torch.cuda.get_rng_state(cuda_device) if cuda_device is not None else None
+        )
         model_training = bool(module.model.training)
         vae_training = bool(module.vae.training)
         try:
             evaluation_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
             random.seed(evaluation_seed)
             np.random.seed(evaluation_seed % (2**32))
-            torch.manual_seed(evaluation_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(evaluation_seed)
+            torch.random.default_generator.manual_seed(evaluation_seed)
+            if cuda_device is not None:
+                torch.cuda.manual_seed(evaluation_seed)
             module.model.eval()
             module.vae.eval()
             with module.use_ema_parameters():
@@ -472,7 +605,7 @@ class LDFEvaluationRunner:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
             if cuda_state is not None:
-                torch.cuda.set_rng_state_all(cuda_state)
+                torch.cuda.set_rng_state(cuda_state, cuda_device)
 
 
 __all__ = ["LDFEvaluationRunner"]

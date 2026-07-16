@@ -45,6 +45,13 @@ VAE checkpoint尚未训练完成时先运行`pre-vae`，训练完成后再运行
 
 测试覆盖typed condition、active/future XZ、Root/Body forward sensitivity、constraint CFG、逐token文本隔离、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`与`train_ldf.py`都会直接检查所需statistics、checkpoint和数据；canonical root statistics已经按当前50-token scaled-ARDY窗口与逐样本anchor分布生成，不再使用额外的`training_ready`状态门闩。Web的四帧chunk runtime已经接入`InferenceSession`，模型加载在正式LDF checkpoint冻结前明确抛出`BLOCKED_ON_LDF_CHECKPOINT`。
 
+LDF训练支持单卡和Lightning DDP。多卡时普通validation、dense-XZ轨迹/视频与完整HumanML T2M评测都会按sample分片；只有rank 0写全局summary和W&B。多机任务需要让所有节点共享同一个`save_dir`。
+
+```bash
+python train_ldf.py --config configs/ldf.yaml \
+  --override trainer.devices=8 trainer.strategy=ddp
+```
+
 本地数据、依赖和输出目录默认分别为`./data`、`./deps`和`./outputs`，也可以通过`FLOODCONTROL_DATA`、`FLOODCONTROL_DEPS`和`FLOODCONTROL_OUTPUTS`覆盖。
 
 设计入口见 [`docs/rearchitecture/README.md`](docs/rearchitecture/README.md)。已经完成的代码与协议修改记录在 [`docs/DEVELOPMENT_LOG.md`](docs/DEVELOPMENT_LOG.md)，仓库级 agent 维护规则见 [`AGENTS.md`](AGENTS.md)。
