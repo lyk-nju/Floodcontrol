@@ -1,6 +1,13 @@
+from datetime import timedelta
+import os
 import types
 
+import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
+from torch.multiprocessing.spawn import ProcessRaisedException
 
 from models.diffusion_forcing_wan import LDF
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFInput
@@ -46,6 +53,52 @@ def make_input(batch=2, tokens=6):
     )
 
 
+def _with_future_condition(inputs: LDFInput) -> LDFInput:
+    condition = LDFCondition(
+        inputs.condition.text_context,
+        inputs.condition.text_null_context,
+        future_root_condition_value=torch.zeros(1, 1, 4, 5),
+        future_root_condition_mask=torch.ones(1, 1, 4, 5, dtype=torch.bool),
+        future_timeline_position_ids=torch.tensor([[8]]),
+        future_valid_mask=torch.tensor([[True]]),
+    )
+    return LDFInput(**{**inputs.__dict__, "condition": condition})
+
+
+def _static_future_graph_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+) -> None:
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        model = DistributedDataParallel(make_model().train())
+        inputs = make_input(batch=1, tokens=4)
+        if rank == 1:
+            inputs = _with_future_condition(inputs)
+        output = model(inputs)
+        loss = (
+            output.velocity.root_motion.square().mean()
+            + output.velocity.latent_motion.square().mean()
+        )
+        loss.backward()
+        gradient = model.module.root_transformer.future_projection.weight.grad
+        assert gradient is not None
+        checksums = [torch.zeros((), dtype=gradient.dtype) for _ in range(world_size)]
+        dist.all_gather(checksums, gradient.sum())
+        assert torch.equal(checksums[0], checksums[1])
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 def test_forward_shapes_and_v_to_x0_identity():
     model = make_model()
     inputs = make_input()
@@ -56,6 +109,36 @@ def test_forward_shapes_and_v_to_x0_identity():
     # x/y/z are unaffected by the heading manifold projection under identity stats.
     assert torch.allclose(output.clean_root_motion[..., :3], expected[..., :3], atol=1e-5)
     assert output.local_root_motion.shape == (2, 6, 4, 4)
+
+
+def test_future_projection_has_zero_gradient_instead_of_being_unused():
+    model = make_model().train()
+    output = model(make_input(batch=1, tokens=4))
+    (
+        output.velocity.root_motion.square().mean()
+        + output.velocity.latent_motion.square().mean()
+    ).backward()
+
+    for parameter in model.root_transformer.future_projection.parameters():
+        assert parameter.grad is not None
+        assert torch.count_nonzero(parameter.grad) == 0
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_future_projection_static_graph_supports_rank_local_future_conditions(tmp_path):
+    world_size = 2
+    try:
+        mp.spawn(
+            _static_future_graph_worker,
+            args=(world_size, str(tmp_path / "ddp_init")),
+            nprocs=world_size,
+            join=True,
+        )
+    except ProcessRaisedException as error:
+        message = str(error)
+        if "Operation not permitted" in message or "Cannot resolve" in message:
+            pytest.skip("sandbox does not permit the Gloo loopback transport")
+        raise
 
 
 def test_body_loss_does_not_backpropagate_into_root_transformer():

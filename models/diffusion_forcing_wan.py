@@ -391,6 +391,18 @@ class RootTransformer(TransformerStage):
         root_output[output_batch, output_index] = output[
             output_batch, output_index
         ]
+        # ``future_projection`` is data-dependent: late/short windows and
+        # constraint dropout can leave one DDP rank with no future tokens while
+        # peer ranks still use this layer.  Keep the parameter graph static by
+        # attaching a numerically-zero dependency.  The no-future rank then
+        # contributes a real zero gradient to the same reduction bucket instead
+        # of leaving the parameters unused and desynchronizing DDP collectives.
+        future_parameter_dependency = sum(
+            parameter.sum() for parameter in self.future_projection.parameters()
+        )
+        root_output = root_output + (
+            future_parameter_dependency.to(dtype=root_output.dtype) * 0.0
+        )
         return root_output.reshape(batch, tokens, FRAMES_PER_TOKEN, ROOT_DIM)
 
 

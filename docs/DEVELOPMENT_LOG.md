@@ -3539,3 +3539,36 @@
 尚未完成的后续事项：
 
 - 已经写入历史checkpoint目录的旧视频保持原样；需要重新运行相应generation evaluation才能生成带轨迹面板的新视频。
+
+## 2026-07-16 · LDF可选future约束保持静态DDP参数图
+
+改动类型：分布式训练修复 / Root Transformer参数图 / 回归测试
+
+实际改动内容：
+
+- `RootTransformer`现在始终将`future_projection`参数以数值为零的依赖连接到root velocity输出。
+- 当本地rank的短窗口、late history或constraint dropout使整个batch没有future constraint时，`future_projection`会得到显式零梯度，而不再处于`grad is None`的unused状态。
+- 有future constraint时继续使用原有投影和真实梯度；零依赖不改变forward数值、约束可见性、窗口采样或loss监督范围。
+- 新增单进程梯度回归，验证无future输入下`future_projection`的weight/bias梯度存在且严格为零。
+- 新增真实两进程CPU/Gloo回归：rank 0不提供future、rank 1提供future，在默认`find_unused_parameters=False`的`DistributedDataParallel`下完成同一次backward，并确认投影梯度已同步。
+
+改动理由：
+
+- 8卡训练中某个rank出现无future local batch后，该rank跳过`future_projection`并进入下一轮forward `BROADCAST`，其余rank仍等待包含该层参数的梯度`ALLREDUCE`，最终触发1800秒NCCL watchdog timeout。
+- 无future是合法训练状态，来源包括短clip、late continuation和独立constraint dropout；不能通过伪造future或关闭dropout来规避。静态零依赖使各rank保持相同参数归约图，同时保留真实训练分布，并避免全局启用`find_unused_parameters=True`的额外图遍历。
+
+验证：
+
+- `tests/test_ldf_forward.py tests/test_ldf_cfg.py`：`19 passed`，其中真实两进程不同future分支DDP回归通过。
+- 完整`tests`运行结果为`246 passed, 1 failed`；唯一失败来自用户已有的`configs/ldf.yaml`修改：`validation.t2m.enabled=false`，而配置迁移守卫锁定正式默认值为`true`。本轮未覆盖该配置；全部模型、forward、DDP、training与evaluation实现测试均通过。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `models/diffusion_forcing_wan.py`
+- `tests/test_ldf_forward.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 需要在目标8卡NCCL服务器重新启动训练，确认短窗口batch经过原故障步数后不再发生collective分叉；无需改为`ddp_find_unused_parameters_true`。
