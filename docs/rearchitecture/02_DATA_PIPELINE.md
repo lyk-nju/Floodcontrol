@@ -36,7 +36,7 @@ HumanML3D root deltas + RIC positions + IK local rotations
 
 上述schema和full-sequence-before-crop顺序已经实现。263D与265D的完整通道定义、root恢复、rotation层级组合和唯一转换入口集中在离线`tools/convert_motion_263_to_265.py`；`tools/build_motion_artifact.py`只原子写入`root_motion/body_motion/body_feature_valid_mask`三个字段。旧NPZ中的version、hash或FPS metadata会被Dataset忽略。
 
-`HumanML3DDataset`与`BABELDataset`分别解析自己的split和`caption#tokens#start#end`文本，且不互相继承；统一返回完整未裁剪sample：`dataset/name/root_motion/body_motion/body_feature_valid_mask/text_data`。处理后的dataset root自包含split、`artifacts/`和`texts/`；需要文本的任务使用相对目录`text_path: texts`，纯VAE训练可显式设置`text_path: null`，避免读取未消费的caption。motion NPZ只保存三组tensor，文本保持独立TXT，不把字符串复制进每个NPZ。公开source identity固定为`HumanML3D`和`BABEL`，不从数据目录名推导，因此目录移动或重命名不会改变batch metadata。`MultiDataset`只实例化并concat子Dataset，不拥有collate。
+`HumanML3DDataset`与`BABELDataset`分别解析自己的split和`caption#tokens#start#end`文本，且不互相继承；统一返回完整未裁剪sample：`dataset/name/root_motion/body_motion/body_feature_valid_mask/text_data`。处理后的dataset root自包含split、`all.txt`、`artifacts/`和`texts/`；`all.txt`严格等于所有正式处理后split的唯一ID并集，只定义数据集级文本库存，不参与train/val/test采样。需要文本的任务使用相对目录`text_path: texts`，纯VAE训练可显式设置`text_path: null`，避免读取未消费的caption。motion NPZ只保存三组tensor，文本保持独立TXT，不把字符串复制进每个NPZ。公开source identity固定为`HumanML3D`和`BABEL`，不从数据目录名推导，因此目录移动或重命名不会改变batch metadata。`MultiDataset`只实例化并concat子Dataset，不拥有collate。
 
 任务相关处理下沉到training data层：`utils/training/vae/data.py`负责VAE crop、translation rebase、同步yaw、previous-root和padding；LDF的`MinimumFrameDataset`只排除不足一个5-token active band的样本。`LDFSpanCollator`为每个sample保留自然长度并最多裁50 tokens：短动作不缩短，长动作随机裁一个10秒parent；batch只在右侧padding并输出`span_token_count[B]`。它同时携带真实VAE左context、previous root、source坐标和token prompt timeline，但不决定H/active/frontier，也不做translation anchor、noise或self-forcing。Lightning plan随后在每个sample内独立采样H；只有`source_start_token=0`的真实序列前缀允许`H=0`，中间parent必须`H>=1`。HumanML3D从覆盖parent的caption备选中选择一条并重复到每个token；BABEL任意frame半开区间按四帧token最大重叠编译。训练crop、caption和yaw由sampler提供的epoch/sample seed决定；resume时恢复bucket epoch与已消费batch游标。
 
@@ -156,7 +156,7 @@ python -m tools.pretokenize_t5_text \
 # 正式LDF训练直接从checkpoint加载EMA encoder并在线产生deterministic mu。
 ```
 
-文本表在离线写出时对encoder/tokenizer身份、caption和embedding内容生成一次`content_id`。训练加载只检查metadata与shape，具体tensor在第一次lookup时才检查finite，避免启动阶段扫描整个mmap文件；LDF checkpoint保存`content_id`，即使路径不变而表内容被替换，resume也会失败。
+两份LDF配置通过`data.text_meta_paths`显式指向各数据集的`all.txt`；T5工具只读取这些完整库存，不再从某次实验的train/val/test/probe字段猜测文本范围。文本表在离线写出时对encoder/tokenizer身份、caption和embedding内容生成一次`content_id`。训练加载只检查metadata与shape，具体tensor在第一次lookup时才检查finite，避免启动阶段扫描整个mmap文件；LDF checkpoint保存`content_id`，即使路径不变而表内容被替换，resume也会失败。
 
 `configs/vae.yaml`保留HumanML-only基线，`configs/vae_multi.yaml`使用HumanML3D+BABEL联合statistics。BABEL源目录没有正式test split，因此构建器默认只发布train/val；空的`test_processed.txt`和调试用`test_min_processed.txt`不会被伪装成正式test。
 

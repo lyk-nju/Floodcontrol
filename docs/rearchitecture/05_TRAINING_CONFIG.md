@@ -84,7 +84,7 @@ validation:
 
 WandB的key/entity仍由共享环境配置提供，但实验级project由各训练配置所有：`vae*.yaml`显式使用`VAE_Flood`，`ldf*.yaml`显式使用`Floodcontrol`，避免共享路径配置改变某一类实验的冻结recipe。
 
-`configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`拼接HumanML3D+BABEL，并与baseline共享HumanML3D canonical root statistics、VAE physical/latent statistics和模型合同。这样无论multi模型从头训练还是从HumanML checkpoint继续训练，normalized root语义都不会随数据mixture变化；multi配置只切换Dataset与包含BABEL caption的联合T5表。两个入口都使用单卡Lightning、LDF EMA，并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；后者必须由`tools/pretokenize_t5_text.py`生成，包含空文本及训练/验证全部caption和离线内容`content_id`。resume同时校验路径、数值statistics与文本内容身份。
+`configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`拼接HumanML3D+BABEL，并与baseline共享HumanML3D canonical root statistics、VAE physical/latent statistics和模型合同。这样无论multi模型从头训练还是从HumanML checkpoint继续训练，normalized root语义都不会随数据mixture变化；multi配置只切换Dataset与包含BABEL caption的联合T5表。两个入口都使用单卡Lightning、LDF EMA，并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`，后者覆盖全部正式split，而不依赖当前训练或评测配置。`tools/pretokenize_t5_text.py`据此生成包含空文本、完整数据集caption和离线内容`content_id`的表。resume同时校验路径、数值statistics与文本内容身份。
 
 训练DataLoader内部固定使用20-frame（1秒）长度bucket减少batch右侧padding。这是20 FPS项目合同下的加载实现细节，不改变crop、窗口或样本分布，因此不暴露为正式YAML实验参数。
 

@@ -1,5 +1,6 @@
 """
-Offline: run UMT5-XXL encoder on every unique caption under cfg.data (HumanML3D/Babel-style texts/*.txt).
+Offline: run UMT5-XXL encoder on every unique caption listed by each
+``cfg.data.text_meta_paths`` inventory (HumanML3D/BABEL-style texts/*.txt).
 
 调用方必须显式传入包含 ``model.params`` 与 ``data`` 的训练配置。新版four-frame
 训练配置尚未接线，因此本工具不再回退到已经删除的legacy ``configs/ldf.yaml``。
@@ -21,6 +22,7 @@ import sys
 import torch
 import torch.distributed as dist
 
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 from lightning.pytorch.utilities import rank_zero_info
 from omegaconf import OmegaConf
@@ -84,13 +86,18 @@ def _parse_overrides(override_list: Optional[List[str]]) -> Optional[Dict[str, s
     return out
 
 
-def _meta_paths_from_data_block(data_cfg) -> List[str]:
-    out: List[str] = []
-    for key in ("train_meta_paths", "val_meta_paths", "test_meta_paths"):
-        if key not in data_cfg or data_cfg[key] is None:
-            continue
-        out.extend(OmegaConf.to_container(data_cfg[key], resolve=True))
-    return out
+def _text_meta_paths_from_data_block(data_cfg) -> List[str]:
+    paths = data_cfg.get("text_meta_paths")
+    if paths is None:
+        raise ValueError(
+            "each text data block must define text_meta_paths pointing to all.txt"
+        )
+    resolved = list(OmegaConf.to_container(paths, resolve=True))
+    if not resolved:
+        raise ValueError("text_meta_paths must contain at least one all.txt inventory")
+    if any(Path(path).name != "all.txt" for path in resolved):
+        raise ValueError("text_meta_paths must point to dataset-level all.txt files")
+    return resolved
 
 
 def collect_unique_captions(cfg) -> Set[str]:
@@ -109,7 +116,7 @@ def collect_unique_captions(cfg) -> Set[str]:
         if text_path is None:
             rank_zero_info("Skipping a data block with text_path=None.")
             continue
-        for meta_file in _meta_paths_from_data_block(block):
+        for meta_file in _text_meta_paths_from_data_block(block):
             meta_file = os.path.normpath(meta_file)
             if not os.path.isfile(meta_file):
                 rank_zero_info(f"Meta file missing, skip: {meta_file}")
@@ -272,7 +279,7 @@ def main():
         else:
             blocks = [oc.data]
         for block in blocks:
-            for p in _meta_paths_from_data_block(block):
+            for p in _text_meta_paths_from_data_block(block):
                 if os.path.isfile(p):
                     first = p
                     break

@@ -190,6 +190,7 @@ def _read_split(path: Path) -> list[str]:
 
 def _validate_dataset(root: Path, splits: tuple[str, ...]) -> dict[str, object]:
     counts: dict[str, int] = {}
+    split_union: set[str] = set()
     for split in splits:
         names = _read_split(root / f"{split}.txt")
         missing_motion = [
@@ -204,7 +205,13 @@ def _validate_dataset(root: Path, splits: tuple[str, ...]) -> dict[str, object]:
                 f"motion={missing_motion[:5]}, text={missing_text[:5]}"
             )
         counts[split] = len(names)
-    return {"path": str(root.resolve()), "splits": counts}
+        split_union.update(names)
+    all_names = _read_split(root / "all.txt")
+    if set(all_names) != split_union:
+        raise RuntimeError(
+            f"processed dataset all.txt does not equal the split union at {root}"
+        )
+    return {"path": str(root.resolve()), "splits": counts, "all": len(all_names)}
 
 
 def _validate_statistics(

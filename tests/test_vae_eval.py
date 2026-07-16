@@ -4,11 +4,11 @@ from metrics.stream import (
     compute_stream_boundary_metrics,
     compute_stream_vs_offline_metrics,
 )
-from eval.vae.evaluate_reconstruction import (
+from utils.training.vae.evaluation import (
     MotionSample,
     ReconstructionResult,
-    _output_paths,
     create_rolling_window,
+    output_paths,
     reconstruction_metrics,
     rolling_reconstruct,
     stream_reconstruct,
@@ -191,7 +191,7 @@ def test_reconstruction_skating_metrics_use_position_transitions_and_masks():
 
 
 def test_output_layout_separates_original_and_reconstruction(tmp_path):
-    paths = _output_paths(tmp_path, "humanml3d", "vae_body265_run", "sample")
+    paths = output_paths(tmp_path, "humanml3d", "vae_body265_run", "sample")
     model_root = tmp_path / "humanml3d/vae_body265_run"
     assert paths["original_video"] == model_root / "video/original/sample.mp4"
     assert paths["reconstruction_video"] == model_root / "video/reconstruction/sample.mp4"

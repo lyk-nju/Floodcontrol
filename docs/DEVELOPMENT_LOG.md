@@ -3295,3 +3295,162 @@
 尚未完成的后续事项：
 
 - LDF主模型中仍显式保留`model.params.fps: 20.0`，因为本轮用户指定的收敛范围是`vae.params.fps`。如果后续决定全项目一律不允许实验级FPS，应再将LDF、runtime和可视化的“动作时间协议”与“视频输出帧率”分层收敛。
+
+## 2026-07-16 · Future-root token的混合精度拼接修复
+
+改动类型：LDF训练阻断修复 / BF16混合精度回归测试
+
+实际改动内容：
+
+- Root Stage在将future-root条件投影结果写入motion token packed buffer前，显式将其转换为motion token流的dtype。
+- 新增CPU BF16 autocast回归测试，覆盖带future-root条件的完整Root/Body forward。
+
+改动理由：
+
+- `bf16-mixed`下，`future_projection`的线性层输出为BF16，而由原始noisy motion创建的packed buffer仍是FP32。PyTorch高级索引赋值要求source和destination dtype完全一致，因此训练会在future token写入时直接失败。
+- packed buffer属于motion token流，统一跟随`current.dtype`可以同时保持有/无future条件两条路径的输入合同；转换操作保留梯度，不改变future projection的训练能力。
+
+验证：
+
+- LDF forward定向测试：`15 passed`，新增测试可复现旧错误并验证修复。
+- LDF training、self-forcing、condition与Wan block定向测试：`46 passed, 3 skipped`。
+- 全仓pytest：`234 passed, 3 skipped`。
+- 修改文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `models/diffusion_forcing_wan.py`
+- `tests/test_ldf_forward.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 无。
+
+## 2026-07-16 · LDF评测prompt的T5覆盖修复
+
+改动类型：训练时生成评测阻断修复 / 离线文本产物 / 启动前fail-fast
+
+实际改动内容：
+
+- `pretokenize_t5_text.py`除train/val/test外，继续扫描`data.test_probe_meta_paths`中的评测样本caption。
+- `LDFEvaluationRunner`新增scheduled evaluation prompt覆盖检查；dense-XZ probe所需文本缺失时，在训练开始前给出明确错误，不再等到周期评测时才失败。
+- `LDFEvaluationCallback.on_fit_start()`在rank zero执行一次覆盖检查。
+- 使用`--reuse-existing`为HumanML3D文本表补编码缺失caption，表由47420条更新为47442条，新的`content_id`为`c1ce0ae1701b1bdc27ad9938891c7150165d948b`。
+
+改动理由：
+
+- 正式T5表此前只扫描`train_meta_paths`和`val_meta_paths`，而dense-XZ评测使用独立的`test_min.txt`。因此评测sample的caption不在表中，模型训练到生成评测步骤后才在exact-string lookup处抛出`KeyError`。
+- 将probe纳入离线产物定义解决数据缺口；启动前覆盖检查则防止未来替换probe文件后再次延迟失败。缺失prompt不会静默退化为空文本。
+
+验证：
+
+- LDF text、evaluation与migration guard定向测试：`49 passed`。
+- 真实`test_min.txt`的全部prompt覆盖检查通过；报错中的`person is walking normally in a circle`可正常lookup。
+- 更新后文本表共47442条，真实加载得到预期的新`content_id`。
+- 全仓pytest：`236 passed, 3 skipped`。
+- 修改文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `tools/pretokenize_t5_text.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `eval/ldf_training.py`
+- `tests/{test_ldf_text,test_ldf_evaluation}.py`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/t5_text_embeddings.pt`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 无。
+
+## 2026-07-16 · 数据集级all.txt文本库存与完整T5表
+
+改动类型：离线文本合同 / 数据预处理产物 / 正式T5表重建
+
+实际改动内容：
+
+- HumanML3D与BABEL预处理器现在除正式split外固定发布`all.txt`，内容是所有处理后split有效sample ID的唯一并集。
+- `pretokenize_t5_text.py`不再扫描train/val/test/probe配置字段，只接受每个数据块显式声明的`text_meta_paths`，且路径必须指向`all.txt`。
+- `configs/ldf.yaml`使用`HumanML3D_motion/all.txt`；`configs/ldf_multi.yaml`分别使用HumanML3D与BABEL的`all.txt`。
+- 资产准备验证新增`all.txt == split union`检查，防止库存陈旧或漏项。
+- 为现有数据发布HumanML3D 29046条和BABEL 14087条`all.txt`，并增量更新HumanML-only与HumanML+BABEL两份T5表。
+
+改动理由：
+
+- 离线T5表是数据集级静态资源，不应由某次实验是否配置test或某个probe决定。之前即使`test_min.txt`来自正式test split，只要训练配置没有`test_meta_paths`，工具仍会漏掉test caption。
+- `all.txt`将“哪些sample属于该处理后数据集”冻结在数据产物层；train/val/test仍只控制训练和评测采样，两者不再混用。
+- 使用处理后的split并集而非原始HumanML3D `all.txt`，可以排除没有有效motion artifact的182个源sample。
+
+验证：
+
+- HumanML3D `all.txt`：29046条，全部存在对应artifact与text；完整文本库存55519条唯一caption。
+- BABEL `all.txt`：14087条，全部存在对应artifact与text。
+- HumanML-only T5表：55519条，`content_id=4e70af2e394aeae3dbcf4c69f8db6694af1466c5`，键集合与配置库存完全一致。
+- HumanML+BABEL T5表：59151条，`content_id=3086ab427f5ce1a3575ad34422187c978bfebaed`，键集合与配置库存完全一致。
+- 数据、配置、预处理、文本与资产准备定向测试：`59 passed`。
+- 全仓pytest：`237 passed, 3 skipped`。
+- 修改文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `tools/{preprocess_humanml3d,preprocess_babel,pretokenize_t5_text,prepare_training_assets}.py`
+- `configs/{ldf,ldf_multi}.yaml`
+- `tests/{test_ldf_text,test_migration_guards,test_vae_data_pipeline,test_multi_dataset,test_prepare_training_assets}.py`
+- `docs/rearchitecture/{02_DATA_PIPELINE,05_TRAINING_CONFIG}.md`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/{HumanML3D_motion,BABEL_motion}/all.txt`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/t5_text_embeddings.pt`
+- `/data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_BABEL_t5_text_embeddings.pt`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 无。
+
+## 2026-07-16 · VAE评测核心下沉与入口分层
+
+改动类型：目录职责重构 / VAE评测公共接口迁移
+
+实际改动内容：
+
+- 将原先集中在`eval/vae/evaluate_reconstruction.py`中的VAE评测实现拆分到`utils/training/vae/evaluation/`：
+  - `reconstruction.py`负责deterministic-mu的persistent stream与finite-history rolling重建；
+  - `metrics.py`负责物理重建、rotation、contact、skating与stream parity指标；
+  - `artifacts.py`负责JSON、NPZ、目录布局与视频输出；
+  - `runner.py`负责Dataset遍历、EMA VAE加载、任务配置与聚合结果。
+- `eval/vae/stream.py`与`eval/vae/rolling.py`收敛为只解析入口参数并调用评测runner的薄入口；删除旧单体实现。
+- 将两个VAE评测YAML从`eval/vae/`迁移到`configs/vae_eval_stream.yaml`与`configs/vae_eval_rolling.yaml`，同步更新默认入口和README命令。
+- 测试改为从`utils.training.vae.evaluation`公共接口导入，不再反向依赖`eval`可执行层。
+
+改动理由：
+
+- `eval`应只拥有可执行组合入口，VAE领域可复用的重建、指标与artifact逻辑应由`utils/training/vae`拥有。
+- 新依赖方向与LDF的`eval/ldf_training.py -> utils/training/ldf/evaluation`保持同构，避免训练/测试代码依赖CLI层。
+- 将原先868行的混合职责文件拆开，后续修改rolling协议、指标或输出格式时不再互相牵连。
+
+验证：
+
+- VAE eval与MultiDataset定向测试：`13 passed`。
+- 全仓测试：`237 passed`。
+- 新评测模块与两个薄入口`py_compile`通过。
+- 两个CLI入口的`--help`可正常加载；全仓搜索不存在旧`eval.vae.evaluate_reconstruction`或旧YAML路径引用。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/vae/evaluation/__init__.py`
+- `utils/training/vae/evaluation/reconstruction.py`
+- `utils/training/vae/evaluation/metrics.py`
+- `utils/training/vae/evaluation/artifacts.py`
+- `utils/training/vae/evaluation/runner.py`
+- `eval/vae/stream.py`
+- `eval/vae/rolling.py`
+- `eval/vae/README.md`
+- `configs/vae_eval_stream.yaml`
+- `configs/vae_eval_rolling.yaml`
+- `tests/test_vae_eval.py`
+- `tests/test_multi_dataset.py`
+
+尚未完成的后续事项：
+
+- 未运行真实GPU VAE重建任务；本轮只改变模块所有权和入口路径，CUDA stream/rolling数值仍沿用既有实现与测试合同。

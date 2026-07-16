@@ -28,7 +28,11 @@ from .artifacts import (
     save_dense_xz_sample,
     write_json,
 )
-from .generation import GENERATION_MODES, generate_evaluation_sequence
+from .generation import (
+    GENERATION_MODES,
+    compile_evaluation_prompt,
+    generate_evaluation_sequence,
+)
 
 
 def _stable_seed(base_seed: int, *parts: object) -> int:
@@ -66,6 +70,7 @@ class LDFEvaluationRunner:
         self.cfg = cfg
         self._dataset = None
         self._probe_datasets: dict[str, object] = {}
+        self._text_coverage_validated = False
 
     @property
     def enabled(self) -> bool:
@@ -127,6 +132,34 @@ class LDFEvaluationRunner:
         if not selected:
             raise RuntimeError("generation evaluation selected no validation samples")
         return selected
+
+    def validate_text_coverage(self, module) -> None:
+        """Fail before training when scheduled evaluation prompts are not encoded."""
+
+        if self._text_coverage_validated or not self.enabled:
+            return
+        validation = self.cfg.validation
+        required = {""}
+        if bool(validation.dense_xz.get("enabled", False)):
+            probe = str(validation.dense_xz.probe)
+            maximum_frames = int(self.cfg.data.max_frames)
+            for sample in self._selected_samples(
+                dataset=self._probe_dataset(probe),
+                limit=0,
+            ):
+                frames = _frame_count(sample, maximum_frames)
+                required.update(
+                    compile_evaluation_prompt(sample, frame_count=frames).timeline
+                )
+        try:
+            module.text_embeddings.lookup(sorted(required))
+        except KeyError as error:
+            raise RuntimeError(
+                "EVALUATION_TEXT_EMBEDDINGS_INCOMPLETE: scheduled validation "
+                "prompts are missing from data.text_embeddings_path. Regenerate "
+                "the table with tools/pretokenize_t5_text.py --reuse-existing."
+            ) from error
+        self._text_coverage_validated = True
 
     @staticmethod
     def _generation_config(validation) -> dict[str, Any]:

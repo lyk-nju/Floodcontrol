@@ -193,6 +193,9 @@ def build_dataset(
         atomic_copy(source_text, output / "texts" / source_text.name)
     for split, names in split_names.items():
         atomic_write_text(output / f"{split}.txt", "".join(f"{name}\n" for name in names))
+    atomic_write_text(
+        output / "all.txt", "".join(f"{name}\n" for name in unique_names)
+    )
     summary = {
         "source_dataset": "BABEL_streamed",
         "source_root": str(source_root.resolve()),
@@ -202,6 +205,7 @@ def build_dataset(
         "fps": float(fps),
         "min_frames": min_frames,
         "splits": {name: len(values) for name, values in split_names.items()},
+        "all": len(unique_names),
         "missing": {name: len(values) for name, values in missing_by_split.items()},
         "invalid_nonfinite": {
             name: len(values) for name, values in invalid_by_split.items()

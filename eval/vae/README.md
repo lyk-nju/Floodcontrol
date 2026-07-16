@@ -1,4 +1,8 @@
-# VAE reconstruction evaluation
+# VAE reconstruction evaluation entrypoints
+
+`eval/vae`只保留独立评测入口和使用说明。重建、指标、artifact与
+Dataset runner由`utils/training/vae/evaluation/`统一实现，与LDF训练期
+评测采用相同的依赖方向。
 
 The VAE evaluation package exposes two separate tasks. Both use the first 10
 sample IDs from the HumanML3D and BABEL validation TXT files, the frozen EMA
@@ -12,7 +16,7 @@ Every deterministic body token is committed directly to one persistent
 offline decode against token-by-token decode.
 
 ```bash
-python -m eval.vae.stream --config eval/vae/stream.yaml
+python -m eval.vae.stream --config configs/vae_eval_stream.yaml
 ```
 
 Results are written below `eval/vae/output/stream/`.
@@ -36,7 +40,7 @@ the cache implementation independently of the expected finite-history error.
 stream在数值容差内一致，并作为强回归检查。
 
 ```bash
-python -m eval.vae.rolling --config eval/vae/rolling.yaml
+python -m eval.vae.rolling --config configs/vae_eval_rolling.yaml
 ```
 
 Results are written below `eval/vae/output/rolling/`. Reconstruction NPZ files
@@ -50,7 +54,7 @@ Both entrypoints accept the same overrides:
 
 ```bash
 python -m eval.vae.rolling \
-  --config eval/vae/rolling.yaml \
+  --config configs/vae_eval_rolling.yaml \
   --device cpu \
   --sample-count 1 \
   --skip-video \

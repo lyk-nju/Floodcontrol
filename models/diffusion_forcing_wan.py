@@ -304,6 +304,10 @@ class RootTransformer(TransformerStage):
             future = self.future_projection(
                 torch.cat([future_value.flatten(2), future_mask.flatten(2).float()], dim=-1)
             )
+            # Autocast may produce BF16 projection outputs while ``current`` and
+            # the packed token buffer remain FP32. Indexed assignment requires
+            # an exact dtype match, so the packed stream follows motion dtype.
+            future = future.to(dtype=current.dtype)
             future_count = condition.future_valid_mask.sum(
                 dim=1, dtype=torch.long
             ).to(valid_lengths.device)

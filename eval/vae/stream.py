@@ -1,13 +1,12 @@
-"""Run direct token-by-token VAE stream reconstruction."""
+"""Thin entrypoint for direct token-by-token VAE reconstruction."""
 
-from .evaluate_reconstruction import load_task_config, run
+from utils.training.vae.evaluation.runner import load_task_config, run
 
 
 def main() -> None:
-    cfg = load_task_config("eval/vae/stream.yaml")
+    cfg = load_task_config("configs/vae_eval_stream.yaml")
     run(cfg, mode="stream")
 
 
 if __name__ == "__main__":
     main()
-

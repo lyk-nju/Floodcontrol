@@ -6,9 +6,9 @@ from datasets.humanml3d import HumanML3DDataset
 from datasets.multi import MultiDataset
 from tools.compute_vae_stats import compute_motion_statistics
 from tools.preprocess_babel import build_dataset
-from eval.vae.evaluate_reconstruction import evaluate_dataset
 from tests.vae_helpers import make_vae
 from utils.training.vae.data import VAEWindowCollator
+from utils.training.vae.evaluation import evaluate_dataset
 
 
 def make_motion(frames: int) -> np.ndarray:
@@ -87,6 +87,7 @@ def test_babel_preprocess_copies_text_and_writes_minimal_motion(tmp_path):
     output = tmp_path / "BABEL_motion"
     summary = build_dataset(source, output, workers=1)
     assert summary["copied_texts"] == 1
+    assert (output / "all.txt").read_text() == "sample\n"
     assert (output / "texts" / "sample.txt").read_text() == (
         "walk#walk/VERB#0#1\n"
     )

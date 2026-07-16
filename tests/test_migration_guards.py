@@ -62,6 +62,9 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.data.text_embeddings_path.endswith(
         "HumanML3D_motion/t5_text_embeddings.pt"
     )
+    assert list(cfg.data.text_meta_paths) == [
+        str(Path(cfg.data.train_meta_paths[0]).with_name("all.txt"))
+    ]
     assert "continuation_span_frames" not in cfg.validation
     assert "loss_probes" not in cfg.validation
     assert cfg.validation.generation.enabled is True
@@ -108,6 +111,11 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
         "datasets.babel.BABELDataset",
     ]
     assert all(item.text_path == "texts" for item in cfg.data.datasets)
+    assert all(
+        len(item.text_meta_paths) == 1
+        and Path(item.text_meta_paths[0]).name == "all.txt"
+        for item in cfg.data.datasets
+    )
     assert cfg.model.params.text_len == cfg.text_encoder.text_len == 128
     assert cfg.self_forcing.enabled is False
     assert cfg.data.text_embeddings_path.endswith(

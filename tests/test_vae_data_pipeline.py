@@ -210,6 +210,7 @@ def test_preprocess_writes_minimal_npz_split_and_copies_text(tmp_path):
     output = tmp_path / "HumanML3D_motion"
     summary = build_dataset(source, output, workers=1)
     assert summary["copied_texts"] == 1
+    assert (output / "all.txt").read_text() == "sample\n"
     assert (output / "texts" / "sample.txt").read_text().startswith("motion#")
     with np.load(output / "artifacts" / "sample.npz", allow_pickle=False) as data:
         assert set(data.files) == {

@@ -14,6 +14,10 @@ class LDFEvaluationCallback(Callback):
         super().__init__()
         self.runner = LDFEvaluationRunner(cfg)
 
+    def on_fit_start(self, trainer, pl_module) -> None:
+        if trainer.is_global_zero:
+            self.runner.validate_text_coverage(pl_module)
+
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
         if trainer.sanity_checking or not trainer.is_global_zero:
             return

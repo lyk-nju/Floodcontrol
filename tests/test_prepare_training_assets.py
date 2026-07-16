@@ -63,6 +63,8 @@ def test_pre_vae_pipeline_builds_and_resumes_all_non_t5_assets(tmp_path):
     babel = raw_data / "BABEL_motion"
     assert (human / "artifacts" / "human.npz").is_file()
     assert (babel / "artifacts" / "babel.npz").is_file()
+    assert (human / "all.txt").read_text() == "human\n"
+    assert (babel / "all.txt").read_text() == "babel\n"
     for path, fields in (
         (
             human / "motion_stats.npz",

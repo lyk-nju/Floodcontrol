@@ -191,12 +191,16 @@ def build_dataset(
         _atomic_write_text(
             output / f"{split}.txt", "".join(f"{name}\n" for name in names)
         )
+    _atomic_write_text(
+        output / "all.txt", "".join(f"{name}\n" for name in unique_names)
+    )
     summary = {
         "source_root": str(source_root.resolve()),
         "artifact_path": str(artifact_subdir),
         "fps": float(fps),
         "min_frames": min_frames,
         "splits": {name: len(values) for name, values in split_names.items()},
+        "all": len(unique_names),
         "missing": {name: len(values) for name, values in missing_by_split.items()},
         "invalid_nonfinite": {
             name: len(values) for name, values in invalid_by_split.items()

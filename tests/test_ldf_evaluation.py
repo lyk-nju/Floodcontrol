@@ -6,6 +6,7 @@ import types
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from models.diffusion_forcing_wan import LDF
 from eval.ldf_training import LDFEvaluationCallback
@@ -20,6 +21,7 @@ from utils.training.ldf.evaluation.generation import (
     compile_evaluation_prompt,
     generate_evaluation_sequence,
 )
+from utils.training.ldf.evaluation.runner import LDFEvaluationRunner
 
 
 class _TextEmbeddings:
@@ -77,15 +79,22 @@ def _evaluation_module():
 def test_generation_evaluation_is_composed_as_an_entrypoint_callback():
     callback = object.__new__(LDFEvaluationCallback)
     calls = []
-    callback.runner = types.SimpleNamespace(maybe_run=calls.append)
+    coverage_calls = []
+    callback.runner = types.SimpleNamespace(
+        maybe_run=calls.append,
+        validate_text_coverage=coverage_calls.append,
+    )
     module = object()
+
+    callback.on_fit_start(types.SimpleNamespace(is_global_zero=True), module)
+    callback.on_fit_start(types.SimpleNamespace(is_global_zero=False), module)
+    assert coverage_calls == [module]
 
     callback.on_validation_epoch_end(
         types.SimpleNamespace(sanity_checking=False, is_global_zero=True),
         module,
     )
     assert calls == [module]
-
     callback.on_validation_epoch_end(
         types.SimpleNamespace(sanity_checking=True, is_global_zero=True),
         module,
@@ -95,6 +104,48 @@ def test_generation_evaluation_is_composed_as_an_entrypoint_callback():
         module,
     )
     assert calls == [module]
+
+
+def test_evaluation_text_coverage_fails_before_training_for_missing_probe_prompt():
+    cfg = OmegaConf.create(
+        {
+            "validation": {
+                "generation": {"enabled": True},
+                "dense_xz": {"enabled": True, "probe": "dense_xz"},
+                "t2m": {"enabled": False},
+            },
+            "data": {
+                "max_frames": 8,
+                "test_probe_meta_paths": {"dense_xz": ["unused.txt"]},
+            },
+        }
+    )
+    runner = LDFEvaluationRunner(cfg)
+    runner._probe_datasets["dense_xz"] = [
+        {
+            "dataset": "HumanML3D",
+            "name": "probe",
+            "root_motion": torch.zeros(8, 5),
+            "text_data": [
+                {
+                    "text": "missing prompt",
+                    "tokens": [],
+                    "start_frame": 0,
+                    "end_frame": 8,
+                }
+            ],
+        }
+    ]
+
+    class MissingLookup:
+        @staticmethod
+        def lookup(texts):
+            raise KeyError(texts)
+
+    with pytest.raises(RuntimeError, match="EVALUATION_TEXT_EMBEDDINGS_INCOMPLETE"):
+        runner.validate_text_coverage(
+            types.SimpleNamespace(text_embeddings=MissingLookup())
+        )
 
 
 def test_dense_xz_metrics_report_time_aligned_and_path_errors():

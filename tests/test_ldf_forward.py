@@ -234,6 +234,39 @@ def test_future_root_uses_generation_centered_rope_without_extending_body():
     assert output.velocity.latent_motion.shape[1] == 4
 
 
+def test_future_root_supports_bfloat16_autocast():
+    model = make_model().train()
+    root = torch.randn(1, 4, 4, 5)
+    latent = torch.randn(1, 4, 8)
+    condition = LDFCondition(
+        text_context=[torch.randn(3, 8) for _ in range(4)],
+        text_null_context=[torch.zeros(1, 8)],
+        future_root_condition_value=torch.zeros(1, 2, 4, 5),
+        future_root_condition_mask=torch.ones(1, 2, 4, 5, dtype=torch.bool),
+        future_timeline_position_ids=torch.tensor([[9, 10]]),
+        future_valid_mask=torch.tensor([[True, True]]),
+    )
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(root, latent),
+        beta=torch.tensor([[0.0, 0.5, 0.75, 1.0]]),
+        history_mask=torch.tensor([[True, False, False, False]]),
+        generation_mask=torch.tensor([[False, True, True, True]]),
+        timeline_position_ids=torch.tensor([[5, 6, 7, 8]]),
+        rope_position_ids=torch.tensor([[-1, 0, 1, 2]]),
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=condition,
+    )
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = model(inputs)
+
+    assert output.velocity.root_motion.shape == (1, 4, 4, 5)
+    assert output.velocity.latent_motion.shape == (1, 4, 8)
+    assert torch.isfinite(output.velocity.root_motion).all()
+    assert torch.isfinite(output.velocity.latent_motion).all()
+
+
 def test_future_root_is_packed_after_the_visible_motion_prefix():
     model = make_model().eval()
     condition = LDFCondition(

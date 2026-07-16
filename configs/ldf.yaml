@@ -63,6 +63,8 @@ data:
   target: datasets.humanml3d.HumanML3DDataset
   root_stats_path: ${dirs.raw_data}/HumanML3D_motion/root_stats.npz
   text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion/t5_text_embeddings.pt
+  text_meta_paths:
+    - ${dirs.raw_data}/HumanML3D_motion/all.txt
   train_meta_paths:
     - ${dirs.raw_data}/HumanML3D_motion/train.txt
   val_meta_paths:

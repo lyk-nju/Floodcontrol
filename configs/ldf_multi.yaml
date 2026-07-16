@@ -43,6 +43,8 @@ data:
   text_embeddings_path: ${dirs.raw_data}/HumanML3D_BABEL_t5_text_embeddings.pt
   datasets:
     - target: datasets.humanml3d.HumanML3DDataset
+      text_meta_paths:
+        - ${dirs.raw_data}/HumanML3D_motion/all.txt
       train_meta_paths:
         - ${dirs.raw_data}/HumanML3D_motion/train.txt
       val_meta_paths:
@@ -50,6 +52,8 @@ data:
       artifact_path: artifacts
       text_path: texts
     - target: datasets.babel.BABELDataset
+      text_meta_paths:
+        - ${dirs.raw_data}/BABEL_motion/all.txt
       train_meta_paths:
         - ${dirs.raw_data}/BABEL_motion/train.txt
       val_meta_paths:

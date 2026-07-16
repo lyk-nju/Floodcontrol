@@ -2,11 +2,48 @@ from __future__ import annotations
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
+from tools.pretokenize_t5_text import collect_unique_captions
 from utils.training.ldf.text import (
     TextEmbeddingLookup,
     create_text_embedding_content_id,
 )
+
+
+def test_pretokenize_collects_dataset_level_all_caption_inventory(tmp_path):
+    texts = tmp_path / "texts"
+    texts.mkdir()
+    (tmp_path / "all.txt").write_text("train_sample\nprobe_sample\n")
+    (texts / "train_sample.txt").write_text("training caption#token#0#0\n")
+    (texts / "probe_sample.txt").write_text("probe caption#token#0#0\n")
+    cfg = OmegaConf.create(
+        {
+            "data": {
+                "text_meta_paths": [str(tmp_path / "all.txt")],
+                "text_path": "texts",
+            }
+        }
+    )
+
+    assert collect_unique_captions(cfg) == {
+        "",
+        "training caption",
+        "probe caption",
+    }
+
+
+def test_pretokenize_requires_dataset_level_all_inventory(tmp_path):
+    cfg = OmegaConf.create(
+        {
+            "data": {
+                "text_meta_paths": [str(tmp_path / "train.txt")],
+                "text_path": "texts",
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="all.txt"):
+        collect_unique_captions(cfg)
 
 
 def _write_table(path, embeddings):
