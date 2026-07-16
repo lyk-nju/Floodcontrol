@@ -265,17 +265,19 @@ root_condition_value: float [B,T,4,5]
 root_condition_mask:  bool  [B,T,4,5]
 ```
 
-Root stage 使用一个只读 input view：
+Root Stage将noisy state与condition作为两个独立输入边界：
 
 ```text
-root_visible = where(
-    root_condition_mask,
-    root_condition_value,
+root_input = concat(
     noisy_motion.root_motion,
+    noisy_motion.latent_motion,
+    where(root_condition_mask, root_condition_value, 0),
+    root_condition_mask,
+    beta / history / generation region,
 )
 ```
 
-同时把 value 与 mask 投影给网络。这个 overwrite 只改变本次 Root Transformer 的可见输入，不原地修改 `LDFInput.noisy_motion.root_motion`。
+active XZ等观测不得覆盖`noisy_motion.root_motion`。root flow监督`v*=x0-epsilon`，网络必须始终看见与该target配对的`x_beta`；value/mask只作为额外只读condition features进入constraint branch。未观测value在投影前清零，防止mask外数值泄漏。
 
 稀疏 body observations 通常是 frame-level body265/joint/keyframe constraints，并不天然等于 causal body latent。因此 V1 只把它们通过 observation projector 作为条件，不对 latent state 或最终输出做 hard overwrite。
 

@@ -14,7 +14,7 @@ from utils.motion_process import (
     rotate_motion_yaw,
     rotate_root_yaw,
 )
-from utils.token_frame import FRAMES_PER_TOKEN
+from utils.token_frame import FRAMES_PER_TOKEN, MOTION_FPS
 
 
 class VAEWindowCollator:
@@ -130,7 +130,7 @@ class VAEWindowCollator:
 
 
 def create_dataset(cfg, split: str):
-    common_args = {"split": split, "fps": float(cfg.model.params.fps)}
+    common_args = {"split": split, "fps": MOTION_FPS}
     dataset_configs = cfg.data.get("datasets", None)
     if dataset_configs:
         return instantiate_target(

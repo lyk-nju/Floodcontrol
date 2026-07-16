@@ -17,7 +17,9 @@ from utils.initialize import (
     load_config,
     save_run_snapshot,
 )
-from utils.training.vae import VAELightningModule, create_dataloaders
+from utils.training.vae.data import create_dataloaders
+from utils.training.vae.lightning_module import VAELightningModule
+from utils.training.lightning_module import EMARestoreOnException
 
 
 def _validate_training_config(cfg) -> None:
@@ -80,7 +82,9 @@ def main() -> None:
     run_time, save_dir = _create_run_directory(cfg)
     logger = _create_logger(cfg, run_time, save_dir)
     lightning_module = VAELightningModule(cfg.config)
-    callbacks = [_create_checkpoint_callback(cfg, save_dir)] if cfg.train else []
+    callbacks = [EMARestoreOnException()]
+    if cfg.train:
+        callbacks.append(_create_checkpoint_callback(cfg, save_dir))
     trainer = Trainer(
         **cfg.trainer,
         logger=logger,

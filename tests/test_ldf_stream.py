@@ -34,11 +34,16 @@ def constant_prediction(self, inputs, **kwargs):
     return LDFPrediction(HybridMotion(root, latent), root, local, valid)
 
 
+def stream_condition(tokens=6):
+    prompt = torch.ones(1, 4)
+    return LDFCondition([prompt for _ in range(tokens)], [torch.zeros(1, 4)])
+
+
 def test_step_input_excludes_the_untouched_pure_noise_frontier():
     model = make_model()
     motion = HybridMotion(torch.zeros(1, 6, 4, 5), torch.zeros(1, 6, 3))
     positions = torch.arange(6)[None]
-    condition = LDFCondition([torch.ones(1, 4)], [torch.zeros(1, 4)])
+    condition = stream_condition()
     inputs = model._create_step_input(
         motion,
         beta=torch.ones(1, 6),
@@ -58,7 +63,7 @@ def test_stream_updates_both_fields_and_snapshot_restore_is_deterministic():
     model.predict_with_cfg = types.MethodType(constant_prediction, model)
     generator = torch.Generator().manual_seed(7)
     initial = HybridMotion(torch.zeros(1, 6, 4, 5), torch.zeros(1, 6, 3))
-    condition = LDFCondition([torch.ones(1, 4)], [torch.zeros(1, 4)])
+    condition = stream_condition()
     state = model.init_stream_state(
         batch_size=1,
         window_tokens=6,
@@ -89,7 +94,7 @@ def test_stream_updates_both_fields_and_snapshot_restore_is_deterministic():
 def test_stream_roll_keeps_boundary_and_advances_origin():
     model = make_model()
     model.predict_with_cfg = types.MethodType(constant_prediction, model)
-    condition = LDFCondition([torch.ones(1, 4)], [torch.zeros(1, 4)])
+    condition = stream_condition()
     state = model.init_stream_state(
         batch_size=1,
         window_tokens=6,

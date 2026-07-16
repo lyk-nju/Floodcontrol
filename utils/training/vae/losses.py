@@ -15,7 +15,7 @@ from utils.conditions.vae import (
     VAEPrediction,
 )
 from utils.motion_process import rotation_to_matrix
-from utils.token_frame import frame_valid_to_token_valid
+from utils.token_frame import MOTION_FPS, frame_valid_to_token_valid
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -43,7 +43,7 @@ class VAELoss(nn.Module):
         lambda_velocity_consistency: float = 0.0,
         skeleton_parents=None,
         skeleton_offsets=None,
-        fps: float = 20.0,
+        fps: float = MOTION_FPS,
     ):
         super().__init__()
         self.register_buffer("body_cont_mean", torch.as_tensor(body_cont_mean).float())

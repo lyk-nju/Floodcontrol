@@ -1,4 +1,3 @@
-status: training_ready
 exp_name: ldf_hybrid
 seed: 1234
 debug: false
@@ -6,6 +5,9 @@ train: true
 save_dir: /data1/yuankai/text2Motion/Floodcontrol/ldf
 resume_ckpt: null
 test_ckpt: null
+
+wandb_info:
+  project: Floodcontrol
 
 trainer:
   max_steps: 300000
@@ -20,14 +22,29 @@ validation:
   save_every_n_steps: 10000
   save_top_k: 20
   seed: 4321
-  continuation_span_frames: 40
-  continuation_history_tokens: 5
-  self_forcing_steps: 5
-  self_forcing_history_tokens: 1
 
-# Canonical HumanML3D statistics generated with the fixed-span anchor sampler.
-root_stats_path: ${dirs.raw_data}/HumanML3D_motion/root_stats.npz
-text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion/t5_text_embeddings.pt
+  generation:
+    enabled: true
+    steps: 5000
+    modes: [stream]
+    num_runs: 3
+    video_samples: 4
+    render: true
+    num_denoise_steps: 10
+    max_horizon_token: 10
+    rolling:
+      window_tokens: 50
+      rebase_on_roll: true
+
+  dense_xz:
+    enabled: true
+    probe: dense_xz
+    video_samples: ${validation.generation.video_samples}
+    segment_frames: 20
+
+  t2m:
+    enabled: true
+    steps: 10000
 
 vae:
   target: models.vae_wan_1d.BodyVAE
@@ -39,24 +56,26 @@ vae:
     decoder_layers: 6
     kernel_size: 3
     dropout: 0.0
-    fps: 20.0
     motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
     latent_stats_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/latent_stats.npz
 
 data:
   target: datasets.humanml3d.HumanML3DDataset
+  root_stats_path: ${dirs.raw_data}/HumanML3D_motion/root_stats.npz
+  text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion/t5_text_embeddings.pt
   train_meta_paths:
     - ${dirs.raw_data}/HumanML3D_motion/train.txt
   val_meta_paths:
     - ${dirs.raw_data}/HumanML3D_motion/val.txt
+  test_probe_meta_paths:
+    dense_xz:
+      - ${dirs.raw_data}/HumanML3D_motion/test_min.txt
   artifact_path: artifacts
   text_path: texts
-  min_frames: 40
+  min_frames: 20
   max_frames: 200
   random_yaw: true
-  cold_start_probability: 0.1
-  length_bucket_frames: 20
-  train_batch_size: 16
+  train_batch_size: 8
   val_batch_size: 16
   num_workers: 16
   pin_memory: true
@@ -67,15 +86,53 @@ text_encoder:
   text_len: 128
   dtype: bfloat16
 
+metrics:
+  t2m:
+    evaluate_text: true
+    metric_mean_path: ${dirs.deps}/t2m/meta/mean.npy
+    metric_std_path: ${dirs.deps}/t2m/meta/std.npy
+    wordvectorizer:
+      target: metrics.tools.word_vectorizer.WordVectorizer
+      params:
+        meta_root: ${dirs.deps}/glove
+        prefix: our_vab
+      max_text_len: 20
+    textencoder:
+      target: metrics.tools.t2m_evaluator.TextEncoderBiGRUCo
+      ckpt: ${dirs.deps}/t2m/humanml3d/text_encoder.pt
+      params:
+        word_size: 300
+        pos_size: 15
+        hidden_size: 512
+        output_size: 512
+    moveencoder:
+      target: metrics.tools.t2m_evaluator.MovementConvEncoder
+      ckpt: ${dirs.deps}/t2m/humanml3d/movement_encoder.pt
+      params:
+        input_size: 259
+        hidden_size: 512
+        output_size: 512
+    motionencoder:
+      target: metrics.tools.t2m_evaluator.MotionEncoderBiGRUCo
+      ckpt: ${dirs.deps}/t2m/humanml3d/motion_encoder.pt
+      params:
+        input_size: 512
+        hidden_size: 1024
+        output_size: 512
+
 training:
-  text_dropout_probability: 0.1
-  constraint_dropout_probability: 0.1
-  future_root_lookahead_tokens: 20
+  text_dropout: 0.1
+  constraint_dropout: 0.1
+  window:
+    max_tokens: 50
+    generation_tokens: 5
+    sampling: random_generation_start
+  max_horizon_token: 45
   constraint_sampling:
     dense_probability: 0.5
     waypoint_probability: 0.25
     goal_probability: 0.25
-    max_waypoints: 4
+    max_waypoint_count: 4
 
 loss:
   root_weight: 1.0
@@ -103,7 +160,7 @@ model:
     ffn_dim: 2048
     freq_dim: 256
     text_dim: 4096
-    text_len: 128
+    text_len: ${text_encoder.text_len}
     num_heads: 8
     root_num_layers: 8
     body_num_layers: 8
@@ -126,6 +183,7 @@ optimizer:
     eps: 1.0e-8
 
 lr_scheduler:
-  target: diffusers.optimization.get_constant_schedule_with_warmup
+  target: diffusers.optimization.get_cosine_schedule_with_warmup
   params:
-    num_warmup_steps: 1000
+    num_warmup_steps: 5000
+    num_training_steps: ${trainer.max_steps}

@@ -1,6 +1,6 @@
 # Floodcontrol 新版框架讨论索引
 
-状态：`LDF_BODY_VAE_AND_WEB_RUNTIME_READY / FORMAL_LDF_TRAINING_OPEN`。Hybrid LDF、BodyVAE、唯一`humanml265`转换器、全量本地motion artifacts/statistics、首个300k EMA tokenizer、在线EMA Hybrid bridge、原子推理session与四帧Web runtime已经落地；正式LDF训练仍需H/G/F/C、self-forcing、noise/beta、condition和v-predict loss，Web模型加载等待由该训练冻结的checkpoint合同。未标记为`LOCKED`的内容继续视为讨论项。
+状态：`TRAJECTORY_CONDITIONED_LDF_TRAINING_READY`。Hybrid LDF、BodyVAE、唯一`humanml265`转换器、在线EMA Hybrid bridge、teacher/self-forcing训练合同、dense/sparse XZ监督、原子推理session以及训练期stream/rolling生成评测已经落地；Web模型加载等待正式LDF checkpoint。未标记为`LOCKED`的内容继续视为讨论项。
 
 这个目录用于把新版 Floodcontrol 的设计讨论拆成可独立审阅的主题，避免把模型协议、数据语义、在线状态、训练目标和实验超参数混在同一份文档里。
 
@@ -20,6 +20,8 @@
    只在前四份协议稳定后记录可执行配置、初始超参数、消融矩阵、资源预算和验收指标。
 6. [`06_LDF_IMPLEMENTATION_DESIGN.md`](06_LDF_IMPLEMENTATION_DESIGN.md)
    记录 LDF 的最终代码层级、公共命名、`utils/conditions/ldf.py` 协议、Root/Body forward、CFG 接管、流式迁移 seam，以及 ControlNet/FlexTraj 的删除门槛。
+7. [`07_LDF_TRAINING_EVALUATION.md`](07_LDF_TRAINING_EVALUATION.md)
+   记录训练期stream/rolling完整生成、dense XZ指标与视频、HumanML T2M/FID评测、执行周期和FloodNet风格artifact目录。
 
 用户提出的第 2 项被拆成离线数据和在线 active-window 两份文档，因为二者共享坐标协议，但状态所有权、失败模式和测试方法不同。
 

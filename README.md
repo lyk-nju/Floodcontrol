@@ -26,7 +26,24 @@ root_motion + latent_motion
 python -m pytest tests -q
 ```
 
-测试覆盖typed condition、active/future XZ、Root/Body forward sensitivity、constraint CFG、逐token文本隔离、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`与`train_ldf.py`都会在所需statistics/checkpoint/data缺失时fail-fast；canonical root statistics已经按当前fixed-span anchor sampler生成，正式LDF配置为`training_ready`，并强制要求正数future XZ lookahead。Web的四帧chunk runtime已经接入`InferenceSession`，模型加载在正式LDF checkpoint冻结前明确抛出`BLOCKED_ON_LDF_CHECKPOINT`。
+迁移服务器时可以从FloodDiffusion同构的`HumanML3D`与`BABEL_streamed`源目录
+一体化重建motion、statistics、UMT5和VAE latent statistics：
+
+```bash
+python -m tools.prepare_training_assets all \
+  --raw-data-root /path/to/raw_data \
+  --deps-root /path/to/deps \
+  --vae-checkpoint /path/to/body_vae/last.ckpt \
+  --workers 16 \
+  --t5-devices 0,1,2 \
+  --latent-device cuda:0
+```
+
+VAE checkpoint尚未训练完成时先运行`pre-vae`，训练完成后再运行`post-vae`；
+完整输入、输出和恢复协议见
+[`02_DATA_PIPELINE.md`](docs/rearchitecture/02_DATA_PIPELINE.md)。
+
+测试覆盖typed condition、active/future XZ、Root/Body forward sensitivity、constraint CFG、逐token文本隔离、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`与`train_ldf.py`都会直接检查所需statistics、checkpoint和数据；canonical root statistics已经按当前50-token scaled-ARDY窗口与逐样本anchor分布生成，不再使用额外的`training_ready`状态门闩。Web的四帧chunk runtime已经接入`InferenceSession`，模型加载在正式LDF checkpoint冻结前明确抛出`BLOCKED_ON_LDF_CHECKPOINT`。
 
 本地数据、依赖和输出目录默认分别为`./data`、`./deps`和`./outputs`，也可以通过`FLOODCONTROL_DATA`、`FLOODCONTROL_DEPS`和`FLOODCONTROL_OUTPUTS`覆盖。
 

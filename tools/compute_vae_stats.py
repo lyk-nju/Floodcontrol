@@ -9,8 +9,11 @@ import numpy as np
 import torch
 
 from datasets.humanml3d import HumanML3DDataset
+from utils.initialize import load_config
 from utils.conditions.vae import BODY_CONTINUOUS_DIM
 from utils.motion_process import recover_local_root, rotate_motion_yaw
+from utils.token_frame import MOTION_FPS
+from utils.training.vae.data import create_dataset
 
 
 class Accumulator:
@@ -89,9 +92,11 @@ def compute_motion_statistics(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-meta-paths", nargs="+", required=True)
+    parser.add_argument("--config")
+    parser.add_argument("--override", nargs="+")
+    parser.add_argument("--train-meta-paths", nargs="+")
     parser.add_argument("--artifact-path", default="artifacts")
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output")
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument(
         "--random-yaw",
@@ -99,22 +104,42 @@ def main() -> None:
         default=True,
     )
     args = parser.parse_args()
-    dataset = HumanML3DDataset(
-        meta_paths=args.train_meta_paths,
-        split="train",
-        artifact_path=args.artifact_path,
-        fps=args.fps,
-    )
+    if args.config:
+        overrides = {}
+        for item in args.override or ():
+            key, separator, value = item.partition("=")
+            if separator != "=" or not key.strip():
+                parser.error(f"invalid --override {item!r}; expected KEY=VALUE")
+            overrides[key.strip()] = value.strip()
+        cfg = load_config(args.config, overrides)
+        dataset = create_dataset(cfg, "train")
+        fps = MOTION_FPS
+        output_path = args.output or str(cfg.model.params.motion_stats_path)
+    else:
+        if args.override:
+            parser.error("--override requires --config")
+        if not args.train_meta_paths:
+            parser.error("set --config or --train-meta-paths")
+        if not args.output:
+            parser.error("--output is required without --config")
+        dataset = HumanML3DDataset(
+            meta_paths=args.train_meta_paths,
+            split="train",
+            artifact_path=args.artifact_path,
+            fps=args.fps,
+        )
+        fps = float(args.fps)
+        output_path = args.output
     statistics = compute_motion_statistics(
-        dataset, fps=args.fps, random_yaw=args.random_yaw
+        dataset, fps=fps, random_yaw=args.random_yaw
     )
-    output = Path(args.output)
+    output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         output,
         **{name: value.numpy() for name, value in statistics.items()},
     )
-    print(f"wrote motion statistics to {args.output}")
+    print(f"wrote motion statistics to {output}")
 
 
 if __name__ == "__main__":

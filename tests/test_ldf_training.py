@@ -84,19 +84,21 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
             "trainer": {"max_steps": 10},
             "validation": {
                 "seed": 11,
-                "continuation_history_tokens": 1,
-                "self_forcing_steps": 2,
-                "self_forcing_history_tokens": 1,
             },
             "training": {
-                "text_dropout_probability": 0.0,
-                "constraint_dropout_probability": 0.0,
-                "future_root_lookahead_tokens": 2,
+                "text_dropout": 0.0,
+                "constraint_dropout": 0.0,
+                "max_horizon_token": 2,
+                "window": {
+                    "max_tokens": 50,
+                    "generation_tokens": chunk_size,
+                    "sampling": "random_generation_start",
+                },
                 "constraint_sampling": {
                     "dense_probability": 1.0,
                     "waypoint_probability": 0.0,
                     "goal_probability": 0.0,
-                    "max_waypoints": 4,
+                    "max_waypoint_count": 4,
                 },
             },
             "loss": {"root_weight": 1.0, "body_weight": 1.0},
@@ -104,9 +106,9 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
                 "enabled": False,
                 "phase_start_step": 10,
                 "phase_steps": 20,
+                "k_schedule": [[0.0, 2], [0.4, 3], [0.7, 5]],
+                "teacher_replay": {2: 0.2, 3: 0.1, 5: 0.1},
             },
-            "root_stats_path": str(root_stats),
-            "text_embeddings_path": str(text_embeddings),
             "vae": {
                 "target": "models.vae_wan_1d.BodyVAE",
                 "checkpoint_path": str(checkpoint),
@@ -119,8 +121,11 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
                     "decoder_layers": 1,
                     "kernel_size": 3,
                     "dropout": 0.0,
-                    "fps": 20.0,
                 },
+            },
+            "data": {
+                "root_stats_path": str(root_stats),
+                "text_embeddings_path": str(text_embeddings),
             },
             "model": {
                 "target": "models.diffusion_forcing_wan.LDF",
@@ -141,6 +146,67 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
             },
         }
     )
+
+
+def _make_step_batch():
+    root = torch.zeros(1, 8, 5)
+    root[..., 3] = 1.0
+    return {
+        "root_motion": root,
+        "body_motion": torch.randn(1, 8, 265),
+        "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        "body_with_context": torch.randn(1, 8, 265),
+        "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        "context_token_count": torch.zeros(1, dtype=torch.long),
+        "previous_root_frame": torch.zeros(1, 5),
+        "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
+        "source_start_token": torch.zeros(1, dtype=torch.long),
+        "span_token_count": torch.tensor([2]),
+        "prompt_timeline": [["walk", "walk"]],
+    }
+
+
+def test_step_keeps_teacher_forcing_before_phase_start(tmp_path, monkeypatch):
+    cfg = _make_config(tmp_path)
+    cfg.self_forcing.enabled = True
+    module = LDFLightningModule(cfg).train()
+
+    def fail_if_sampled(*_args, **_kwargs):
+        pytest.fail("self-forcing sampling must not run before phase_start_step")
+
+    monkeypatch.setattr(
+        "utils.training.ldf.lightning_module.sample_rollout_steps",
+        fail_if_sampled,
+    )
+    losses = module._step(
+        _make_step_batch(),
+        is_training=True,
+        initial_history_tokens=0,
+    )
+    assert torch.isfinite(losses["total"])
+
+
+def test_step_starts_self_forcing_at_phase_boundary(tmp_path, monkeypatch):
+    cfg = _make_config(tmp_path)
+    cfg.self_forcing.enabled = True
+    cfg.self_forcing.phase_start_step = 0
+    module = LDFLightningModule(cfg).train()
+    calls = []
+
+    def record_sampling(progress, **_kwargs):
+        calls.append(progress)
+        return 1
+
+    monkeypatch.setattr(
+        "utils.training.ldf.lightning_module.sample_rollout_steps",
+        record_sampling,
+    )
+    module._step(
+        _make_step_batch(),
+        is_training=True,
+        initial_history_tokens=0,
+    )
+    assert calls == [0.0]
 
 
 def test_ldf_training_bridge_uses_frozen_ema_vae_and_shared_statistics(tmp_path):
@@ -196,42 +262,6 @@ def test_create_clean_motion_aligns_root_latent_and_padding(tmp_path):
     assert not motion.latent_motion.requires_grad
 
 
-def test_create_clean_motion_rejects_partial_active_token(tmp_path):
-    module = LDFLightningModule(_make_config(tmp_path)).eval()
-    batch = {
-        "root_motion": torch.zeros(1, 4, 5),
-        "frame_valid_mask": torch.tensor([[True, True, False, False]]),
-        "body_with_context": torch.zeros(1, 4, 265),
-        "body_with_context_frame_valid_mask": torch.ones(1, 4, dtype=torch.bool),
-        "context_token_count": torch.zeros(1, dtype=torch.long),
-    }
-    with pytest.raises(ValueError, match="constant within each four-frame token"):
-        module._create_clean_motion(batch)
-
-
-def test_create_clean_motion_rejects_per_sample_root_body_misalignment(tmp_path):
-    module = LDFLightningModule(_make_config(tmp_path)).eval()
-    batch = {
-        "root_motion": torch.zeros(2, 8, 5),
-        "frame_valid_mask": torch.tensor(
-            [
-                [True] * 8,
-                [True] * 4 + [False] * 4,
-            ]
-        ),
-        "body_with_context": torch.zeros(2, 8, 265),
-        "body_with_context_frame_valid_mask": torch.tensor(
-            [
-                [True] * 4 + [False] * 4,
-                [True] * 8,
-            ]
-        ),
-        "context_token_count": torch.zeros(2, dtype=torch.long),
-    }
-    with pytest.raises(ValueError, match="active token counts"):
-        module._create_clean_motion(batch)
-
-
 def test_prompt_timeline_encoding_preserves_token_order_and_builds_null_branch(tmp_path):
     module = LDFLightningModule(_make_config(tmp_path)).eval()
     contexts, null = module._encode_prompt_timeline(
@@ -255,10 +285,10 @@ def test_xz_condition_exposes_only_active_xz_and_post_active_lookahead():
     positions = torch.arange(10, 18)[None].expand(2, -1)
     view = LDFStepView(
         step_index=0,
-        history_end=2,
-        active_start=2,
-        active_end=5,
-        frontier_start=5,
+        history_end=torch.tensor([2, 2]),
+        active_start=torch.tensor([2, 2]),
+        active_end=torch.tensor([5, 5]),
+        frontier_start=torch.tensor([5, 5]),
         timeline_position_ids=positions,
         rope_position_ids=torch.arange(-2, 6)[None].expand(2, -1),
         beta=torch.zeros(2, 8),
@@ -267,13 +297,13 @@ def test_xz_condition_exposes_only_active_xz_and_post_active_lookahead():
     null = [torch.zeros(1, 8) for _ in range(2)]
     constraint_mask = sample_xz_constraint_mask(
         token_valid_mask=token_valid,
-        initial_active_start=2,
-        initial_active_end=5,
-        future_lookahead_tokens=2,
+        initial_active_start=torch.tensor([2, 2]),
+        initial_active_end=torch.tensor([5, 5]),
+        max_horizon_token=2,
         dense_probability=1.0,
         waypoint_probability=0.0,
         goal_probability=0.0,
-        max_waypoints=4,
+        max_waypoint_count=4,
     )
     constraint_mask[1] = False
     condition = create_xz_condition(
@@ -283,7 +313,7 @@ def test_xz_condition_exposes_only_active_xz_and_post_active_lookahead():
         view=view,
         text_context=text,
         text_null_context=null,
-        future_lookahead_tokens=2,
+        max_horizon_token=2,
     )
 
     mask = condition.root_condition_mask
@@ -306,10 +336,10 @@ def test_xz_sampling_supports_dense_waypoints_and_single_future_goal():
     valid = torch.ones(1, 8, dtype=torch.bool)
     common = dict(
         token_valid_mask=valid,
-        initial_active_start=2,
-        initial_active_end=5,
-        future_lookahead_tokens=2,
-        max_waypoints=4,
+        initial_active_start=torch.tensor([2]),
+        initial_active_end=torch.tensor([5]),
+        max_horizon_token=2,
+        max_waypoint_count=4,
     )
     dense = sample_xz_constraint_mask(
         **common,
@@ -318,8 +348,9 @@ def test_xz_sampling_supports_dense_waypoints_and_single_future_goal():
         goal_probability=0.0,
         generator=torch.Generator().manual_seed(1),
     )
-    assert dense[:, 2:, :, 0].all()
-    assert dense[:, 2:, :, 2].all()
+    assert dense[:, 2:7, :, 0].all()
+    assert dense[:, 2:7, :, 2].all()
+    assert not dense[:, 7:].any()
     assert not dense[:, :2].any()
 
     waypoints = sample_xz_constraint_mask(
@@ -353,13 +384,13 @@ def test_xz_sampling_supports_dense_waypoints_and_single_future_goal():
 def test_goal_sampling_without_future_falls_back_to_one_active_waypoint():
     goal = sample_xz_constraint_mask(
         token_valid_mask=torch.ones(1, 5, dtype=torch.bool),
-        initial_active_start=2,
-        initial_active_end=5,
-        future_lookahead_tokens=2,
+        initial_active_start=torch.tensor([2]),
+        initial_active_end=torch.tensor([5]),
+        max_horizon_token=2,
         dense_probability=0.0,
         waypoint_probability=0.0,
         goal_probability=1.0,
-        max_waypoints=4,
+        max_waypoint_count=4,
         generator=torch.Generator().manual_seed(4),
     )
     assert int(goal[..., 0].sum().item()) == 1
@@ -376,10 +407,10 @@ def test_sparse_future_constraints_are_packed_by_absolute_position():
     positions = torch.arange(10, 18)[None].expand(2, -1)
     view = LDFStepView(
         step_index=0,
-        history_end=2,
-        active_start=2,
-        active_end=5,
-        frontier_start=5,
+        history_end=torch.tensor([2, 2]),
+        active_start=torch.tensor([2, 2]),
+        active_end=torch.tensor([5, 5]),
+        frontier_start=torch.tensor([5, 5]),
         timeline_position_ids=positions,
         rope_position_ids=torch.arange(-2, 6)[None].expand(2, -1),
         beta=torch.zeros(2, 8),
@@ -391,7 +422,7 @@ def test_sparse_future_constraints_are_packed_by_absolute_position():
         view=view,
         text_context=[torch.zeros(1, 8) for _ in range(16)],
         text_null_context=[torch.zeros(1, 8) for _ in range(2)],
-        future_lookahead_tokens=3,
+        max_horizon_token=3,
     )
     assert condition.future_timeline_position_ids.tolist() == [[15, 17], [16, 0]]
     assert condition.future_valid_mask.tolist() == [[True, True], [True, False]]
@@ -438,7 +469,7 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         "previous_root_frame": torch.zeros(1, 5),
         "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
         "source_start_token": torch.zeros(1, dtype=torch.long),
-        "cold_start_mask": torch.ones(1, dtype=torch.bool),
+        "span_token_count": torch.tensor([2]),
         "prompt_timeline": [["walk", "walk"]],
     }
     seen_conditions = []
@@ -449,7 +480,7 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         return original_forward(inputs)
 
     module.model.forward = recording_forward
-    losses = module._step(batch, is_training=True)
+    losses = module._step(batch, is_training=True, initial_history_tokens=0)
     assert set(losses) == {
         "anchor_root_flow_v",
         "latent_body_flow_v",
@@ -482,7 +513,7 @@ def test_validation_plan_and_noise_are_repeatable_with_fixed_generator(tmp_path)
         "previous_root_frame": torch.zeros(1, 5),
         "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
         "source_start_token": torch.zeros(1, dtype=torch.long),
-        "cold_start_mask": torch.ones(1, dtype=torch.bool),
+        "span_token_count": torch.tensor([2]),
         "prompt_timeline": [["walk", "walk"]],
     }
     first = module._step(
@@ -579,9 +610,9 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
     batch = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=module.vae.encoder_context_tokens,
         training=False,
-        cold_start=False,
     )([dataset[0]])
     plan = sample_window_plan(
         batch,
@@ -597,9 +628,10 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
     assert token_valid.all()
 
     def condition_builder(_view):
+        null = torch.zeros(1, 8)
         return LDFCondition(
-            text_context=[torch.zeros(1, 8)],
-            text_null_context=[torch.zeros(1, 8)],
+            text_context=[null for _ in range(clean_motion.token_length)],
+            text_null_context=[null],
         )
 
     result = run_self_forcing_rollout(

@@ -48,18 +48,17 @@ def test_ldf_training_dataset_filters_samples_shorter_than_the_source_span():
     assert dataset[0]["name"] == "valid"
 
 
-def test_true_cold_start_is_the_real_sequence_start_without_hidden_boundary():
+def test_parent_window_at_sequence_start_has_no_fake_encoder_context():
     batch = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=8,
         training=True,
-        cold_start=True,
-    )([make_sample(48)])
+    )([make_sample(40)])
 
     assert batch["root_motion"].shape == (1, 40, 5)
     assert batch["source_start_token"].tolist() == [0]
-    assert batch["cold_start_mask"].tolist() == [True]
     assert batch["context_token_count"].tolist() == [0]
     assert not batch["previous_root_valid_mask"].item()
     assert batch["body_with_context"].shape == (1, 40, 265)
@@ -74,13 +73,12 @@ def test_continuation_carries_real_vae_context_without_translation_rebase(monkey
     batch = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=2,
         training=True,
-        cold_start=False,
     )([make_sample(56)])
 
     assert batch["source_start_token"].tolist() == [2]
-    assert batch["cold_start_mask"].tolist() == [False]
     assert batch["context_token_count"].tolist() == [2]
     assert batch["previous_root_valid_mask"].item()
     assert torch.equal(batch["body_with_context"][0, :8, 0], torch.arange(8))
@@ -96,28 +94,38 @@ def test_continuation_carries_real_vae_context_without_translation_rebase(monkey
     )
 
 
-def test_span_length_is_batch_shared_while_source_crops_are_independent(monkeypatch):
-    choices = iter((10, 1, 3))
-    monkeypatch.setattr(
-        "utils.training.ldf.data.random.randint", lambda *_: next(choices)
-    )
+def test_each_sample_keeps_its_natural_parent_length_and_uses_right_padding():
     batch = LDFSpanCollator(
         min_frames=40,
         max_frames=48,
+        generation_tokens=5,
         encoder_context_tokens=2,
         training=True,
-        cold_start=False,
-    )([make_sample(56, "first"), make_sample(64, "second")])
+    )([make_sample(40, "first"), make_sample(48, "second")])
 
-    assert batch["span_token_count"] == 10
-    assert batch["root_motion"].shape == (2, 40, 5)
-    assert batch["frame_valid_mask"].all()
-    assert batch["source_start_token"].tolist() == [1, 3]
-    assert batch["context_token_count"].tolist() == [1, 2]
+    assert batch["span_token_count"].tolist() == [10, 12]
+    assert batch["root_motion"].shape == (2, 48, 5)
+    assert batch["frame_valid_mask"][0, :40].all()
+    assert not batch["frame_valid_mask"][0, 40:].any()
+    assert batch["frame_valid_mask"][1].all()
+    assert batch["source_start_token"].tolist() == [0, 0]
+    assert batch["context_token_count"].tolist() == [0, 0]
     assert batch["body_with_context"].shape == (2, 48, 265)
-    assert batch["body_with_context_frame_valid_mask"][0, :44].all()
-    assert not batch["body_with_context_frame_valid_mask"][0, 44:].any()
+    assert batch["body_with_context_frame_valid_mask"][0, :40].all()
+    assert not batch["body_with_context_frame_valid_mask"][0, 40:].any()
     assert batch["body_with_context_frame_valid_mask"][1].all()
+    root_patches = batch["frame_valid_mask"].reshape(2, -1, 4)
+    encoder_patches = batch["body_with_context_frame_valid_mask"].reshape(2, -1, 4)
+    assert torch.equal(root_patches, root_patches[..., :1].expand_as(root_patches))
+    assert torch.equal(
+        encoder_patches,
+        encoder_patches[..., :1].expand_as(encoder_patches),
+    )
+    root_tokens = root_patches[..., 0].sum(dim=1)
+    encoder_active_tokens = (
+        encoder_patches[..., 0].sum(dim=1) - batch["context_token_count"]
+    )
+    assert torch.equal(root_tokens, encoder_active_tokens)
 
 
 def test_humanml_span_selects_one_caption_alternative_for_prompt_timeline(monkeypatch):
@@ -140,9 +148,9 @@ def test_humanml_span_selects_one_caption_alternative_for_prompt_timeline(monkey
     prompt_timeline = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=0,
         training=True,
-        cold_start=False,
     )([sample])["prompt_timeline"][0]
 
     assert prompt_timeline == ["alternative"] * 10
@@ -162,9 +170,9 @@ def test_babel_span_compiles_one_prompt_per_motion_token(monkeypatch):
     prompt_timeline = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=0,
         training=True,
-        cold_start=False,
     )([sample])["prompt_timeline"][0]
 
     assert prompt_timeline == ["walk"] + ["turn"] * 9
@@ -182,9 +190,9 @@ def test_babel_arbitrary_frame_intervals_use_maximum_token_overlap():
     timeline = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=0,
         training=False,
-        cold_start=True,
     )([sample])["prompt_timeline"][0]
 
     assert timeline == ["walk", "step"] + ["turn"] * 8
@@ -257,10 +265,10 @@ def test_seeded_training_batch_reproduces_crop_caption_and_yaw():
     collator = LDFSpanCollator(
         min_frames=40,
         max_frames=48,
+        generation_tokens=5,
         encoder_context_tokens=2,
         training=True,
         random_yaw=True,
-        cold_start=False,
     )
     first = collator([sample])
     second = collator([sample])
@@ -285,9 +293,9 @@ def test_length_bucket_sampler_indices_flow_through_dataloader():
         collate_fn=LDFSpanCollator(
             min_frames=40,
             max_frames=40,
+            generation_tokens=5,
             encoder_context_tokens=0,
             training=True,
-            cold_start=True,
         ),
     )
     batch = next(iter(loader))
@@ -339,59 +347,60 @@ def test_resumable_dataloader_restores_the_exact_next_batch():
     assert len(list(resumed)) == 4
 
 
-def test_validation_probes_are_deterministic_for_cold_and_continuation():
+def test_validation_parent_window_is_deterministic_for_all_probe_types():
     sample = make_sample(56)
     sample["dataset"] = "HumanML3D"
     sample["text_data"] = [
         {"text": "first", "tokens": [], "start_frame": 0, "end_frame": 56},
         {"text": "second", "tokens": [], "start_frame": 0, "end_frame": 56},
     ]
-    cold = LDFSpanCollator(
+    cold_parent = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=2,
         training=False,
-        cold_start=True,
+        validation_probe="teacher_cold",
     )([sample])
     continuation_collator = LDFSpanCollator(
         min_frames=40,
         max_frames=40,
+        generation_tokens=5,
         encoder_context_tokens=2,
         training=False,
-        cold_start=False,
     )
     first = continuation_collator([sample])
     second = continuation_collator([sample])
 
-    assert cold["source_start_token"].tolist() == [0]
-    assert cold["context_token_count"].tolist() == [0]
+    assert cold_parent["source_start_token"].tolist() == [0]
+    assert cold_parent["context_token_count"].tolist() == [0]
+    assert not cold_parent["previous_root_valid_mask"].item()
     assert first["source_start_token"].tolist() == [2]
     assert first["context_token_count"].tolist() == [2]
     assert torch.equal(first["root_motion"], second["root_motion"])
     assert first["prompt_timeline"][0] == ["first"] * 10
 
 
-def test_continuation_validation_covers_early_middle_and_late_source_positions():
+def test_continuation_validation_labels_early_middle_and_late_history_probes():
     samples = [make_sample(80, f"sample-{index}") for index in range(3)]
     for index, sample in enumerate(samples):
         sample["_ldf_sample_index"] = index
     batch = LDFSpanCollator(
         min_frames=40,
         max_frames=80,
+        generation_tokens=5,
         encoder_context_tokens=2,
         training=False,
-        cold_start=False,
-        validation_span_frames=40,
         validation_positions=("early", "middle", "late"),
     )(samples)
 
     assert batch["validation_position"] == ["early", "middle", "late"]
-    assert batch["source_start_token"].tolist() == [1, 5, 10]
-    assert batch["context_token_count"].tolist() == [1, 2, 2]
+    assert batch["source_start_token"].tolist() == [0, 0, 0]
+    assert batch["context_token_count"].tolist() == [0, 0, 0]
 
 
 def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
-    dataset = MinimumFrameDataset(VariableLengthDataset(), min_frames=40)
+    dataset = MinimumFrameDataset(VariableLengthDataset(), min_frames=20)
     monkeypatch.setattr(
         "utils.training.ldf.data.create_dataset", lambda _cfg, _split: dataset
     )
@@ -399,13 +408,25 @@ def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
         {
             "seed": 3,
             "train": True,
-            "self_forcing": {"enabled": True},
+            "self_forcing": {
+                "enabled": True,
+                "phase_start_step": 0,
+                "phase_steps": 20,
+                "k_schedule": [[0.0, 2], [0.7, 5]],
+                "teacher_replay": {2: 0.2, 5: 0.1},
+            },
+            "trainer": {"max_steps": 20},
+            "training": {
+                "window": {
+                    "max_tokens": 10,
+                    "generation_tokens": 5,
+                }
+            },
+            "model": {"params": {"chunk_size": 5}},
             "data": {
-                "min_frames": 40,
+                "min_frames": 20,
                 "max_frames": 40,
                 "random_yaw": False,
-                "cold_start_probability": 0.1,
-                "length_bucket_frames": 20,
                 "train_batch_size": 1,
                 "val_batch_size": 1,
                 "num_workers": 0,
@@ -415,8 +436,15 @@ def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
     )
     train, validation = create_dataloaders(cfg, encoder_context_tokens=2)
     assert train is not None
-    assert [next(iter(loader))["validation_probe"] for loader in validation] == [
+    # K=5 reserves four rollout tokens, so the five-token short clip is
+    # filtered from self-forcing training while remaining valid for K=1 cold val.
+    assert next(iter(train))["name"] == ["valid"]
+    validation_batches = [next(iter(loader)) for loader in validation]
+    assert [batch["validation_probe"] for batch in validation_batches] == [
         "teacher_cold",
         "teacher_continuation",
         "self_forcing",
     ]
+    assert validation_batches[0]["source_start_token"].tolist() == [0]
+    assert validation_batches[0]["context_token_count"].tolist() == [0]
+    assert not validation_batches[0]["previous_root_valid_mask"].any()

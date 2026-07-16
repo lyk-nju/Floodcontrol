@@ -114,6 +114,36 @@ def test_humanml_dataset_returns_full_clip_parses_text_and_ignores_old_metadata(
     ]
 
 
+def test_humanml_dataset_ignores_annotations_without_positive_motion_overlap(
+    tmp_path,
+):
+    write_processed_sample(tmp_path, frames=12)
+    (tmp_path / "train.txt").write_text("sample\n")
+    texts = tmp_path / "texts"
+    texts.mkdir()
+    (texts / "sample.txt").write_text(
+        "whole#whole/NOUN#0#0\n"
+        "zero duration#zero/NOUN#0.2#0.2\n"
+        "reversed#reverse/VERB#1.0#0.4\n"
+        "past motion#past/NOUN#2.0#3.0\n"
+    )
+    dataset = HumanML3DDataset(
+        meta_paths=[tmp_path / "train.txt"],
+        split="train",
+        text_path="texts",
+        fps=20,
+    )
+
+    assert dataset[0]["text_data"] == [
+        {
+            "text": "whole",
+            "tokens": ["whole/NOUN"],
+            "start_frame": 0,
+            "end_frame": 12,
+        }
+    ]
+
+
 def test_vae_validation_collator_uses_prefix_rebase_previous_root_and_padding(tmp_path):
     write_processed_sample(tmp_path, "long", frames=12)
     write_processed_sample(tmp_path, "short", frames=8)

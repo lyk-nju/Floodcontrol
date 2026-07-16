@@ -24,7 +24,7 @@ def test_separated_cfg_combination_and_shared_root_boundary():
         chunk_size=1,
         noise_steps=1,
     )
-    text = [torch.ones(1, 4)]
+    text = [torch.ones(1, 4) for _ in range(2)]
     null = [torch.zeros(1, 4)]
     root_value = torch.zeros(1, 2, 4, 5)
     root_mask = torch.ones_like(root_value, dtype=torch.bool)

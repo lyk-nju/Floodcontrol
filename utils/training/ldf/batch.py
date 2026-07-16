@@ -1,4 +1,4 @@
-"""Model-facing batch construction for fixed-span LDF training."""
+"""Model-facing batch construction for per-sample LDF windows."""
 
 from __future__ import annotations
 
@@ -25,10 +25,10 @@ class LDFStepView:
     """Region and position metadata supplied to a condition builder."""
 
     step_index: int
-    history_end: int
-    active_start: int
-    active_end: int
-    frontier_start: int
+    history_end: torch.Tensor
+    active_start: torch.Tensor
+    active_end: torch.Tensor
+    frontier_start: torch.Tensor
     timeline_position_ids: torch.Tensor
     rope_position_ids: torch.Tensor
     beta: torch.Tensor
@@ -88,7 +88,8 @@ def build_ldf_training_step(
     clean_motion: HybridMotion,
     noise: HybridMotion,
     source_start_token: torch.Tensor,
-    initial_history_tokens: int,
+    span_token_count: torch.Tensor,
+    initial_history_tokens: torch.Tensor,
     active_tokens: int,
     phase_offset: torch.Tensor,
     step_index: int,
@@ -96,7 +97,7 @@ def build_ldf_training_step(
     previous_root_valid_mask: torch.Tensor | None,
     condition_builder: ConditionBuilder,
 ) -> LDFTrainingStep:
-    """Build one fixed-S history/active/frontier LDF forward contract."""
+    """Build one padded, per-sample history/active/future LDF contract."""
 
     clean_motion.validate()
     batch = clean_motion.batch_size
@@ -107,18 +108,30 @@ def build_ldf_training_step(
     ).view(-1)
     if tuple(source_start.shape) != (batch,):
         raise ValueError("source_start_token must be [B]")
+    span_count = span_token_count.to(
+        device=clean_motion.root_motion.device,
+        dtype=torch.long,
+    ).view(-1)
+    history = initial_history_tokens.to(
+        device=clean_motion.root_motion.device,
+        dtype=torch.long,
+    ).view(-1)
+    if tuple(span_count.shape) != (batch,):
+        raise ValueError("span_token_count must be [B]")
+    if tuple(history.shape) != (batch,):
+        raise ValueError("initial_history_tokens must be [B]")
     phase = phase_offset.to(
         device=clean_motion.root_motion.device,
         dtype=clean_motion.root_motion.dtype,
     )
     beta = build_span_beta(
         span_tokens=span_tokens,
-        initial_history_tokens=initial_history_tokens,
+        initial_history_tokens=history,
         active_tokens=active_tokens,
         phase_offset=phase,
         step_index=step_index,
     )
-    history_end = int(initial_history_tokens) + int(step_index)
+    history_end = history + int(step_index)
     active_start = history_end
     active_end = active_start + int(active_tokens)
     positions = torch.arange(
@@ -127,9 +140,14 @@ def build_ldf_training_step(
         dtype=torch.long,
     )[None].expand(batch, -1)
     timeline = source_start[:, None] + positions
-    rope = positions - active_start
-    history_mask = positions < active_start
-    loss_mask = (positions >= active_start) & (positions < active_end)
+    valid = positions < span_count[:, None]
+    rope = positions - active_start[:, None]
+    history_mask = valid & (positions < active_start[:, None])
+    loss_mask = (
+        valid
+        & (positions >= active_start[:, None])
+        & (positions < active_end[:, None])
+    )
     # Pure-noise frontier remains in persistent state for later rollout steps,
     # but only history plus the current active band enters non-causal attention.
     generation_mask = loss_mask
@@ -158,7 +176,7 @@ def build_ldf_training_step(
         previous_root_valid_mask=previous_root_valid_mask,
         condition=condition,
     )
-    inputs.validate()
+    inputs.validate_structure()
     return LDFTrainingStep(
         inputs=inputs,
         target_velocity=flow_velocity_target(clean_motion, noise),

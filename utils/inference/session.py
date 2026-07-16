@@ -48,21 +48,23 @@ class InferenceConfig:
     """Session scheduler and condition-window configuration."""
 
     window_tokens: int
-    future_constraint_tokens: int = 0
+    max_horizon_token: int = 0
     num_denoise_steps: int | None = None
     rebase_on_roll: bool = True
+    rolling: bool = True
 
     def __post_init__(self) -> None:
         if int(self.window_tokens) <= 0:
             raise ValueError("window_tokens must be positive")
-        if int(self.future_constraint_tokens) < 0:
-            raise ValueError("future_constraint_tokens must be non-negative")
+        if int(self.max_horizon_token) < 0:
+            raise ValueError("max_horizon_token must be non-negative")
         if self.num_denoise_steps is not None and int(self.num_denoise_steps) <= 0:
             raise ValueError("num_denoise_steps must be positive")
         object.__setattr__(self, "window_tokens", int(self.window_tokens))
         object.__setattr__(
-            self, "future_constraint_tokens", int(self.future_constraint_tokens)
+            self, "max_horizon_token", int(self.max_horizon_token)
         )
+        object.__setattr__(self, "rolling", bool(self.rolling))
         if self.num_denoise_steps is not None:
             object.__setattr__(
                 self, "num_denoise_steps", int(self.num_denoise_steps)
@@ -92,6 +94,7 @@ class GeneratedMotionChunk:
     root_motion: torch.Tensor
     body_prediction: BodyPrediction
     trace: InferenceStepTrace
+    committed_motion: HybridMotion | None = None
 
     def validate(self) -> None:
         if self.token_index < 0:
@@ -106,6 +109,12 @@ class GeneratedMotionChunk:
         self.body_prediction.validate()
         if self.body_prediction.continuous_body.shape[:2] != self.root_motion.shape[:2]:
             raise ValueError("root and body output frames must align")
+        if self.committed_motion is not None:
+            self.committed_motion.validate()
+            if self.committed_motion.batch_size != self.root_motion.shape[0]:
+                raise ValueError("committed motion and physical output batch differ")
+            if self.committed_motion.token_length != 1:
+                raise ValueError("one generated chunk must contain one hybrid token")
 
 
 @dataclass(frozen=True)
@@ -225,7 +234,8 @@ class InferenceSession:
             root_mean=ldf.root_mean,
             root_std=ldf.root_std,
             fps=ldf.fps,
-            future_constraint_tokens=config.future_constraint_tokens,
+            active_tokens=ldf.chunk_size,
+            max_horizon_token=config.max_horizon_token,
         )
 
     @property
@@ -304,6 +314,7 @@ class InferenceSession:
         candidate_ldf, committed = self.ldf.stream_generate_step(
             old_state,
             compiled.ldf_condition,
+            roll_window=self.config.rolling,
             cfg_mode=self.guidance.mode,
             cfg_scale_text=self.guidance.scale_text,
             cfg_scale_constraint=self.guidance.scale_constraint,
@@ -376,6 +387,7 @@ class InferenceSession:
             root_motion=world_root[:, 0].clone(),
             body_prediction=body,
             trace=trace,
+            committed_motion=committed.clone(detach=True),
         )
         chunk.validate()
 

@@ -62,6 +62,7 @@ def test_formal_vae_training_config_matches_frozen_recipe():
     )
     assert cfg.model.target == "models.vae_wan_1d.BodyVAE"
     assert cfg.model.params.latent_stats_path is None
+    assert "fps" not in cfg.model.params
     assert "allow_identity_statistics" not in cfg.model.params
     assert "require_latent_statistics" not in cfg.model.params
     assert cfg.loss.beta_kl == pytest.approx(1e-5)
@@ -75,6 +76,7 @@ def test_formal_vae_training_config_matches_frozen_recipe():
 
 def test_multi_vae_config_keeps_source_datasets_explicit():
     cfg = load_config(str(ROOT / "configs" / "vae_multi.yaml"))
+    assert cfg.wandb_info.project == "VAE_Flood"
     assert cfg.data.target == "datasets.multi.MultiDataset"
     assert "collate_fn" not in cfg.data
     assert [entry.target for entry in cfg.data.datasets] == [
@@ -85,6 +87,7 @@ def test_multi_vae_config_keeps_source_datasets_explicit():
     assert cfg.model.params.motion_stats_path == (
         f"{cfg.dirs.raw_data}/HumanML3D_BABEL_motion_stats.npz"
     )
+    assert "fps" not in cfg.model.params
     assert cfg.trainer.devices == 1
     assert cfg.trainer.strategy == "auto"
     assert cfg.data.train_batch_size == 128

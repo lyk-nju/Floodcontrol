@@ -74,7 +74,7 @@ def make_initial_noise(*, root_x=0.0, tokens=6, latent_dim=3):
     return HybridMotion(root, latent)
 
 
-def make_session(*, root_x=0.0, guidance=None):
+def make_session(*, root_x=0.0, guidance=None, rolling=True):
     ldf = make_ldf()
     ldf.predict_with_cfg = types.MethodType(zero_prediction, ldf)
     vae = make_vae(
@@ -87,7 +87,11 @@ def make_session(*, root_x=0.0, guidance=None):
         ldf=ldf,
         body_vae=vae,
         text_encoder=encode_texts,
-        config=InferenceConfig(window_tokens=6, future_constraint_tokens=2),
+        config=InferenceConfig(
+            window_tokens=6,
+            max_horizon_token=2,
+            rolling=rolling,
+        ),
         guidance=guidance,
         initial_world_xz=(10.0, 20.0),
         initial_noise=make_initial_noise(root_x=root_x),
@@ -168,7 +172,8 @@ def test_condition_compiler_aligns_world_route_masks_and_future_positions():
         text_embeddings=TextEmbeddingCache(encode_texts),
         root_mean=ldf.root_mean,
         root_std=ldf.root_std,
-        future_constraint_tokens=2,
+        active_tokens=ldf.chunk_size,
+        max_horizon_token=2,
     )
     compiled = compiler.compile(
         state,
@@ -187,7 +192,7 @@ def test_condition_compiler_aligns_world_route_masks_and_future_positions():
         torch.tensor([0.2, 0.2]),
         atol=1e-6,
     )
-    assert condition.future_timeline_position_ids.tolist() == [[6, 7]]
+    assert condition.future_timeline_position_ids.tolist() == [[3, 4]]
     assert len(condition.text_context) == 6
     assert not torch.equal(condition.text_context[0], condition.text_context[1])
 
@@ -229,6 +234,8 @@ def test_session_commits_one_token_decodes_four_frames_and_restores_snapshot():
     assert first.token_index == 0
     assert first.root_motion.shape == (1, 4, 5)
     assert first.body_prediction.continuous_body.shape == (1, 4, 261)
+    assert first.committed_motion is not None
+    assert first.committed_motion.token_length == 1
     assert session.commit_index == 1
 
     snapshot = session.create_snapshot()
@@ -282,6 +289,15 @@ def test_session_rebases_only_after_ldf_window_roll():
     assert torch.allclose(
         session.ldf_state.previous_root_frame[:, [0, 2]], torch.zeros(1, 2)
     )
+
+
+def test_fixed_stream_session_commits_without_rolling_the_window():
+    session = make_session(root_x=2.0, rolling=False)
+    chunks = list(session.generate(5))
+    assert len(chunks) == 5
+    assert session.ldf_state.window_origin == 0
+    assert session.ldf_state.epoch == 0
+    assert all(not chunk.trace.rebased for chunk in chunks)
 
 
 def test_guidance_is_session_local_and_does_not_mutate_shared_model_defaults():

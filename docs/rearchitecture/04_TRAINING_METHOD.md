@@ -31,7 +31,7 @@ Stage F: long-horizon/replanning curriculum and final finetuning
 ## 已冻结的 LDF target
 
 - root/body 共用 FloodDiffusion 的三角 per-token `beta` 和线性 flow convention；网络分别预测 normalized diffusion velocity `x0-epsilon`。
-- 每个 denoising step 内先恢复clean `anchor_root_x0_model`，融合root observations并投影heading后，通过 `LocalRootMotionCodec` 派生backward/current-heading-local `local_root_motion`；第一版训练detach后送入body stage。
+- 每个denoising step中，Root Stage同时读取完整noisy root与独立的root observation value/mask并预测velocity；随后由`x_beta+beta*v`恢复clean `anchor_root_x0_model`，投影heading，再通过`LocalRootMotionCodec`派生backward/current-heading-local `local_root_motion`。observation不覆盖`x_beta`或恢复后的clean root；第一版local-root在训练时detach后送入body stage。
 - `anchor_root_motion` 不增加速度生成通道，也不设置独立physical velocity loss；派生速度只作为Body Transformer/VAE Decoder condition或不参与优化的诊断指标。
 - diffusion velocity loss 明确命名为：
 
@@ -42,16 +42,21 @@ L_latent_body_flow_v
 
 这里的 `flow_v=x0-epsilon` 是 normalized diffusion-space target，不是物理速度。root 的额外直接监督只作用于 clean position/height/heading 与声明过的 constraint terms；不默认加入相邻帧速度差分 loss。
 
-## 已实现的固定span训练内核
+## 已实现的scaled-ARDY窗口训练内核
 
-- source span固定为batch共享的`S∈[10,50]` tokens，active band固定为`A=chunk_size=5`，初始划分满足`S=H+A+F_frontier`。
+- 每个sample保留自己的自然parent长度`N_i=min(sample_tokens,50)`；长动作随机裁一个50-token父窗口，短动作不人为缩短。batch只在右侧padding，因此真实长度由`span_token_count[B]`表达。
+- active band固定为`C=chunk_size=5`。K=1时每个sample独立均匀采样`H_i∈[0,N_i-C]`，并令`F_i=N_i-H_i-C`，唯一预算为`H_i+C+F_i<=50`，不再分别截断history与future。K-step self-forcing时额外保留`R=K-1`，采样上界变为`N_i-C-R`。
 - 第`i`步使用`history=[0,H+i)`、`active=[H+i,H+i+5)`、`frontier=[H+i+5,S)`。persistent noisy state仍保存完整S和固定frontier noise，但Transformer只接收`history+active`有效前缀；尚未开始更新的pure-noise frontier不进入self-attention。它与span外future-root condition token仍是两类对象。
 - 一个rollout只采样一次per-sample phase和absolute-token root/body Gaussian noise。active右移时只改变beta，同一token不会跳到另一条diffusion path。
 - translation anchor由初始H确定并在整个K步保持不变；region boundary移动不触发OriginEpoch rebase。
 - 前K-1步保持`model.train()`并在`torch.no_grad()`内运行，只用`x_beta+beta*v_pred`替换最左active token；最终一步保留梯度并只监督当前5-token active band。
-- teacher baseline使用K=1；fine-tune默认K=2/3/5，并支持20%/10%/10%的K=1 replay。curriculum进度从显式`phase_start_step`起算，并在`phase_steps`内从0推进到1，不使用包含baseline的全局训练进度。replay概率是实验配置，不是模型协议。
+- teacher baseline使用K=1；即使提前设置`self_forcing.enabled=true`，`global_step < phase_start_step`期间也由硬gate保持K=1，不调用curriculum sampler。到`phase_start_step`才进入K=2/3/5 fine-tune，并支持20%/10%/10%的K=1 replay。curriculum进度在`phase_steps`内从0推进到1，不使用包含baseline的全局训练进度。replay概率是实验配置，不是模型协议。
 
-训练实现分为`flow.py`的代数、`batch.py`的固定S输入合同、`losses.py`的root/body flow-v reduction和`self_forcing.py`的plan/state rollout。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ；冻结UMT5只在训练前运行一次并生成caption-to-embedding table，训练热路径按prompt字符串lookup token-aligned context，不在LDF GPU上加载11GB文本编码器。LDF checkpoint只保存LDF/EMA，但附带VAE/statistics/text路径与VAE统计用于resume前校验。它不调用也不复制正式runtime的commit、roll或rebase状态机。
+训练实现分为`flow.py`的代数、`batch.py`的固定S输入合同、`losses.py`的root/body flow-v reduction和`self_forcing.py`的plan/state rollout。数据内容合同由CPU collator在构造时保证；上述GPU热路径只保留shape/dtype检查，完整plan/input内容校验仅按debug周期在rollout前抽查，不能在每个self-forcing microstep重复同步。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ；冻结UMT5只在训练前运行一次并生成caption-to-embedding table，训练热路径按prompt字符串lookup token-aligned context，不在LDF GPU上加载11GB文本编码器。LDF checkpoint只保存LDF/EMA，但附带VAE/statistics/text路径与VAE统计用于resume前校验。它不调用也不复制正式runtime的commit、roll或rebase状态机。
+
+Validation整轮只在开始时把EMA shadow换入模型一次，所有loss probe和inline generation复用这组参数，并在epoch-end恢复训练参数。临时`collected_params`恢复后立即释放且不进入checkpoint；异常由统一callback回滚，checkpoint若在EMA参数仍激活时触发会fail-fast，避免把EMA权重误写成主训练state。
+
+计算层保持相同可见性语义但压缩无效工作：Root在有future约束时向量化打包`visible motion | future root`，无future时只运行batch内最大visible prefix；Body同样只运行最大visible prefix并把尾部补零。FlashAttention varlen打包与恢复使用布尔prefix mask，不再逐row执行Python scalar读取。pure-noise frontier仍保留在persistent state且不进入本步Transformer，compact只删除已被mask排除的pointwise/FFN计算，不改变non-causal visible attention。
 
 ## 已实现的XZ轨迹条件训练
 
@@ -59,7 +64,7 @@ L_latent_body_flow_v
 
 ```text
 dense trajectory（50%）:
-    从首个active token开始标记所有真实帧XZ
+    从首个active token开始标记动态future范围内的所有真实帧XZ
 
 sparse waypoints（25%）:
     在active + future lookahead内随机标记1–4个独立帧XZ
@@ -75,21 +80,25 @@ future goal（25%）:
 
 ```yaml
 training:
-  text_dropout_probability: 0.1
-  constraint_dropout_probability: 0.1
-  future_root_lookahead_tokens: 20
+  text_dropout: 0.1
+  constraint_dropout: 0.1
+  window:
+    max_tokens: 50
+    generation_tokens: 5
+    sampling: random_generation_start
+  max_horizon_token: 45
   constraint_sampling:
     dense_probability: 0.5
     waypoint_probability: 0.25
     goal_probability: 0.25
-    max_waypoints: 4
+    max_waypoint_count: 4
 ```
 
-三种采样概率之和必须为1。constraint dropout在采样计划之后按sample清空整份约束，因此它是唯一产生无轨迹条件样本的机制；mode sampler不会用短span意外制造无约束样本。训练入口要求lookahead为正、两种dropout位于`[0,1]`且`max_waypoints>0`；不允许把没有轨迹条件的text-only训练误标为`training_ready`。
+三种采样概率之和必须为1。constraint dropout在采样计划之后按sample清空整份约束，因此它是唯一产生无轨迹条件样本的机制；mode sampler不会用短span意外制造无约束样本。训练入口要求`max_horizon_token`为正、两种dropout位于`[0,1]`且`max_waypoint_count>0`，并直接检查所需statistics/checkpoint/data，不再依赖人工状态字符串。
 
 文本条件遵循FloodDiffusion的局部性：HumanML3D的一条动作caption在span内重复；BABEL的区间caption编译到对应token。Root/Body Stage的每个motion query直接cross-attend自身prompt；后续Transformer层仍可通过可见motion token之间的non-causal self-attention传播已经注入的文本信息，因此该协议是`direct token-aligned cross-attention`，不是严格文本隔离。pure-noise frontier不进入当前attention，未到达active band的未来prompt不能提前传播。训练以sample级text dropout构造空文本分布，推理CFG复用同一空文本语义。
 
-Validation使用固定seed的三个独立probe：teacher cold start固定`H=0,K=1`；teacher continuation使用显式`continuation_span_frames`，并按稳定sample index在同一loader中轮换early/middle/late source位置，固定`H=5,K=1`；启用self-forcing后再增加相同位置覆盖的固定`H=1,K=5` probe。continuation数据视图会提前排除无法在span前保留至少一个真实token的短clip，不能再把整段clip从token 0开始却标成continuation。phase、root/body noise和文本选择对同一batch保持确定，使checkpoint loss可横向比较。
+Validation使用固定seed的独立probe：teacher cold强制parent从真实序列第0 token开始，并固定`source_start=0, context=0, previous-root invalid, H=0, K=1`；teacher continuation在确定性的中间parent窗口上按early/middle/late标签选择合法`H>=1`，默认中点probe等价于固定`H=5,K=1`配置；启用self-forcing后再增加固定`H=1,K=5` probe。source parent、phase、root/body noise和文本选择对同一batch保持确定，使checkpoint loss可横向比较。
 
 ## 当前待讨论问题
 

@@ -15,7 +15,6 @@ from utils.token_frame import (
     FRAMES_PER_TOKEN,
     frame_count_to_token_count,
     frame_valid_to_token_valid,
-    prefix_valid_token_count,
     require_aligned_frame_count,
 )
 from utils.training.lightning_module import BasicLightningModule
@@ -89,7 +88,7 @@ class LDFLightningModule(BasicLightningModule):
         if not vae.latent_statistics_ready:
             raise RuntimeError("LDF requires VAE latent statistics")
 
-        root_mean, root_std = _load_root_statistics(cfg.root_stats_path)
+        root_mean, root_std = _load_root_statistics(cfg.data.root_stats_path)
         model_params = dict(cfg.model.params)
         injected_names = {
             "latent_dim",
@@ -119,11 +118,10 @@ class LDFLightningModule(BasicLightningModule):
         self.vae = vae
         self.vae.eval().requires_grad_(False)
         self.text_embeddings = TextEmbeddingLookup(
-            cfg.text_embeddings_path,
+            cfg.data.text_embeddings_path,
             expected_dim=int(cfg.model.params.text_dim),
             expected_text_len=int(cfg.model.params.text_len),
         )
-
         if self.model.latent_dim != self.vae.latent_dim:
             raise RuntimeError("LDF and VAE latent dimensions do not match")
         if not torch.equal(
@@ -157,10 +155,10 @@ class LDFLightningModule(BasicLightningModule):
         dropout = float(
             0.0
             if training_config is None
-            else training_config.get("text_dropout_probability", 0.0)
+            else training_config.get("text_dropout", 0.0)
         )
         if not 0.0 <= dropout <= 1.0:
-            raise ValueError("text_dropout_probability must lie in [0,1]")
+            raise ValueError("text_dropout must lie in [0,1]")
         if apply_dropout and dropout:
             dropped = (
                 torch.rand(
@@ -198,35 +196,13 @@ class LDFLightningModule(BasicLightningModule):
             raise TypeError("frame_valid_mask must be bool")
         frames = require_aligned_frame_count(root.shape[1])
         tokens = frame_count_to_token_count(frames)
-        frame_patches = frame_valid.reshape(
-            root.shape[0], tokens, FRAMES_PER_TOKEN
-        )
-        if not bool((frame_patches == frame_patches[..., :1]).all()):
-            raise ValueError(
-                "active frame validity must be constant within each four-frame token"
-            )
         token_valid = frame_valid_to_token_valid(frame_valid)
-        root_valid_token_count = prefix_valid_token_count(token_valid)
 
         latent = self.vae.tokenize_window(
             batch["body_with_context"],
             batch["body_with_context_frame_valid_mask"],
             batch["context_token_count"],
         )
-        encoder_token_valid = frame_valid_to_token_valid(
-            batch["body_with_context_frame_valid_mask"]
-        )
-        encoder_valid_token_count = prefix_valid_token_count(encoder_token_valid)
-        active_token_count = encoder_valid_token_count - batch[
-            "context_token_count"
-        ].to(device=encoder_valid_token_count.device)
-        if not torch.equal(
-            active_token_count,
-            root_valid_token_count.to(device=active_token_count.device),
-        ):
-            raise ValueError(
-                "VAE active token counts do not match active root token counts"
-            )
         if tuple(latent.shape[:2]) != (root.shape[0], tokens):
             raise ValueError(
                 "VAE active latent shape does not match the active root token axis"
@@ -255,7 +231,7 @@ class LDFLightningModule(BasicLightningModule):
         *,
         generator: torch.Generator | None = None,
         rollout_steps_override: int | None = None,
-        initial_history_tokens: int | None = None,
+        initial_history_tokens: int | torch.Tensor | None = None,
     ):
         if generator is None and is_training:
             generator = torch.Generator(device=self.device).manual_seed(
@@ -273,23 +249,36 @@ class LDFLightningModule(BasicLightningModule):
             and self_forcing is not None
             and bool(self_forcing.get("enabled", False))
         ):
-            progress = self_forcing_phase_progress(
-                int(self.global_step),
-                phase_start_step=int(self_forcing.phase_start_step),
-                phase_steps=int(self_forcing.phase_steps),
-            )
-            schedule = [tuple(row) for row in self_forcing.k_schedule]
-            replay = {
-                int(key): float(value)
-                for key, value in dict(self_forcing.teacher_replay).items()
-            }
-            rollout_steps = sample_rollout_steps(
-                progress,
-                generator=generator,
-                schedule=schedule,
-                teacher_replay=replay,
-            )
+            phase_start_step = int(self_forcing.phase_start_step)
+            if int(self.global_step) >= phase_start_step:
+                progress = self_forcing_phase_progress(
+                    int(self.global_step),
+                    phase_start_step=phase_start_step,
+                    phase_steps=int(self_forcing.phase_steps),
+                )
+                schedule = [tuple(row) for row in self_forcing.k_schedule]
+                replay = {
+                    int(key): float(value)
+                    for key, value in dict(self_forcing.teacher_replay).items()
+                }
+                rollout_steps = sample_rollout_steps(
+                    progress,
+                    generator=generator,
+                    schedule=schedule,
+                    teacher_replay=replay,
+                )
 
+        training_config = self.cfg.get("training") or {}
+        window_config = training_config.get("window") or {}
+        max_window_tokens = int(window_config.get("max_tokens", 0))
+        generation_tokens = int(window_config.get("generation_tokens", 0))
+        if max_window_tokens <= 0 or generation_tokens <= 0:
+            raise ValueError("training.window must define positive max/generation tokens")
+        if generation_tokens != self.model.chunk_size:
+            raise ValueError(
+                "training generation window must equal the model active chunk size"
+            )
+        validate_contract = bool(self.cfg.get("debug", False))
         plan = sample_window_plan(
             batch,
             active_tokens=self.model.chunk_size,
@@ -298,6 +287,8 @@ class LDFLightningModule(BasicLightningModule):
             generator=generator,
             initial_history_tokens=initial_history_tokens,
         )
+        if validate_contract:
+            plan.validate()
         anchored_batch = anchor_physical_batch(
             batch, plan.translation_anchor_xz
         )
@@ -308,19 +299,16 @@ class LDFLightningModule(BasicLightningModule):
             generator=generator,
         )
 
-        training_config = self.cfg.get("training") or {}
         constraint_keep = sample_constraint_keep_mask(
             clean_motion.batch_size,
             dropout_probability=float(
-                training_config.get("constraint_dropout_probability", 0.0)
+                training_config.get("constraint_dropout", 0.0)
             ),
             device=clean_motion.root_motion.device,
             generator=generator,
             apply_dropout=is_training,
         )
-        future_lookahead_tokens = int(
-            training_config.get("future_root_lookahead_tokens", 0)
-        )
+        max_horizon_token = int(training_config.get("max_horizon_token", 0))
         sampling = training_config.get("constraint_sampling") or {}
         constraint_mask = sample_xz_constraint_mask(
             token_valid_mask=token_valid,
@@ -328,13 +316,13 @@ class LDFLightningModule(BasicLightningModule):
             initial_active_end=(
                 plan.initial_history_tokens + plan.active_tokens
             ),
-            future_lookahead_tokens=future_lookahead_tokens,
+            max_horizon_token=max_horizon_token,
             dense_probability=float(sampling.get("dense_probability", 0.5)),
             waypoint_probability=float(
                 sampling.get("waypoint_probability", 0.25)
             ),
             goal_probability=float(sampling.get("goal_probability", 0.25)),
-            max_waypoints=int(sampling.get("max_waypoints", 4)),
+            max_waypoint_count=int(sampling.get("max_waypoint_count", 4)),
             generator=generator,
         )
         constraint_mask &= constraint_keep[:, None, None, None]
@@ -347,7 +335,7 @@ class LDFLightningModule(BasicLightningModule):
                 view=view,
                 text_context=contexts,
                 text_null_context=null_contexts,
-                future_lookahead_tokens=future_lookahead_tokens,
+                max_horizon_token=max_horizon_token,
             )
 
         result = run_self_forcing_rollout(
@@ -360,6 +348,8 @@ class LDFLightningModule(BasicLightningModule):
             ),
             condition_builder=condition_builder,
         )
+        if validate_contract:
+            result.final_step.inputs.validate()
         weights = self.cfg.get("loss") or {}
         return compute_velocity_loss(
             result.prediction,
@@ -373,8 +363,8 @@ class LDFLightningModule(BasicLightningModule):
             "vae_checkpoint_path": self.cfg.vae.checkpoint_path,
             "motion_stats_path": self.cfg.vae.params.motion_stats_path,
             "latent_stats_path": self.cfg.vae.params.latent_stats_path,
-            "root_stats_path": self.cfg.root_stats_path,
-            "text_embeddings_path": self.cfg.text_embeddings_path,
+            "root_stats_path": self.cfg.data.root_stats_path,
+            "text_embeddings_path": self.cfg.data.text_embeddings_path,
         }
         return {
             "paths": {
@@ -440,24 +430,36 @@ class LDFLightningModule(BasicLightningModule):
             base_seed + int(dataloader_idx) * 1_000_003 + int(batch_idx)
         )
         if probe == "teacher_cold":
-            rollout_steps, history_tokens = 1, 0
+            rollout_steps = 1
+            history_tokens: int | torch.Tensor = torch.zeros_like(
+                batch["span_token_count"]
+            )
         elif probe == "teacher_continuation":
             rollout_steps = 1
-            history_tokens = int(validation.get("continuation_history_tokens", 5))
+            history_tokens = self._validation_history_tokens(
+                batch,
+                rollout_steps=rollout_steps,
+                fallback=1,
+            )
         elif probe == "self_forcing":
-            rollout_steps = int(validation.get("self_forcing_steps", 5))
-            history_tokens = int(validation.get("self_forcing_history_tokens", 1))
+            rollout_steps = max(
+                int(row[1]) for row in self.cfg.self_forcing.k_schedule
+            )
+            history_tokens = self._validation_history_tokens(
+                batch,
+                rollout_steps=rollout_steps,
+                fallback=1,
+            )
         else:
             raise ValueError(f"unknown validation probe {probe!r}")
 
-        with self.ema.average_parameters(self._trainable_parameters):
-            loss_dict = self._step(
-                batch,
-                is_training=False,
-                generator=generator,
-                rollout_steps_override=rollout_steps,
-                initial_history_tokens=history_tokens,
-            )
+        loss_dict = self._step(
+            batch,
+            is_training=False,
+            generator=generator,
+            rollout_steps_override=rollout_steps,
+            initial_history_tokens=history_tokens,
+        )
         batch_size = int(batch["body_motion"].shape[0])
         for key, value in loss_dict.items():
             self.log(
@@ -471,5 +473,33 @@ class LDFLightningModule(BasicLightningModule):
             )
         return loss_dict
 
+    def _validation_history_tokens(
+        self,
+        batch,
+        *,
+        rollout_steps: int,
+        fallback: int,
+    ) -> torch.Tensor:
+        """Resolve deterministic early/middle/late H probes per sample."""
+
+        counts = batch["span_token_count"].to(dtype=torch.long)
+        maximum = counts - self.model.chunk_size - (int(rollout_steps) - 1)
+        if bool((maximum < 1).any()):
+            raise ValueError("continuation validation parent is too short")
+        positions = batch.get("validation_position")
+        if positions is None:
+            requested = torch.full_like(maximum, int(fallback))
+            return torch.minimum(requested.clamp_min(1), maximum)
+        history = torch.empty_like(maximum)
+        for index, position in enumerate(positions):
+            if position == "early":
+                history[index] = 1
+            elif position == "middle":
+                history[index] = max(1, int(maximum[index].item()) // 2)
+            elif position == "late":
+                history[index] = maximum[index]
+            else:
+                raise ValueError(f"unknown validation position {position!r}")
+        return history
 
 __all__ = ["LDFLightningModule"]

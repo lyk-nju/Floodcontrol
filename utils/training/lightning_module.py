@@ -1,7 +1,9 @@
 import time
+from contextlib import contextmanager
 
 import torch
 from lightning import LightningModule
+from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.utilities import rank_zero_info
 from torch.nn.modules.module import _IncompatibleKeys
 from torch_ema import ExponentialMovingAverage
@@ -39,6 +41,7 @@ class BasicLightningModule(LightningModule):
 
         self.last_batch_end_time, self.batch_ready_time = None, None
         self._skip_next_lightning_load_state_dict = False
+        self._ema_parameters_active = False
 
     def configure_optimizers(self):
         optim_target = self.cfg.optimizer.target
@@ -82,6 +85,9 @@ class BasicLightningModule(LightningModule):
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
         if "ema_state" in checkpoint:
             self.ema.load_state_dict(checkpoint["ema_state"])
+            # Older checkpoints may contain the temporary parameter copy made by
+            # torch_ema.average_parameters(). It is never part of the EMA model.
+            self.ema.collected_params = None
             rank_zero_info("init ema from ckpt")
         else:
             self.ema = ExponentialMovingAverage(
@@ -89,6 +95,8 @@ class BasicLightningModule(LightningModule):
                 decay=self.cfg.model.ema_decay,
             )
             rank_zero_info("init ema from current model weights")
+        self.ema.collected_params = None
+        self._ema_parameters_active = False
 
         # Compare state_dict and parameters
         log_state_dict_summary(
@@ -99,8 +107,52 @@ class BasicLightningModule(LightningModule):
         self._skip_next_lightning_load_state_dict = True
 
     def on_save_checkpoint(self, checkpoint):
-        checkpoint["ema_state"] = self.ema.state_dict()
+        if self._ema_parameters_active:
+            raise RuntimeError(
+                "cannot save a checkpoint while EMA parameters are active; "
+                "restore the training parameters first"
+            )
+        ema_state = dict(self.ema.state_dict())
+        ema_state["collected_params"] = None
+        checkpoint["ema_state"] = ema_state
         checkpoint["state_dict"] = self.model.state_dict()
+
+    def _activate_ema_parameters(self) -> None:
+        """Swap EMA shadows into the model once for an evaluation scope."""
+
+        if self._ema_parameters_active:
+            return
+        self.ema.to(self.device)
+        with torch.no_grad():
+            self.ema.store(self._trainable_parameters)
+            self.ema.copy_to(self._trainable_parameters)
+        self._ema_parameters_active = True
+
+    def _restore_training_parameters(self) -> None:
+        """Restore trainable weights and release torch_ema's temporary copy."""
+
+        if not self._ema_parameters_active:
+            self.ema.collected_params = None
+            return
+        try:
+            with torch.no_grad():
+                self.ema.restore(self._trainable_parameters)
+        finally:
+            self.ema.collected_params = None
+            self._ema_parameters_active = False
+
+    @contextmanager
+    def use_ema_parameters(self):
+        """Use EMA parameters without cloning again inside a nested scope."""
+
+        already_active = self._ema_parameters_active
+        if not already_active:
+            self._activate_ema_parameters()
+        try:
+            yield
+        finally:
+            if not already_active:
+                self._restore_training_parameters()
 
     def _step(self, batch, is_training=True):
         raise NotImplementedError
@@ -109,7 +161,7 @@ class BasicLightningModule(LightningModule):
         self.ema.to(self.device)
 
     def on_validation_start(self):
-        self.ema.to(self.device)
+        self._activate_ema_parameters()
 
     def on_train_batch_start(self, batch, batch_idx):
         self.batch_ready_time = time.time()
@@ -173,8 +225,7 @@ class BasicLightningModule(LightningModule):
                 self.log("ema_diff/avg", avg_diff, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
-        with self.ema.average_parameters(self._trainable_parameters):
-            loss_dict = self._step(batch, is_training=False)
+        loss_dict = self._step(batch, is_training=False)
         batch_size = int(batch["body_motion"].shape[0])
         for key, value in loss_dict.items():
             self.log(
@@ -185,3 +236,18 @@ class BasicLightningModule(LightningModule):
                 sync_dist=True,
                 batch_size=batch_size,
             )
+
+    def on_validation_epoch_end(self) -> None:
+        self._restore_training_parameters()
+
+
+class EMARestoreOnException(Callback):
+    """Keep an interrupted validation run from leaving EMA weights installed."""
+
+    def on_exception(self, trainer, pl_module, exception) -> None:
+        restore = getattr(pl_module, "_restore_training_parameters", None)
+        if restore is not None:
+            restore()
+
+
+__all__ = ["BasicLightningModule", "EMARestoreOnException"]

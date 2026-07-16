@@ -21,6 +21,7 @@ from utils.conditions.vae import (
 from utils.motion_process import recover_local_root
 from utils.token_frame import (
     FRAMES_PER_TOKEN,
+    MOTION_FPS,
     frame_count_to_token_count,
     frame_valid_to_token_valid,
     prefix_valid_token_count,
@@ -85,11 +86,10 @@ class BodyVAE(nn.Module):
         decoder_layers: int = 6,
         kernel_size: int = 3,
         dropout: float = 0.0,
-        fps: float = 20.0,
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
-        self.fps = float(fps)
+        self.fps = MOTION_FPS
         body_mean, body_std, local_mean, local_std = _load_motion_statistics(
             motion_stats_path
         )

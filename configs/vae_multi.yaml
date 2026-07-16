@@ -6,6 +6,9 @@ save_dir: /data1/yuankai/text2Motion/Floodcontrol/vae
 resume_ckpt: null
 test_ckpt: null
 
+wandb_info:
+  project: VAE_Flood
+
 trainer:
   max_steps: 300000
   accelerator: gpu
@@ -51,7 +54,6 @@ model:
     decoder_layers: 6
     kernel_size: 3
     dropout: 0.0
-    fps: 20.0
     motion_stats_path: ${dirs.raw_data}/HumanML3D_BABEL_motion_stats.npz
     latent_stats_path: null
 

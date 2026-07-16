@@ -188,9 +188,7 @@ class WanCrossAttention(nn.Module):
             # context so both FlashAttention and SDPA remain numerically
             # defined; their projected outputs are then removed exactly.
             flat_context_lens = context_lens.reshape(-1).clamp_min(1)
-            flat_query_lens = torch.ones(
-                flat_batch, device=value.device, dtype=torch.long
-            )
+            flat_query_lens = query_mask.reshape(-1).to(dtype=torch.long)
             out = attention(
                 q,
                 k,
@@ -292,16 +290,28 @@ class WanTransformerBlock(nn.Module):
         return value
 
 
-def embed_text_context(
+def project_unique_text_context(
     projection: nn.Module,
     context: list[torch.Tensor],
     *,
     text_len: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad and project one text feature sequence per sample."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project unique tensor identities and return per-entry prompt IDs."""
     if not context:
         raise ValueError("text context cannot be empty")
+    projection_parameter = next(projection.parameters(), None)
+    if projection_parameter is None:
+        raise ValueError("text projection must own at least one parameter")
+    # Under mixed-precision autocast, retain the stored BF16/FP16 text dtype
+    # instead of materializing an FP32 [N,L,4096] temporary. Outside autocast,
+    # match the projection parameters so evaluation and Web inference remain
+    # dtype-safe.
+    projection_dtype = (
+        torch.get_autocast_dtype(device.type)
+        if torch.is_autocast_enabled(device.type)
+        else projection_parameter.dtype
+    )
     unique: list[torch.Tensor] = []
     unique_by_identity: dict[int, int] = {}
     gather_indices: list[int] = []
@@ -311,21 +321,23 @@ def embed_text_context(
             unique_by_identity[identity] = len(unique)
             unique.append(item)
         gather_indices.append(unique_by_identity[identity])
-    lengths = torch.tensor(
-        [min(int(item.shape[0]), int(text_len)) for item in context],
-        device=device,
-        dtype=torch.long,
-    )
-    padded_length = max(1, int(lengths.max().item()))
+    unique_lengths_list = [
+        min(int(item.shape[0]), int(text_len)) for item in unique
+    ]
+    padded_length = max(1, max(unique_lengths_list))
     padded_unique = torch.stack(
         [
             torch.cat(
                 [
-                    item[:padded_length].to(device),
-                    item.new_zeros(
-                        max(0, padded_length - item.shape[0]), item.shape[-1]
-                    ).to(
-                        device
+                    item[:padded_length].to(
+                        device=device,
+                        dtype=projection_dtype,
+                    ),
+                    torch.zeros(
+                        max(0, padded_length - item.shape[0]),
+                        item.shape[-1],
+                        device=device,
+                        dtype=projection_dtype,
                     ),
                 ],
                 dim=0,
@@ -335,8 +347,32 @@ def embed_text_context(
         dim=0,
     )
     projected_unique = projection(padded_unique)
+    unique_lengths = torch.tensor(
+        unique_lengths_list, device=device, dtype=torch.long
+    )
     indices = torch.tensor(gather_indices, device=device, dtype=torch.long)
-    return projected_unique.index_select(0, indices), lengths
+    return projected_unique, unique_lengths, indices
+
+
+def embed_text_context(
+    projection: nn.Module,
+    context: list[torch.Tensor],
+    *,
+    text_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad and project one text feature sequence per timeline entry."""
+
+    projected, unique_lengths, prompt_ids = project_unique_text_context(
+        projection,
+        context,
+        text_len=text_len,
+        device=device,
+    )
+    return (
+        projected.index_select(0, prompt_ids),
+        unique_lengths.index_select(0, prompt_ids),
+    )
 
 
 __all__ = [
@@ -347,5 +383,6 @@ __all__ = [
     "WanTransformerBlock",
     "apply_rope_with_position_ids",
     "embed_text_context",
+    "project_unique_text_context",
     "sinusoidal_embedding_1d",
 ]

@@ -61,6 +61,21 @@ def test_babel_is_independent_and_parses_segmented_text(tmp_path):
     ]
 
 
+def test_babel_ignores_annotations_without_positive_motion_overlap(tmp_path):
+    texts = write_npz(tmp_path, "sample")
+    (texts / "sample.txt").write_text(
+        "walk#walk/VERB#0.0#0.4\n"
+        "zero#zero/NOUN#0.5#0.5\n"
+        "reverse#reverse/VERB#1.0#0.5\n"
+        "past#past/NOUN#2.0#3.0\n"
+    )
+    dataset = BABELDataset(
+        meta_paths=[tmp_path / "train.txt"], split="train", text_path="texts"
+    )
+
+    assert [item["text"] for item in dataset[0]["text_data"]] == ["walk"]
+
+
 def test_babel_preprocess_copies_text_and_writes_minimal_motion(tmp_path):
     source = tmp_path / "BABEL_streamed"
     (source / "motions").mkdir(parents=True)

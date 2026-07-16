@@ -18,6 +18,7 @@ import torch
 
 
 FRAMES_PER_TOKEN = 4
+MOTION_FPS = 20.0
 
 
 def _non_negative_integer(name: str, value: int) -> int:
@@ -151,6 +152,7 @@ def prefix_valid_token_count(token_mask: torch.Tensor) -> torch.Tensor:
 
 __all__ = [
     "FRAMES_PER_TOKEN",
+    "MOTION_FPS",
     "aligned_frame_floor",
     "commit_index_to_frame_count",
     "frame_count_to_token_count",

@@ -10,12 +10,15 @@ from utils.conditions.ldf import (
     create_cfg_condition,
     create_ldf_condition,
     create_window_condition,
+    expand_null_timeline,
 )
 from utils.motion_process import recover_local_root
 
 
-def _text(batch=1, dim=8):
-    return [torch.ones(2, dim) for _ in range(batch)], [torch.zeros(1, dim) for _ in range(batch)]
+def _text(batch=1, tokens=1, dim=8):
+    prompts = [torch.ones(2, dim) for _ in range(batch)]
+    timeline = [prompt for prompt in prompts for _ in range(tokens)]
+    return timeline, [torch.zeros(1, dim) for _ in range(batch)]
 
 
 def test_backward_local_root_cold_start_and_forward_motion():
@@ -46,7 +49,7 @@ def test_local_velocity_is_invariant_to_global_yaw_rotation():
 
 
 def test_heading_mask_must_be_paired():
-    text, null = _text()
+    text, null = _text(tokens=2)
     value = torch.zeros(1, 2, 4, 5)
     mask = torch.zeros_like(value, dtype=torch.bool)
     mask[..., 3] = True
@@ -73,14 +76,14 @@ def test_window_compile_packs_sparse_future_tokens_and_cfg_is_read_only():
     assert condition.root_condition_value.shape == (1, 4, 4, 5)
     assert condition.future_valid_mask.tolist() == [[True, False]]
     original = condition.future_valid_mask.clone()
-    branches = create_cfg_condition(condition)
+    branches = create_cfg_condition(condition, token_length=4)
     assert torch.equal(condition.future_valid_mask, original)
     assert not branches["history"].future_valid_mask.any()
     assert branches["constraint"].future_valid_mask.any()
 
 
 def test_timeline_and_rope_positions_remain_distinct_after_window_roll():
-    text, null = _text()
+    text, null = _text(tokens=4)
     root = torch.zeros(1, 40, 5)
     mask = torch.zeros_like(root, dtype=torch.bool)
     # window_origin=3 and window_tokens=4 place future tokens at absolute 7 and 8.
@@ -118,7 +121,7 @@ def test_timeline_and_rope_positions_remain_distinct_after_window_roll():
 
 
 def test_future_timeline_positions_cannot_overlap_current_window():
-    text, null = _text()
+    text, null = _text(tokens=4)
     condition = LDFCondition(
         text_context=text,
         text_null_context=null,
@@ -145,7 +148,7 @@ def test_future_timeline_positions_cannot_overlap_current_window():
 
 
 def test_future_valid_mask_must_match_observed_constraint_tokens():
-    text, null = _text()
+    text, null = _text(tokens=4)
     condition = LDFCondition(
         text_context=text,
         text_null_context=null,
@@ -174,4 +177,45 @@ def test_previous_root_frame_and_validity_mask_are_paired():
         condition=LDFCondition(text, null),
     )
     with pytest.raises(ValueError, match="must both be set"):
+        inputs.validate()
+
+
+def test_conditional_text_is_strictly_token_aligned_and_cfg_expands_nulls():
+    prompt = torch.ones(2, 8)
+    null = torch.zeros(1, 8)
+    static = LDFCondition([prompt], [null])
+    with pytest.raises(ValueError, match=r"B\*T=3"):
+        static.validate_structure(batch_size=1, token_length=3, latent_dim=8)
+
+    timeline = [prompt, prompt, prompt]
+    condition = LDFCondition(timeline, [null])
+    condition.validate_structure(batch_size=1, token_length=3, latent_dim=8)
+    assert all(item is prompt for item in condition.text_context)
+    expanded = expand_null_timeline(condition.text_null_context, 3)
+    assert all(item is null for item in expanded)
+
+    branches = create_cfg_condition(condition, token_length=3)
+    assert branches["joint"] is condition
+    assert all(item is null for item in branches["history"].text_context)
+    assert all(item is null for item in branches["constraint"].text_context)
+    assert all(item is prompt for item in branches["text"].text_context)
+
+
+def test_structure_validation_does_not_replace_full_semantic_validation():
+    text, null = _text(tokens=2)
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(
+            torch.zeros(1, 2, 4, 5), torch.zeros(1, 2, 8)
+        ),
+        beta=torch.tensor([[1.5, 1.5]]),
+        history_mask=torch.zeros(1, 2, dtype=torch.bool),
+        generation_mask=torch.ones(1, 2, dtype=torch.bool),
+        timeline_position_ids=torch.arange(2)[None],
+        rope_position_ids=torch.arange(2)[None],
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=LDFCondition(text, null),
+    )
+    inputs.validate_structure()
+    with pytest.raises(ValueError, match=r"\[0,1\]"):
         inputs.validate()

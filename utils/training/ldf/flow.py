@@ -10,28 +10,29 @@ from utils.conditions.ldf import HybridMotion
 def build_span_beta(
     *,
     span_tokens: int,
-    initial_history_tokens: int,
+    initial_history_tokens: torch.Tensor,
     active_tokens: int,
     phase_offset: torch.Tensor,
     step_index: int,
 ) -> torch.Tensor:
-    """Return history/active/frontier beta from one continuous formula."""
+    """Return per-sample history/active/frontier beta from one formula."""
 
     span_tokens = int(span_tokens)
-    history_end = int(initial_history_tokens) + int(step_index)
     active_tokens = int(active_tokens)
     if span_tokens <= 0 or active_tokens <= 0:
         raise ValueError("span_tokens and active_tokens must be positive")
-    if history_end < 0 or history_end + active_tokens > span_tokens:
-        raise ValueError("active band does not fit inside the source span")
     if not torch.is_tensor(phase_offset) or phase_offset.ndim != 1:
         raise TypeError("phase_offset must be a floating [B] tensor")
     if not phase_offset.is_floating_point():
         raise TypeError("phase_offset must be floating point")
-    if bool((phase_offset < 0).any()) or bool(
-        (phase_offset >= 1.0 / active_tokens).any()
-    ):
-        raise ValueError("phase_offset must lie in [0,1/active_tokens)")
+    history = torch.as_tensor(
+        initial_history_tokens,
+        device=phase_offset.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    if tuple(history.shape) != tuple(phase_offset.shape):
+        raise ValueError("initial_history_tokens and phase_offset must both be [B]")
+    history_end = history + int(step_index)
 
     positions = torch.arange(
         span_tokens,
@@ -39,7 +40,8 @@ def build_span_beta(
         dtype=phase_offset.dtype,
     )
     return torch.clamp(
-        (positions[None] - float(history_end) + 1.0) / float(active_tokens)
+        (positions[None] - history_end[:, None].to(phase_offset.dtype) + 1.0)
+        / float(active_tokens)
         - phase_offset[:, None],
         min=0.0,
         max=1.0,

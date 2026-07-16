@@ -29,6 +29,7 @@ positions只从x/z减去planar root，y保留世界高度。rotations和velociti
 ## Token与因果合同
 
 - `utils/token_frame.py`唯一拥有`FRAMES_PER_TOKEN=4`及frame/token换算；模型输入帧数必须整除4，模型、Dataset和runtime不得自行向上取整或静默截断。
+- `utils/token_frame.py`同时唯一定义`MOTION_FPS=20.0`。VAE直接读取这个项目时间协议，不在`vae.params`中暴露一个可与数据协议产生分歧的`fps`实验参数。
 - encoder在进入网络前将连续四帧reshape为一个patch；不存在首帧特殊token。
 - encoder/decoder均在token轴使用causal convolution，token t不读取t+1。
 - decoder每次读取一个128D latent token和一个`[4,4]` local-root patch，严格输出四帧。

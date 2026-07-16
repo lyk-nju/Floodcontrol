@@ -5,5 +5,4 @@ dirs:
 
 wandb_info:
     key: "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"
-    project: "VAE_Flood"
     entity: "laiyuankia-nanjing-university"

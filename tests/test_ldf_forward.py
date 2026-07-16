@@ -29,7 +29,8 @@ def make_model():
 def make_input(batch=2, tokens=6):
     root = torch.randn(batch, tokens, 4, 5)
     latent = torch.randn(batch, tokens, 8)
-    text = [torch.randn(3, 8) for _ in range(batch)]
+    prompts = [torch.randn(3, 8) for _ in range(batch)]
+    text = [prompt for prompt in prompts for _ in range(tokens)]
     null = [torch.zeros(1, 8) for _ in range(batch)]
     condition = LDFCondition(text, null)
     return LDFInput(
@@ -107,6 +108,80 @@ def test_changing_active_xz_condition_changes_root_prediction():
     assert not torch.allclose(predict(first_value), predict(second_value))
 
 
+def test_active_xz_condition_preserves_noisy_root_as_an_independent_input():
+    torch.manual_seed(6)
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=4)
+    mask = torch.zeros_like(inputs.noisy_motion.root_motion, dtype=torch.bool)
+    mask[..., 0] = True
+    mask[..., 2] = True
+    condition = LDFCondition(
+        inputs.condition.text_context,
+        inputs.condition.text_null_context,
+        root_condition_value=torch.zeros_like(inputs.noisy_motion.root_motion),
+        root_condition_mask=mask,
+    )
+
+    changed_root = inputs.noisy_motion.root_motion.clone()
+    changed_root[..., 0] += 17.0
+    changed_root[..., 2] -= 17.0
+    changed = LDFInput(
+        **{
+            **inputs.__dict__,
+            "noisy_motion": HybridMotion(
+                changed_root,
+                inputs.noisy_motion.latent_motion,
+            ),
+            "condition": condition,
+        }
+    )
+    original = LDFInput(**{**inputs.__dict__, "condition": condition})
+
+    with torch.no_grad():
+        original_velocity = model(original).velocity.root_motion
+        changed_velocity = model(changed).velocity.root_motion
+    assert not torch.allclose(original_velocity, changed_velocity)
+
+
+def test_unobserved_active_root_values_cannot_leak_through_condition_input():
+    torch.manual_seed(7)
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=4)
+    mask = torch.zeros_like(inputs.noisy_motion.root_motion, dtype=torch.bool)
+    mask[..., 0] = True
+    mask[..., 2] = True
+    first_value = torch.zeros_like(inputs.noisy_motion.root_motion)
+    second_value = first_value.clone()
+    second_value[..., 1] = 100.0
+    second_value[..., 3:] = -100.0
+
+    def predict(value):
+        condition = LDFCondition(
+            inputs.condition.text_context,
+            inputs.condition.text_null_context,
+            root_condition_value=value,
+            root_condition_mask=mask,
+        )
+        conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
+        return model(conditioned).velocity.root_motion
+
+    with torch.no_grad():
+        assert torch.equal(predict(first_value), predict(second_value))
+
+
+def test_bfloat16_text_runs_with_float32_model_without_autocast():
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=4)
+    condition = LDFCondition(
+        [value.bfloat16() for value in inputs.condition.text_context],
+        [value.bfloat16() for value in inputs.condition.text_null_context],
+    )
+    conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
+    with torch.no_grad():
+        output = model(conditioned)
+    assert output.velocity.root_motion.dtype == torch.float32
+
+
 def test_body_heading_is_derived_from_clean_root():
     model = make_model()
     inputs = make_input(batch=1, tokens=4)
@@ -121,7 +196,7 @@ def test_future_root_uses_generation_centered_rope_without_extending_body():
     model = make_model().eval()
     root = torch.randn(1, 4, 4, 5)
     latent = torch.randn(1, 4, 8)
-    text = [torch.randn(3, 8)]
+    text = [torch.randn(3, 8) for _ in range(4)]
     null = [torch.zeros(1, 8)]
     condition = LDFCondition(
         text_context=text,
@@ -293,3 +368,47 @@ def test_local_root_uses_per_sample_previous_root_validity():
     assert valid[1, 0, 0].all()
     assert torch.allclose(local[0, 0, 0, :3], torch.zeros(3))
     assert torch.allclose(local[1, 0, 0, 1], torch.tensor(20.0))
+
+
+def test_invisible_motion_and_text_tail_cannot_change_visible_predictions():
+    torch.manual_seed(29)
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=6)
+    visible = torch.tensor([[True, True, True, True, False, False]])
+    inputs = LDFInput(
+        **{
+            **inputs.__dict__,
+            "generation_mask": visible,
+        }
+    )
+    changed_root = inputs.noisy_motion.root_motion.clone()
+    changed_latent = inputs.noisy_motion.latent_motion.clone()
+    changed_root[:, 4:] += 1000.0
+    changed_latent[:, 4:] -= 1000.0
+    changed_text = list(inputs.condition.text_context)
+    changed_text[4] = torch.full_like(changed_text[4], 1000.0)
+    changed_text[5] = torch.full_like(changed_text[5], -1000.0)
+    changed_condition = LDFCondition(
+        changed_text, inputs.condition.text_null_context
+    )
+    changed_inputs = LDFInput(
+        **{
+            **inputs.__dict__,
+            "noisy_motion": HybridMotion(changed_root, changed_latent),
+            "condition": changed_condition,
+        }
+    )
+
+    with torch.no_grad():
+        original = model(inputs)
+        changed = model(changed_inputs)
+    assert torch.equal(
+        original.velocity.root_motion[:, :4],
+        changed.velocity.root_motion[:, :4],
+    )
+    assert torch.equal(
+        original.velocity.latent_motion[:, :4],
+        changed.velocity.latent_motion[:, :4],
+    )
+    assert not original.velocity.root_motion[:, 4:].any()
+    assert not original.velocity.latent_motion[:, 4:].any()

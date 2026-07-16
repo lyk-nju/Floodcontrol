@@ -29,6 +29,15 @@ def _length_mask(
     return torch.arange(length, device=device)[None] < lengths[:, None]
 
 
+def _pack_valid_prefix(
+    value: torch.Tensor, lengths: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack row-major valid prefixes without Python scalar extraction."""
+
+    valid = torch.arange(value.shape[1], device=value.device)[None] < lengths[:, None]
+    return value[valid].contiguous(), valid
+
+
 def _sdpa_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -88,6 +97,7 @@ def flash_attention(
 ) -> torch.Tensor:
     """Run FlashAttention when possible, otherwise use the exact SDPA fallback."""
     del version
+    fixed_length = q_lens is None and k_lens is None
     can_flash = (
         FLASH_ATTN_2_AVAILABLE
         and q.device.type == "cuda"
@@ -107,6 +117,20 @@ def flash_attention(
             causal=causal,
         )
 
+    if q_scale is not None:
+        q = q * float(q_scale)
+    if fixed_length:
+        return flash_attn.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=float(dropout_p),
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            deterministic=deterministic,
+        )
+
     batch, q_len, k_len = q.shape[0], q.shape[1], k.shape[1]
     q_lens = (
         torch.full((batch,), q_len, device=q.device, dtype=torch.int32)
@@ -118,9 +142,11 @@ def flash_attention(
         if k_lens is None
         else k_lens.to(device=q.device, dtype=torch.int32)
     )
-    q_flat = torch.cat([row[: int(length)] for row, length in zip(q, q_lens)])
-    k_flat = torch.cat([row[: int(length)] for row, length in zip(k, k_lens)])
-    v_flat = torch.cat([row[: int(length)] for row, length in zip(v, k_lens)])
+    if tuple(q_lens.shape) != (batch,) or tuple(k_lens.shape) != (batch,):
+        raise ValueError("q_lens and k_lens must be [B]")
+    q_flat, q_valid = _pack_valid_prefix(q, q_lens)
+    k_flat, k_valid = _pack_valid_prefix(k, k_lens)
+    v_flat, _ = _pack_valid_prefix(v, k_lens)
     cu_q = torch.cat([q_lens.new_zeros(1), q_lens]).cumsum(0, dtype=torch.int32)
     cu_k = torch.cat([k_lens.new_zeros(1), k_lens]).cumsum(0, dtype=torch.int32)
     out_flat = flash_attn.flash_attn_varlen_func(
@@ -138,10 +164,7 @@ def flash_attention(
         deterministic=deterministic,
     )
     out = q.new_zeros(batch, q_len, *out_flat.shape[1:])
-    offset = 0
-    for batch_idx, length in enumerate(q_lens.tolist()):
-        out[batch_idx, :length] = out_flat[offset : offset + length]
-        offset += length
+    out[q_valid] = out_flat
     return out
 
 

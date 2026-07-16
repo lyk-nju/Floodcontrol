@@ -18,8 +18,8 @@ def compute_velocity_loss(
     """Compute root/body flow-v MSE only on the active band."""
 
     mask = training_step.loss_mask
-    if mask.dtype != torch.bool or not bool(mask.any()):
-        raise ValueError("loss_mask must select at least one active token")
+    if mask.dtype != torch.bool:
+        raise TypeError("loss_mask must be bool")
     root_error = (
         prediction.velocity.root_motion
         - training_step.target_velocity.root_motion

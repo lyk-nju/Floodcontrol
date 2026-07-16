@@ -19,9 +19,11 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 from utils.initialize import instantiate_target
 from utils.motion_process import BODY_DIM, ROOT_DIM, rotate_motion_yaw, rotate_root_yaw
 from utils.token_frame import FRAMES_PER_TOKEN
+from utils.training.ldf.self_forcing import validate_self_forcing_config
 
 
 _SEED_MASK = (1 << 64) - 1
+_LENGTH_BUCKET_FRAMES = 20
 
 
 def _mix_seed(values: list[int]) -> int:
@@ -220,34 +222,28 @@ class ResumableDataLoader(DataLoader):
 
 
 class LDFSpanCollator:
-    """Crop one batch-shared physical span without constructing diffusion state."""
+    """Build natural-length parent windows for scaled-ARDY LDF sampling."""
 
     def __init__(
         self,
         *,
         min_frames: int,
         max_frames: int,
+        generation_tokens: int,
         encoder_context_tokens: int,
         training: bool,
         random_yaw: bool = False,
-        cold_start_probability: float = 0.1,
-        cold_start: bool | None = None,
         validation_probe: str | None = None,
-        validation_span_frames: int | None = None,
         validation_positions: tuple[str, ...] | None = None,
     ):
         self.min_frames = int(min_frames)
         self.max_frames = int(max_frames)
+        self.generation_tokens = int(generation_tokens)
         self.encoder_context_tokens = int(encoder_context_tokens)
         self.context_frames = self.encoder_context_tokens * FRAMES_PER_TOKEN
         self.training = bool(training)
         self.random_yaw = bool(random_yaw and training)
-        self.cold_start_probability = float(cold_start_probability)
-        self.cold_start = cold_start
         self.validation_probe = validation_probe
-        self.validation_span_frames = (
-            None if validation_span_frames is None else int(validation_span_frames)
-        )
         self.validation_positions = validation_positions
 
         for name, value in (
@@ -258,27 +254,15 @@ class LDFSpanCollator:
                 raise ValueError(f"{name} must be a positive multiple of four")
         if self.min_frames > self.max_frames:
             raise ValueError("min_frames must not exceed max_frames")
+        if self.generation_tokens <= 0:
+            raise ValueError("generation_tokens must be positive")
+        if self.min_frames < self.generation_tokens * FRAMES_PER_TOKEN:
+            raise ValueError("min_frames must fit one complete generation window")
         if self.encoder_context_tokens < 0:
             raise ValueError("encoder_context_tokens must be non-negative")
-        if not 0.0 <= self.cold_start_probability <= 1.0:
-            raise ValueError("cold_start_probability must lie in [0,1]")
-        if self.validation_span_frames is not None:
-            if self.training:
-                raise ValueError("validation_span_frames is only valid for validation")
-            if (
-                self.validation_span_frames < self.min_frames
-                or self.validation_span_frames > self.max_frames
-                or self.validation_span_frames % FRAMES_PER_TOKEN
-            ):
-                raise ValueError(
-                    "validation_span_frames must be a four-frame multiple within "
-                    "[min_frames,max_frames]"
-                )
         if self.validation_positions is not None:
-            if self.training or self.cold_start is not False:
-                raise ValueError(
-                    "validation_positions requires a continuation validation collator"
-                )
+            if self.training:
+                raise ValueError("validation_positions are only valid for validation")
             allowed = {"early", "middle", "late"}
             if not self.validation_positions or not set(
                 self.validation_positions
@@ -287,65 +271,21 @@ class LDFSpanCollator:
                     "validation_positions may only contain early/middle/late"
                 )
 
-    def _select_cold_start(self, rng=random) -> bool:
-        if self.cold_start is not None:
-            return bool(self.cold_start)
-        if not self.training:
-            return True
-        return rng.random() < self.cold_start_probability
-
-    def _select_span_tokens(
-        self, samples: list[dict[str, object]], rng=random
-    ) -> int:
-        available = min(
-            int(sample["root_motion"].shape[0]) // FRAMES_PER_TOKEN
-            for sample in samples
-        )
-        minimum = self.min_frames // FRAMES_PER_TOKEN
-        maximum = min(available, self.max_frames // FRAMES_PER_TOKEN)
-        if maximum < minimum:
-            identities = ", ".join(
-                f"{sample['dataset']}/{sample['name']}" for sample in samples
-            )
-            raise ValueError(
-                f"LDF span requires at least {self.min_frames} frames; "
-                f"short batch contains {identities}"
-            )
-        if self.training:
-            return rng.randint(minimum, maximum)
-        if self.validation_span_frames is not None:
-            requested = self.validation_span_frames // FRAMES_PER_TOKEN
-            if requested > maximum:
-                raise ValueError(
-                    "validation sample is shorter than validation_span_frames"
-                )
-            return requested
-        return maximum
-
     def _select_start_token(
         self,
         *,
         available_tokens: int,
         span_tokens: int,
-        cold_start: bool,
-        validation_position: str | None = None,
         rng=random,
     ) -> int:
-        if cold_start:
-            return 0
         maximum = available_tokens - span_tokens
+        if maximum <= 0:
+            return 0
+        if self.validation_probe == "teacher_cold":
+            return 0
         if self.training:
             return rng.randint(0, maximum)
-        if maximum <= 0:
-            raise ValueError(
-                "continuation validation requires at least one source token before "
-                "the active span"
-            )
-        if validation_position == "early":
-            return 1
-        if validation_position == "late":
-            return maximum
-        return max(1, maximum // 2)
+        return maximum // 2
 
     def _select_caption(
         self,
@@ -446,9 +386,6 @@ class LDFSpanCollator:
         self,
         sample: dict[str, object],
         *,
-        span_tokens: int,
-        cold_start: bool,
-        validation_position: str | None = None,
         rng=random,
         torch_generator: torch.Generator | None = None,
     ) -> dict[str, object]:
@@ -456,25 +393,28 @@ class LDFSpanCollator:
         full_body = sample["body_motion"]
         full_feature_valid = sample["body_feature_valid_mask"]
         available_tokens = int(full_root.shape[0]) // FRAMES_PER_TOKEN
+        minimum_tokens = self.min_frames // FRAMES_PER_TOKEN
+        if available_tokens < minimum_tokens:
+            raise ValueError(
+                f"{sample['dataset']}/{sample['name']} has fewer than "
+                f"{self.min_frames} frames"
+            )
+        span_tokens = min(available_tokens, self.max_frames // FRAMES_PER_TOKEN)
         start_token = self._select_start_token(
             available_tokens=available_tokens,
             span_tokens=span_tokens,
-            cold_start=cold_start,
-            validation_position=validation_position,
             rng=rng,
         )
         start = start_token * FRAMES_PER_TOKEN
         frames = span_tokens * FRAMES_PER_TOKEN
         end = start + frames
 
-        context_tokens = 0 if cold_start else min(
-            start_token, self.encoder_context_tokens
-        )
+        context_tokens = min(start_token, self.encoder_context_tokens)
         context_start = start - context_tokens * FRAMES_PER_TOKEN
         joined_root = full_root[context_start:end].clone()
         joined_body = full_body[context_start:end].clone()
         joined_valid = full_feature_valid[context_start:end].clone()
-        previous = full_root[start - 1].clone() if start > 0 and not cold_start else None
+        previous = full_root[start - 1].clone() if start > 0 else None
 
         if self.random_yaw:
             angle = torch.rand(
@@ -500,6 +440,7 @@ class LDFSpanCollator:
             "body_with_context": joined_body,
             "body_with_context_feature_valid_mask": joined_valid,
             "context_token_count": context_tokens,
+            "span_token_count": span_tokens,
             "previous_root_frame": previous,
             "source_start_token": start_token,
             "prompt_timeline": self._prompt_timeline(
@@ -526,8 +467,6 @@ class LDFSpanCollator:
         else:
             rng = random
             torch_generator = None
-        cold_start = self._select_cold_start(rng)
-        span_tokens = self._select_span_tokens(samples, rng)
         spans = []
         for sample in samples:
             validation_position = None
@@ -538,15 +477,13 @@ class LDFSpanCollator:
                 ]
             span = self._crop_sample(
                 sample,
-                span_tokens=span_tokens,
-                cold_start=cold_start,
-                validation_position=validation_position,
                 rng=rng,
                 torch_generator=torch_generator,
             )
             span["validation_position"] = validation_position
             spans.append(span)
         batch_size = len(spans)
+        span_tokens = max(int(item["span_token_count"]) for item in spans)
         span_frames = span_tokens * FRAMES_PER_TOKEN
         total_frames = max(int(item["body_with_context"].shape[0]) for item in spans)
 
@@ -555,7 +492,7 @@ class LDFSpanCollator:
         feature_valid = torch.zeros(
             batch_size, span_frames, BODY_DIM, dtype=torch.bool
         )
-        frame_valid = torch.ones(batch_size, span_frames, dtype=torch.bool)
+        frame_valid = torch.zeros(batch_size, span_frames, dtype=torch.bool)
         body_with_context = torch.zeros(batch_size, total_frames, BODY_DIM)
         context_feature_valid = torch.zeros(
             batch_size, total_frames, BODY_DIM, dtype=torch.bool
@@ -565,11 +502,18 @@ class LDFSpanCollator:
         previous = torch.zeros(batch_size, ROOT_DIM)
         previous_valid = torch.zeros(batch_size, dtype=torch.bool)
         source_start = torch.zeros(batch_size, dtype=torch.long)
+        span_token_count = torch.zeros(batch_size, dtype=torch.long)
 
         for index, item in enumerate(spans):
-            root[index] = item["root_motion"]
-            body[index] = item["body_motion"]
-            feature_valid[index] = item["body_feature_valid_mask"]
+            sample_tokens = int(item["span_token_count"])
+            sample_frames = sample_tokens * FRAMES_PER_TOKEN
+            root[index, :sample_frames] = item["root_motion"]
+            body[index, :sample_frames] = item["body_motion"]
+            feature_valid[index, :sample_frames] = item[
+                "body_feature_valid_mask"
+            ]
+            frame_valid[index, :sample_frames] = True
+            span_token_count[index] = sample_tokens
             source = item["body_with_context"]
             encoder_frames = int(source.shape[0])
             body_with_context[index, :encoder_frames] = source
@@ -595,13 +539,14 @@ class LDFSpanCollator:
             "previous_root_frame": previous,
             "previous_root_valid_mask": previous_valid,
             "source_start_token": source_start,
-            "cold_start_mask": torch.full(
-                (batch_size,), cold_start, dtype=torch.bool
-            ),
-            "span_token_count": span_tokens,
+            "span_token_count": span_token_count,
             "dataset": [str(item["dataset"]) for item in spans],
             "name": [str(item["name"]) for item in spans],
-            "prompt_timeline": [item["prompt_timeline"] for item in spans],
+            "prompt_timeline": [
+                item["prompt_timeline"]
+                + [""] * (span_tokens - int(item["span_token_count"]))
+                for item in spans
+            ],
         }
         if self.validation_probe is not None:
             output["validation_probe"] = self.validation_probe
@@ -612,10 +557,12 @@ class LDFSpanCollator:
         return output
 
 
-def create_dataset(cfg, split: str):
+def create_dataset(cfg, split: str, *, meta_paths=None):
     common_args = {"split": split, "fps": float(cfg.model.params.fps)}
     dataset_configs = cfg.data.get("datasets", None)
     if dataset_configs:
+        if meta_paths is not None:
+            raise ValueError("explicit probe meta paths require a single-source dataset")
         dataset = instantiate_target(
             cfg.data.target,
             cfg=None,
@@ -623,13 +570,17 @@ def create_dataset(cfg, split: str):
             **common_args,
         )
         return MinimumFrameDataset(dataset, min_frames=int(cfg.data.min_frames))
-    meta_paths = cfg.data.get(f"{split}_meta_paths", None)
-    if not meta_paths:
+    resolved_meta_paths = (
+        meta_paths
+        if meta_paths is not None
+        else cfg.data.get(f"{split}_meta_paths", None)
+    )
+    if not resolved_meta_paths:
         raise RuntimeError(f"set data.{split}_meta_paths to processed motion splits")
     dataset = instantiate_target(
         cfg.data.target,
         cfg=None,
-        meta_paths=meta_paths,
+        meta_paths=resolved_meta_paths,
         artifact_path=cfg.data.get("artifact_path", "artifacts"),
         text_path=cfg.data.get("text_path"),
         **common_args,
@@ -642,8 +593,40 @@ def create_dataloaders(
     *,
     encoder_context_tokens: int,
 ) -> tuple[DataLoader | None, list[DataLoader]]:
+    training = cfg.get("training") or {}
+    window = training.get("window") or {}
+    max_tokens = int(window.get("max_tokens", 0))
+    generation_tokens = int(window.get("generation_tokens", 0))
+    if max_tokens <= 0 or generation_tokens <= 0:
+        raise ValueError(
+            "training.window.max_tokens and generation_tokens must be positive"
+        )
+    if generation_tokens != int(cfg.model.params.chunk_size):
+        raise ValueError(
+            "training.window.generation_tokens must equal model.params.chunk_size"
+        )
+    if max_tokens * FRAMES_PER_TOKEN != int(cfg.data.max_frames):
+        raise ValueError(
+            "data.max_frames must equal training.window.max_tokens * four frames"
+        )
     train_dataset = create_dataset(cfg, "train") if cfg.train else None
     val_dataset = create_dataset(cfg, "val")
+    self_forcing = cfg.get("self_forcing")
+    maximum_rollout = 1
+    if self_forcing is not None and bool(self_forcing.get("enabled", False)):
+        schedule = validate_self_forcing_config(
+            self_forcing,
+            generation_tokens=generation_tokens,
+            max_window_tokens=max_tokens,
+            max_steps=int(cfg.trainer.max_steps),
+        )
+        maximum_rollout = max(rollout_steps for _, rollout_steps in schedule)
+        if train_dataset is not None:
+            train_dataset = MinimumFrameDataset(
+                train_dataset,
+                min_frames=(generation_tokens + maximum_rollout - 1)
+                * FRAMES_PER_TOKEN,
+            )
     common = {
         "num_workers": int(cfg.data.num_workers),
         "pin_memory": bool(cfg.data.get("pin_memory", True)),
@@ -653,7 +636,7 @@ def create_dataloaders(
         batch_sampler = LengthBucketBatchSampler(
             train_dataset,
             batch_size=int(cfg.data.train_batch_size),
-            bucket_width_frames=int(cfg.data.get("length_bucket_frames", 20)),
+            bucket_width_frames=_LENGTH_BUCKET_FRAMES,
             max_frames=int(cfg.data.max_frames),
             seed=int(cfg.get("seed", 0)),
         )
@@ -663,31 +646,25 @@ def create_dataloaders(
             collate_fn=LDFSpanCollator(
                 min_frames=cfg.data.min_frames,
                 max_frames=cfg.data.max_frames,
+                generation_tokens=generation_tokens,
                 encoder_context_tokens=encoder_context_tokens,
                 training=True,
                 random_yaw=cfg.data.random_yaw,
-                cold_start_probability=cfg.data.cold_start_probability,
             ),
             **common,
         )
 
     validation = cfg.get("validation") or {}
-    continuation_span_frames = int(
-        validation.get("continuation_span_frames", cfg.data.min_frames)
-    )
-    if continuation_span_frames % FRAMES_PER_TOKEN:
-        raise ValueError("validation.continuation_span_frames must align to four frames")
+    required_tokens = generation_tokens + maximum_rollout
     continuation_dataset = MinimumFrameDataset(
         val_dataset,
-        min_frames=continuation_span_frames + FRAMES_PER_TOKEN,
+        min_frames=required_tokens * FRAMES_PER_TOKEN,
     )
 
     def validation_loader(
         name: str,
         *,
-        cold_start: bool,
         dataset: Dataset,
-        span_frames: int | None = None,
         positions: tuple[str, ...] | None = None,
     ) -> DataLoader:
         return DataLoader(
@@ -697,35 +674,29 @@ def create_dataloaders(
             collate_fn=LDFSpanCollator(
                 min_frames=cfg.data.min_frames,
                 max_frames=cfg.data.max_frames,
+                generation_tokens=generation_tokens,
                 encoder_context_tokens=encoder_context_tokens,
                 training=False,
                 random_yaw=False,
-                cold_start=cold_start,
                 validation_probe=name,
-                validation_span_frames=span_frames,
                 validation_positions=positions,
             ),
             **common,
         )
 
     val_loaders = [
-        validation_loader("teacher_cold", cold_start=True, dataset=val_dataset),
+        validation_loader("teacher_cold", dataset=val_dataset),
         validation_loader(
             "teacher_continuation",
-            cold_start=False,
             dataset=continuation_dataset,
-            span_frames=continuation_span_frames,
             positions=("early", "middle", "late"),
         ),
     ]
-    self_forcing = cfg.get("self_forcing")
     if self_forcing is not None and bool(self_forcing.get("enabled", False)):
         val_loaders.append(
             validation_loader(
                 "self_forcing",
-                cold_start=False,
                 dataset=continuation_dataset,
-                span_frames=continuation_span_frames,
                 positions=("early", "middle", "late"),
             )
         )

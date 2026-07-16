@@ -68,13 +68,13 @@ def _mark_xz(mask: torch.Tensor, batch_index: int, flat_frame_indices: torch.Ten
 def sample_xz_constraint_mask(
     *,
     token_valid_mask: torch.Tensor,
-    initial_active_start: int,
-    initial_active_end: int,
-    future_lookahead_tokens: int,
+    initial_active_start: torch.Tensor,
+    initial_active_end: torch.Tensor,
+    max_horizon_token: int,
     dense_probability: float,
     waypoint_probability: float,
     goal_probability: float,
-    max_waypoints: int,
+    max_waypoint_count: int,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Sample one persistent absolute XZ plan for an entire rollout.
@@ -94,16 +94,25 @@ def sample_xz_constraint_mask(
     ):
         raise ValueError("token_valid_mask must be bool [B,T]")
     batch, tokens = token_valid_mask.shape
-    active_start = int(initial_active_start)
-    active_end = int(initial_active_end)
-    lookahead = int(future_lookahead_tokens)
-    max_waypoints = int(max_waypoints)
-    if not 0 <= active_start < active_end <= tokens:
-        raise ValueError("initial active range lies outside token_valid_mask")
+    active_start = torch.as_tensor(
+        initial_active_start,
+        device=token_valid_mask.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    active_end = torch.as_tensor(
+        initial_active_end,
+        device=token_valid_mask.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    lookahead = int(max_horizon_token)
+    max_waypoint_count = int(max_waypoint_count)
+    if tuple(active_start.shape) != (batch,) or tuple(active_end.shape) != (batch,):
+        raise ValueError("initial active bounds must be [B]")
+    valid_counts = token_valid_mask.sum(dim=1, dtype=torch.long)
     if lookahead < 0:
-        raise ValueError("future_lookahead_tokens must be non-negative")
-    if max_waypoints <= 0:
-        raise ValueError("max_waypoints must be positive")
+        raise ValueError("max_horizon_token must be non-negative")
+    if max_waypoint_count <= 0:
+        raise ValueError("max_waypoint_count must be positive")
     dense, waypoint, _goal = _validate_sampling_probabilities(
         dense_probability,
         waypoint_probability,
@@ -121,17 +130,22 @@ def sample_xz_constraint_mask(
     mode_draws = torch.rand(
         batch, device=token_valid_mask.device, generator=generator
     )
-    future_end = min(tokens, active_end + lookahead)
-
-    for batch_index in range(batch):
-        valid_tokens = torch.nonzero(
-            token_valid_mask[batch_index], as_tuple=False
-        ).flatten()
-        eligible_tokens = valid_tokens[
-            (valid_tokens >= active_start) & (valid_tokens < future_end)
-        ]
-        if eligible_tokens.numel() == 0:
-            raise ValueError("every sample must contain a valid active constraint frame")
+    # Variable-size waypoint/goal selection still uses a Python loop, but copy
+    # its scalar control data to CPU once rather than synchronizing repeatedly
+    # for every sample.
+    bounds = torch.stack((active_start, active_end, valid_counts), dim=1).tolist()
+    mode_draws_list = mode_draws.tolist()
+    rows = zip(bounds, mode_draws_list, strict=True)
+    for batch_index, (
+        (sample_active_start, sample_active_end, valid_count),
+        draw,
+    ) in enumerate(rows):
+        future_end = min(valid_count, sample_active_end + lookahead)
+        eligible_tokens = torch.arange(
+            sample_active_start,
+            future_end,
+            device=token_valid_mask.device,
+        )
         eligible_frames = (
             eligible_tokens[:, None] * FRAMES_PER_TOKEN
             + torch.arange(
@@ -139,20 +153,18 @@ def sample_xz_constraint_mask(
             )[None]
         ).flatten()
 
-        draw = float(mode_draws[batch_index].item())
         if draw < dense:
-            dense_tokens = valid_tokens[valid_tokens >= active_start]
             dense_frames = (
-                dense_tokens[:, None] * FRAMES_PER_TOKEN
+                eligible_tokens[:, None] * FRAMES_PER_TOKEN
                 + torch.arange(
-                    FRAMES_PER_TOKEN, device=dense_tokens.device
+                    FRAMES_PER_TOKEN, device=eligible_tokens.device
                 )[None]
             ).flatten()
             _mark_xz(plan, batch_index, dense_frames)
             continue
 
         if draw < dense + waypoint:
-            count_limit = min(max_waypoints, int(eligible_frames.numel()))
+            count_limit = min(max_waypoint_count, int(eligible_frames.numel()))
             count = int(
                 torch.randint(
                     1,
@@ -170,17 +182,17 @@ def sample_xz_constraint_mask(
             _mark_xz(plan, batch_index, eligible_frames[order])
             continue
 
-        future_tokens = valid_tokens[
-            (valid_tokens >= active_end) & (valid_tokens < future_end)
-        ]
+        future_tokens = torch.arange(
+            sample_active_end,
+            future_end,
+            device=token_valid_mask.device,
+        )
         if future_tokens.numel() > 0:
-            goal_token_offset = int(
-                torch.randint(
-                    future_tokens.numel(),
-                    (),
-                    device=future_tokens.device,
-                    generator=generator,
-                ).item()
+            goal_token_offset = torch.randint(
+                future_tokens.numel(),
+                (),
+                device=future_tokens.device,
+                generator=generator,
             )
             goal_token = future_tokens[goal_token_offset]
             goal_frame = torch.randint(
@@ -192,7 +204,7 @@ def sample_xz_constraint_mask(
             selected = goal_token * FRAMES_PER_TOKEN + goal_frame
         else:
             active_frames = eligible_frames[
-                eligible_frames < active_end * FRAMES_PER_TOKEN
+                eligible_frames < sample_active_end * FRAMES_PER_TOKEN
             ]
             selected = active_frames[
                 torch.randint(
@@ -204,10 +216,6 @@ def sample_xz_constraint_mask(
             ]
         _mark_xz(plan, batch_index, selected.reshape(1))
 
-    if bool((plan[..., 0] != plan[..., 2]).any()):
-        raise RuntimeError("XZ constraint features must always be observed together")
-    if bool(plan[..., 1].any()) or bool(plan[..., 3:].any()):
-        raise RuntimeError("trajectory sampling may only expose XZ")
     return plan
 
 
@@ -216,17 +224,21 @@ def _pack_future_constraints(
     clean_root_motion: torch.Tensor,
     constraint_mask: torch.Tensor,
     timeline_position_ids: torch.Tensor,
-    future_start: int,
-    future_end: int,
+    future_start: torch.Tensor,
+    future_end: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    candidate_mask = constraint_mask[:, future_start:future_end]
-    candidate_valid = candidate_mask.flatten(2).any(dim=-1)
+    batch, tokens = constraint_mask.shape[:2]
+    positions = torch.arange(tokens, device=constraint_mask.device)[None]
+    candidate_range = (
+        (positions >= future_start[:, None])
+        & (positions < future_end[:, None])
+    )
+    candidate_valid = constraint_mask.flatten(2).any(dim=-1) & candidate_range
     counts = candidate_valid.sum(dim=1, dtype=torch.long)
     packed_tokens = int(counts.max().item())
     if packed_tokens == 0:
         return None
 
-    batch = clean_root_motion.shape[0]
     future_value = clean_root_motion.new_zeros(
         batch, packed_tokens, FRAMES_PER_TOKEN, ROOT_DIM
     )
@@ -238,24 +250,24 @@ def _pack_future_constraints(
         device=clean_root_motion.device,
         dtype=torch.bool,
     )
-    for batch_index in range(batch):
-        selected = torch.nonzero(
-            candidate_valid[batch_index], as_tuple=False
-        ).flatten()
-        count = int(selected.numel())
-        if count == 0:
-            continue
-        source_indices = selected + future_start
-        future_value[batch_index, :count] = clean_root_motion[
-            batch_index, source_indices
-        ]
-        future_mask[batch_index, :count] = constraint_mask[
-            batch_index, source_indices
-        ]
-        future_positions[batch_index, :count] = timeline_position_ids[
-            batch_index, source_indices
-        ]
-        future_valid[batch_index, :count] = True
+    packed_indices = candidate_valid.cumsum(dim=1, dtype=torch.long) - 1
+    batch_indices = torch.arange(
+        batch, device=constraint_mask.device
+    )[:, None].expand(-1, tokens)
+    source_indices = positions.expand(batch, -1)
+    selected_batch = batch_indices[candidate_valid]
+    selected_source = source_indices[candidate_valid]
+    selected_destination = packed_indices[candidate_valid]
+    future_value[selected_batch, selected_destination] = clean_root_motion[
+        selected_batch, selected_source
+    ]
+    future_mask[selected_batch, selected_destination] = constraint_mask[
+        selected_batch, selected_source
+    ]
+    future_positions[selected_batch, selected_destination] = timeline_position_ids[
+        selected_batch, selected_source
+    ]
+    future_valid[selected_batch, selected_destination] = True
     return future_value, future_mask, future_positions, future_valid
 
 
@@ -267,7 +279,7 @@ def create_xz_condition(
     view: LDFStepView,
     text_context: list[torch.Tensor],
     text_null_context: list[torch.Tensor],
-    future_lookahead_tokens: int,
+    max_horizon_token: int,
 ) -> LDFCondition:
     """Compile one persistent absolute XZ plan for the current rollout view."""
 
@@ -287,26 +299,32 @@ def create_xz_condition(
     mask = constraint_mask.to(device=clean_root_motion.device, dtype=torch.bool)
     if tuple(mask.shape) != tuple(clean_root_motion.shape):
         raise ValueError("constraint_mask must match clean_root_motion")
-    if bool((mask[..., 0] != mask[..., 2]).any()):
-        raise ValueError("constraint_mask must observe XZ together")
-    if bool(mask[..., 1].any()) or bool(mask[..., 3:].any()):
-        raise ValueError("constraint_mask may only observe XZ")
     mask = mask & token_valid_mask[..., None, None]
-    lookahead = int(future_lookahead_tokens)
+    lookahead = int(max_horizon_token)
     if lookahead < 0:
-        raise ValueError("future_lookahead_tokens must be non-negative")
-    if not 0 <= view.active_start < view.active_end <= tokens:
-        raise ValueError("active range lies outside clean_root_motion")
+        raise ValueError("max_horizon_token must be non-negative")
+    for name, value in (
+        ("active_start", view.active_start),
+        ("active_end", view.active_end),
+    ):
+        if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
+            raise ValueError(f"view.{name} must be [B]")
+    valid_counts = token_valid_mask.sum(dim=1, dtype=torch.long)
     if tuple(view.timeline_position_ids.shape) != (batch, tokens):
         raise ValueError("timeline_position_ids must match clean root [B,T]")
 
-    active_mask = torch.zeros_like(mask)
-    active_mask[:, view.active_start : view.active_end] = mask[
-        :, view.active_start : view.active_end
-    ]
+    positions = torch.arange(tokens, device=mask.device)[None]
+    active_range = (
+        (positions >= view.active_start[:, None])
+        & (positions < view.active_end[:, None])
+    )
+    active_mask = mask & active_range[..., None, None]
 
     future_start = view.active_end
-    future_end = min(tokens, future_start + lookahead)
+    future_end = torch.minimum(
+        valid_counts,
+        future_start + lookahead,
+    )
     packed = _pack_future_constraints(
         clean_root_motion=clean_root_motion,
         constraint_mask=mask,
@@ -328,7 +346,7 @@ def create_xz_condition(
         future_timeline_position_ids=future_positions,
         future_valid_mask=future_valid,
     )
-    condition.validate(batch_size=batch, token_length=tokens)
+    condition.validate_structure(batch_size=batch, token_length=tokens)
     return condition
 
 

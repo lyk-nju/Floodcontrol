@@ -85,10 +85,8 @@ def load_web_config(path: str | Path) -> WebConfig:
         status=str(raw.get("status", "BLOCKED_ON_LDF_CHECKPOINT")),
         message=str(raw.get("message", "")),
         inference=InferenceConfig(
-            window_tokens=int(inference_values.get("window_tokens", 30)),
-            future_constraint_tokens=int(
-                inference_values.get("future_constraint_tokens", 10)
-            ),
+            window_tokens=int(inference_values.get("window_tokens", 50)),
+            max_horizon_token=int(inference_values.get("max_horizon_token", 10)),
             num_denoise_steps=inference_values.get("num_denoise_steps", 10),
             rebase_on_roll=bool(inference_values.get("rebase_on_roll", True)),
         ),

@@ -12,7 +12,7 @@ from utils.conditions.ldf import LDFCondition, LDFStreamState, create_ldf_condit
 from utils.inference.route import RoutePlan
 from utils.inference.text import TextEmbeddingCache, TextInterval, TextTimeline
 from utils.motion_process import ROOT_DIM
-from utils.token_frame import FRAMES_PER_TOKEN
+from utils.token_frame import FRAMES_PER_TOKEN, MOTION_FPS
 
 
 @dataclass(frozen=True)
@@ -132,8 +132,9 @@ class InferenceConditionCompiler:
         text_embeddings: TextEmbeddingCache,
         root_mean: torch.Tensor,
         root_std: torch.Tensor,
-        fps: float = 20.0,
-        future_constraint_tokens: int = 0,
+        active_tokens: int,
+        fps: float = MOTION_FPS,
+        max_horizon_token: int = 0,
     ):
         mean = torch.as_tensor(root_mean, dtype=torch.float32).reshape(-1)
         std = torch.as_tensor(root_std, dtype=torch.float32).reshape(-1)
@@ -145,13 +146,16 @@ class InferenceConditionCompiler:
             raise ValueError("root_std must be strictly positive")
         if not np.isfinite(float(fps)) or float(fps) <= 0:
             raise ValueError("fps must be finite and positive")
-        if int(future_constraint_tokens) < 0:
-            raise ValueError("future_constraint_tokens must be non-negative")
+        if int(max_horizon_token) < 0:
+            raise ValueError("max_horizon_token must be non-negative")
+        if int(active_tokens) <= 0:
+            raise ValueError("active_tokens must be positive")
         self.text_embeddings = text_embeddings
         self.root_mean = mean.clone()
         self.root_std = std.clone()
         self.fps = float(fps)
-        self.future_constraint_tokens = int(future_constraint_tokens)
+        self.active_tokens = int(active_tokens)
+        self.max_horizon_token = int(max_horizon_token)
 
     @staticmethod
     def _origin_array(origin_xz: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -257,17 +261,26 @@ class InferenceConditionCompiler:
 
         future_value = future_mask = None
         future_positions = None
-        if self.future_constraint_tokens:
-            future_start_token = state.window_origin + window_tokens
+        local_commit = state.commit_index - state.window_origin
+        visible_motion_tokens = min(
+            window_tokens,
+            local_commit + self.active_tokens,
+        )
+        # Scaled-ARDY budget: retained history + active band + packed future
+        # conditions never exceeds the model's configured window length.
+        future_budget = max(0, window_tokens - visible_motion_tokens)
+        future_count = min(self.max_horizon_token, future_budget)
+        if future_count:
+            future_start_token = state.commit_index + self.active_tokens
             future_positions = torch.arange(
                 future_start_token,
-                future_start_token + self.future_constraint_tokens,
+                future_start_token + future_count,
                 device=device,
                 dtype=torch.long,
             )
             future_frames = np.arange(
                 future_start_token * FRAMES_PER_TOKEN,
-                (future_start_token + self.future_constraint_tokens)
+                (future_start_token + future_count)
                 * FRAMES_PER_TOKEN,
                 dtype=np.int64,
             )

@@ -1,4 +1,4 @@
-"""Compute root5 statistics with the fixed-span LDF anchor distribution."""
+"""Compute root5 statistics with the scaled-ARDY LDF window distribution."""
 
 from __future__ import annotations
 
@@ -54,10 +54,9 @@ def compute_root_statistics(
     windows_per_sample: int = 1,
     random_yaw: bool = True,
     active_tokens: int = 5,
-    cold_start_probability: float = 0.1,
     seed: int = 1234,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample S/H and the rollout-fixed translation anchor used by training."""
+    """Sample parent windows and a legal true-cold/continuation H per item."""
 
     for name, value in (("min_frames", min_frames), ("max_frames", max_frames)):
         if value < FRAMES_PER_TOKEN or value % FRAMES_PER_TOKEN:
@@ -68,8 +67,8 @@ def compute_root_statistics(
         raise ValueError("windows_per_sample must be positive")
     if active_tokens <= 0:
         raise ValueError("active_tokens must be positive")
-    if not 0.0 <= cold_start_probability <= 1.0:
-        raise ValueError("cold_start_probability must lie in [0,1]")
+    if active_tokens > max_frames // FRAMES_PER_TOKEN:
+        raise ValueError("active_tokens must fit inside max_frames")
 
     sampler = random.Random(int(seed))
     yaw_generator = torch.Generator().manual_seed(int(seed))
@@ -79,21 +78,21 @@ def compute_root_statistics(
         available = int(full_root.shape[0])
         if available < min_frames:
             continue
-        maximum_tokens = min(available, max_frames) // FRAMES_PER_TOKEN
-        minimum_tokens = min_frames // FRAMES_PER_TOKEN
+        available_tokens = available // FRAMES_PER_TOKEN
+        parent_tokens = min(available_tokens, max_frames // FRAMES_PER_TOKEN)
+        if parent_tokens < active_tokens:
+            continue
         for _ in range(windows_per_sample):
-            tokens = sampler.randint(minimum_tokens, maximum_tokens)
-            if tokens <= active_tokens:
-                raise ValueError("statistics span must be longer than active_tokens")
-            cold_start = sampler.random() < cold_start_probability
-            start_token = 0 if cold_start else sampler.randint(
-                0, available // FRAMES_PER_TOKEN - tokens
+            source_start = sampler.randint(
+                0, available_tokens - parent_tokens
             )
-            history_tokens = 0 if cold_start else sampler.randint(
-                1, tokens - active_tokens
+            minimum_history = 0 if source_start == 0 else 1
+            history_tokens = sampler.randint(
+                minimum_history,
+                parent_tokens - active_tokens,
             )
-            start = start_token * FRAMES_PER_TOKEN
-            frames = tokens * FRAMES_PER_TOKEN
+            start = source_start * FRAMES_PER_TOKEN
+            frames = parent_tokens * FRAMES_PER_TOKEN
             root = full_root[start : start + frames].clone()
             anchor_frame = (
                 history_tokens * FRAMES_PER_TOKEN - 1
@@ -122,7 +121,6 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--windows-per-sample", type=int, default=1)
     parser.add_argument("--active-tokens", type=int)
-    parser.add_argument("--cold-start-probability", type=float)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--random-yaw",
@@ -144,12 +142,7 @@ def main() -> None:
             if args.active_tokens is None
             else args.active_tokens
         )
-        cold_start_probability = float(
-            cfg.data.cold_start_probability
-            if args.cold_start_probability is None
-            else args.cold_start_probability
-        )
-        output_path = args.output or str(cfg.root_stats_path)
+        output_path = args.output or str(cfg.data.root_stats_path)
     else:
         if not args.train_meta_paths:
             parser.error("set --config or --train-meta-paths")
@@ -162,14 +155,9 @@ def main() -> None:
             text_path=None,
             fps=args.fps,
         )
-        min_frames = 40 if args.min_frames is None else args.min_frames
+        min_frames = 20 if args.min_frames is None else args.min_frames
         max_frames = 200 if args.max_frames is None else args.max_frames
         active_tokens = 5 if args.active_tokens is None else args.active_tokens
-        cold_start_probability = (
-            0.1
-            if args.cold_start_probability is None
-            else args.cold_start_probability
-        )
         output_path = args.output
     root_mean, root_std = compute_root_statistics(
         dataset,
@@ -178,7 +166,6 @@ def main() -> None:
         windows_per_sample=args.windows_per_sample,
         random_yaw=args.random_yaw,
         active_tokens=active_tokens,
-        cold_start_probability=cold_start_probability,
         seed=args.seed,
     )
     output = Path(output_path)

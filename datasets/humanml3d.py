@@ -11,7 +11,7 @@ import torch
 
 from torch.utils.data import Dataset
 from utils.motion_process import BODY_DIM, ROOT_DIM
-from utils.token_frame import FRAMES_PER_TOKEN
+from utils.token_frame import FRAMES_PER_TOKEN, MOTION_FPS
 
 
 SUPPORTED_SPLITS = frozenset({"train", "val", "test"})
@@ -28,7 +28,7 @@ class HumanML3DDataset(Dataset):
         split: str,
         artifact_path: str = "artifacts",
         text_path: str | Path | None = None,
-        fps: float = 20.0,
+        fps: float = MOTION_FPS,
     ):
         self.split = str(split)
         if self.split not in SUPPORTED_SPLITS:
@@ -187,10 +187,17 @@ class HumanML3DDataset(Dataset):
                 start_frame = 0
                 end_frame = motion_length
             else:
+                # A few source rows have zero-duration or reversed tags. They
+                # describe no usable part of the motion and must not be turned
+                # into a synthetic interval by clamping or swapping endpoints.
+                if to_tag <= from_tag:
+                    continue
                 start_frame = int(from_tag * self.fps + 0.5)
                 end_frame = int(to_tag * self.fps + 0.5)
                 start_frame = max(0, min(motion_length, start_frame))
-                end_frame = max(start_frame, min(motion_length, end_frame))
+                end_frame = max(0, min(motion_length, end_frame))
+                if end_frame <= start_frame:
+                    continue
 
             text_data.append(
                 {

@@ -86,7 +86,7 @@ def make_config(**overrides):
     values = dict(
         status="test",
         message="",
-        inference=InferenceConfig(window_tokens=4, future_constraint_tokens=2),
+        inference=InferenceConfig(window_tokens=4, max_horizon_token=2),
         guidance=GuidanceConfig(),
         buffer_target_chunks=1,
         buffer_capacity_chunks=2,
