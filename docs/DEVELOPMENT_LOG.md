@@ -3252,3 +3252,46 @@
 尚未完成的后续事项：
 
 - 无。如果项目未来改变固定20 FPS数据合同，应连同bucket内部默认与所有frame/time协议统一迁移，而不是只在单个实验YAML里覆盖。
+
+## 2026-07-16 · Future horizon命名与VAE FPS默认收敛
+
+改动类型：配置命名 / 数据产物所有权 / VAE时间协议 / runtime公共接口
+
+实际改动内容：
+
+- 将训练、validation generation、runtime和Web中表示future XZ最大可见范围的字段统一命名为`max_horizon_token`，删除`future_root_lookahead_tokens`、`future_constraint_tokens`和`future_lookahead_tokens`等并存名称。
+- 将waypoint模式的数量上限命名为`max_waypoint_count`；它只限制一个样本最多抽取的离散XZ帧点数，不改变future horizon。
+- 将`root_stats_path`与`text_embeddings_path`从LDF顶层配置收入`data`，统一由`data.root_stats_path`和`data.text_embeddings_path`表达两个离线数据产物。训练入口、Lightning module、root statistics工具和checkpoint contract同步使用新路径。
+- 从`vae.yaml`、`vae_multi.yaml`以及LDF内嵌VAE配置删除`fps: 20.0`。`utils/token_frame.py`现在定义唯一`MOTION_FPS=20.0`，`BodyVAE`、VAE data/loss/statistics路径直接使用该项目默认，避免配置与4-frame/20-FPS数据合同分歧。
+- 同步更新InferenceSession、condition compiler、LDF evaluation、Web配置、迁移守卫和设计文档，不保留旧字段兼容别名。
+
+改动理由：
+
+- `max_horizon_token`直接表达“最多向未来看多少motion tokens”；它是上限，实际可见数量仍受当前`H+C+F<=window`预算限制，并不表示每个样本都固定看满上限。
+- waypoint count与horizon长度是两个正交概念，分开命名能避免将“多远”与“多少个点”混淆。
+- root statistics和T5 embedding都由数据集/离线预处理产生，归入`data`比放在实验顶层更符合当前分层。
+- VAE训练和LDF tokenizer只允许20 FPS、四帧一token协议；将FPS保留为每个模型的可调参数只会制造非法组合，不会产生有意义的实验自由度。
+
+验证：
+
+- LDF training/self-forcing定向测试：`31 passed`。
+- 全仓pytest：`236 passed`。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+- 全仓搜索确认活跃代码和正式文档中不再存在上述旧horizon/waypoint字段或顶层statistics/text path读取。
+
+涉及文件：
+
+- `configs/{vae,vae_multi,ldf,ldf_multi,stream}.yaml`
+- `models/{vae_wan_1d,diffusion_forcing_wan}.py`
+- `utils/token_frame.py`
+- `utils/{inference,training/vae,training/ldf}/`
+- `train_ldf.py`
+- `tools/{compute_ldf_root_stats,compute_vae_stats}.py`
+- `web_demo/config.py`
+- `tests/`相关配置、VAE、LDF、inference和Web回归
+- `docs/rearchitecture/{02_VAE_AND_BODY_REPRESENTATION,04_TRAINING_METHOD,05_TRAINING_CONFIG,07_LDF_TRAINING_EVALUATION}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- LDF主模型中仍显式保留`model.params.fps: 20.0`，因为本轮用户指定的收敛范围是`vae.params.fps`。如果后续决定全项目一律不允许实验级FPS，应再将LDF、runtime和可视化的“动作时间协议”与“视频输出帧率”分层收敛。
