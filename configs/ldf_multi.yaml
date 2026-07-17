@@ -91,19 +91,21 @@ training:
 loss:
   root_weight: 1.0
   body_weight: 1.0
+  rollout_weight: 1.0
+  offpath_beta_min: 0.1
+  root_boundary_weight: 0.0
 
 self_forcing:
-  enabled: false
-  phase_start_step: 300000
+  enabled: true
+  # global_step [0,100k): K=1; [100k,200k): K=2; [200k,300k): K=5.
+  phase_start_step: 100000
   phase_steps: 200000
   k_schedule:
     - [0.0, 2]
-    - [0.4, 3]
-    - [0.7, 5]
+    - [0.5, 5]
   teacher_replay:
-    2: 0.2
-    3: 0.1
-    5: 0.1
+    2: 0.0
+    5: 0.0
 
 model:
   target: models.diffusion_forcing_wan.LDF

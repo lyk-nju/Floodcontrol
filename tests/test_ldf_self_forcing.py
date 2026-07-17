@@ -5,12 +5,12 @@ import torch
 import torch.nn as nn
 
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
-from utils.training.ldf.batch import build_ldf_training_step
+from utils.training.ldf.batch import build_ldf_rollout_step, build_ldf_training_step
 from utils.training.ldf.conditioning import (
     create_xz_condition,
     sample_xz_constraint_mask,
 )
-from utils.training.ldf.losses import compute_velocity_loss
+from utils.training.ldf.losses import compute_offpath_loss, compute_velocity_loss
 from utils.training.ldf.flow import (
     build_span_beta,
     recover_clean_for_full_gradient_auxiliary,
@@ -26,7 +26,7 @@ from utils.training.ldf.self_forcing import (
 
 
 def empty_condition(batch_size: int):
-    def build(view):
+    def build(view, _clean_motion=None):
         token_length = int(view.timeline_position_ids.shape[1])
         null = [torch.zeros(1, 1) for _ in range(batch_size)]
         return LDFCondition(
@@ -307,11 +307,43 @@ class RecordingModel(nn.Module):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(0.25))
         self.calls: list[tuple[bool, bool, int]] = []
+        self.noisy_inputs: list[HybridMotion] = []
+        self.beta_inputs: list[torch.Tensor] = []
+        self.noise_steps = 10
+        self.chunk_size = 5
+        self.register_buffer("root_mean", torch.zeros(5))
+        self.register_buffer("root_std", torch.ones(5))
+
+    def denormalize_root(self, root):
+        return root
+
+    def _project_normalized_root(self, root):
+        return root
+
+    def triangular_beta(self, *, timeline_position_ids, diffusion_time):
+        time = torch.as_tensor(diffusion_time, dtype=torch.float32)
+        if time.ndim == 1:
+            time = time[:, None]
+        return torch.clamp(
+            1.0 + timeline_position_ids.float() / 5.0 - time,
+            min=0.0,
+            max=1.0,
+        )
+
+    def rebase_motion_state(self, motion, beta, translation_xz):
+        root = motion.root_motion.clone()
+        root[..., [0, 2]] -= (
+            (1.0 - beta)[..., None, None]
+            * translation_xz[:, None, None, :]
+        )
+        return HybridMotion(root, motion.latent_motion.clone())
 
     def forward(self, inputs):
         self.calls.append(
             (torch.is_grad_enabled(), self.training, inputs.generation_mask.sum().item())
         )
+        self.noisy_inputs.append(inputs.noisy_motion.clone(detach=True))
+        self.beta_inputs.append(inputs.beta.detach().clone())
         root_velocity = torch.ones_like(inputs.noisy_motion.root_motion) * self.scale
         body_velocity = torch.ones_like(inputs.noisy_motion.latent_motion) * self.scale
         clean_root = recover_clean_for_self_forcing(
@@ -325,8 +357,32 @@ class RecordingModel(nn.Module):
             local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
         )
 
+    def denoise_step(self, inputs, next_beta, *, use_cfg):
+        assert not use_cfg
+        prediction = self(inputs)
+        delta = inputs.beta - next_beta
+        return HybridMotion(
+            inputs.noisy_motion.root_motion
+            + delta[..., None, None] * prediction.velocity.root_motion,
+            inputs.noisy_motion.latent_motion
+            + delta[..., None] * prediction.velocity.latent_motion,
+        ), prediction
 
-def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step():
+
+def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
+    monkeypatch,
+):
+    import utils.training.ldf.rollout as rollout_module
+
+    mix_calls = 0
+    original_mix = rollout_module.mix_fixed_noise
+
+    def counted_mix(*args, **kwargs):
+        nonlocal mix_calls
+        mix_calls += 1
+        return original_mix(*args, **kwargs)
+
+    monkeypatch.setattr(rollout_module, "mix_fixed_noise", counted_mix)
     batch = physical_batch()
     plan = sample_window_plan(
         batch,
@@ -334,7 +390,7 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step():
         rollout_steps=3,
         latent_dim=3,
         initial_history_tokens=2,
-        phase_offset=torch.full((2,), 0.05),
+        phase_offset=torch.zeros(2),
         generator=torch.Generator().manual_seed(11),
     )
     clean = HybridMotion(
@@ -345,7 +401,7 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step():
     model = RecordingModel().train()
     views = []
 
-    def condition_builder(view):
+    def condition_builder(view, _clean_motion):
         views.append(view)
         return empty_condition(2)(view)
 
@@ -361,22 +417,105 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step():
     assert [(grad, training) for grad, training, _ in model.calls] == [
         (False, True),
         (False, True),
+        (False, True),
+        (False, True),
+        (False, True),
         (True, True),
     ]
+    assert mix_calls == 1
+    first_delta = model.beta_inputs[0] - model.beta_inputs[1]
+    assert torch.allclose(
+        model.noisy_inputs[1].root_motion,
+        model.noisy_inputs[0].root_motion
+        + first_delta[..., None, None] * 0.25,
+    )
+    assert torch.allclose(
+        model.noisy_inputs[1].latent_motion,
+        model.noisy_inputs[0].latent_motion + first_delta[..., None] * 0.25,
+    )
     assert [view.active_start.tolist() for view in views] == [[2, 2], [3, 3], [4, 4]]
-    assert len(result.replacements) == 2
+    assert len(result.replacements) == 3
     assert all(not item.root_motion.requires_grad for item in result.replacements)
     assert all(item.root_motion.grad_fn is None for item in result.replacements)
     assert not result.state.clean_motion.root_motion.requires_grad
-    assert result.state.clean_motion.root_motion[:, :2].equal(clean.root_motion[:, :2])
+    # Root history is expressed in the new per-commit coordinate origin, while
+    # body latent history is translation invariant.
+    assert not result.state.clean_motion.root_motion[:, :2].equal(
+        clean.root_motion[:, :2]
+    )
+    assert result.state.clean_motion.latent_motion[:, :2].equal(
+        clean.latent_motion[:, :2]
+    )
+    assert result.solver_state.completed_commits == 3
     assert not result.state.clean_motion.root_motion[:, 2:4].equal(
         clean.root_motion[:, 2:4]
     )
-    assert result.state.clean_motion.root_motion[:, 4:].equal(clean.root_motion[:, 4:])
+    assert result.state.completed_steps == 3
 
-    losses = compute_velocity_loss(result.prediction, result.final_step)
+    from utils.training.ldf.losses import compute_offpath_loss
+
+    losses = compute_offpath_loss(
+        result.prediction,
+        result.final_step,
+        root_mean=model.root_mean,
+        root_std=model.root_std,
+    )
     losses["total"].backward()
     assert model.scale.grad is not None
+
+
+def test_offpath_loss_is_finite_near_zero_beta_and_boundary_loss_backpropagates():
+    clean_root = torch.zeros(1, 2, 4, 5)
+    clean_root[:, 1, :, 0] = torch.arange(1, 5, dtype=torch.float32)
+    clean = HybridMotion(clean_root, torch.zeros(1, 2, 3))
+    current = HybridMotion(
+        torch.zeros_like(clean.root_motion),
+        torch.zeros_like(clean.latent_motion),
+    )
+    noise = HybridMotion(
+        torch.zeros_like(clean.root_motion),
+        torch.zeros_like(clean.latent_motion),
+    )
+    beta = torch.tensor([[0.0, 1.0e-8]])
+    step = build_ldf_rollout_step(
+        noisy_motion=current,
+        clean_motion=clean,
+        noise=noise,
+        beta=beta,
+        source_start_token=torch.zeros(1, dtype=torch.long),
+        span_token_count=torch.tensor([2]),
+        history_end=torch.tensor([1]),
+        active_tokens=1,
+        step_index=0,
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=empty_condition(1)(
+            type("View", (), {"timeline_position_ids": torch.zeros(1, 2)})()
+        ),
+    )
+    root_velocity = torch.zeros_like(clean.root_motion, requires_grad=True)
+    body_velocity = torch.zeros_like(clean.latent_motion, requires_grad=True)
+    local = torch.zeros(1, 2, 4, 4)
+    prediction = LDFPrediction(
+        HybridMotion(root_velocity, body_velocity),
+        clean.root_motion,
+        local,
+        torch.ones_like(local, dtype=torch.bool),
+    )
+    losses = compute_offpath_loss(
+        prediction,
+        step,
+        root_mean=torch.zeros(5),
+        root_std=torch.ones(5),
+        rollout_weight=0.0,
+        root_boundary_weight=1.0,
+        offpath_beta_min=0.1,
+    )
+    assert all(torch.isfinite(value) for value in losses.values())
+    losses["total"].backward()
+    assert root_velocity.grad is not None
+    assert torch.isfinite(root_velocity.grad).all()
+    assert root_velocity.grad.abs().sum() > 0
 
 
 def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
@@ -406,8 +545,11 @@ def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
         max_horizon_token=2,
     )
 
-    def builder(view):
-        condition = create_xz_condition(view=view, **kwargs)
+    def builder(view, clean_motion):
+        condition = create_xz_condition(
+            view=view,
+            **{**kwargs, "clean_root_motion": clean_motion.root_motion},
+        )
         conditions.append(condition)
         return condition
 
@@ -424,7 +566,7 @@ def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
         rollout_steps=2,
         latent_dim=3,
         initial_history_tokens=2,
-        phase_offset=torch.tensor([0.05]),
+        phase_offset=torch.zeros(1),
         generator=torch.Generator().manual_seed(13),
     )
     run_self_forcing_rollout(
@@ -454,9 +596,9 @@ def test_one_persistent_future_goal_becomes_active_during_self_forcing():
     constraint_mask[:, 7, 2, 2] = True
     conditions = []
 
-    def builder(view):
+    def builder(view, clean_motion):
         condition = create_xz_condition(
-            clean_root_motion=root,
+            clean_root_motion=clean_motion.root_motion,
             token_valid_mask=valid,
             constraint_mask=constraint_mask,
             view=view,
@@ -479,7 +621,7 @@ def test_one_persistent_future_goal_becomes_active_during_self_forcing():
         rollout_steps=2,
         latent_dim=3,
         initial_history_tokens=2,
-        phase_offset=torch.tensor([0.05]),
+        phase_offset=torch.zeros(1),
         generator=torch.Generator().manual_seed(13),
     )
     run_self_forcing_rollout(

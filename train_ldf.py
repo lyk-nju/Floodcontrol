@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from utils.training.ldf.data import create_dataloaders
 from utils.training.ldf.lightning_module import LDFLightningModule
 from utils.training.ldf.self_forcing import validate_self_forcing_config
 from utils.training.lightning_module import EMARestoreOnException
+from utils.training.memory import CUDAMemoryReporter
 
 
 def _require_file(path: str, name: str) -> None:
@@ -75,6 +77,26 @@ def _validate_training_config(cfg) -> None:
         max_window_tokens=max_window_tokens,
         max_steps=int(cfg.trainer.max_steps),
     )
+    if bool(self_forcing.get("enabled", False)) and (
+        int(cfg.model.params.noise_steps) % generation_tokens
+    ):
+        raise ValueError(
+            "persistent self-forcing requires model.noise_steps divisible by "
+            "training.window.generation_tokens"
+        )
+    loss = cfg.get("loss") or {}
+    for name in (
+        "root_weight",
+        "body_weight",
+        "rollout_weight",
+        "root_boundary_weight",
+    ):
+        value = float(loss.get(name, 0.0))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"loss.{name} must be finite and non-negative")
+    beta_min = float(loss.get("offpath_beta_min", 0.1))
+    if not math.isfinite(beta_min) or beta_min <= 0.0:
+        raise ValueError("loss.offpath_beta_min must be finite and positive")
     sampling = training.get("constraint_sampling") or {}
     probabilities = [
         float(sampling.get(name, -1.0))
@@ -249,6 +271,9 @@ def main() -> None:
         from eval.ldf_training import LDFEvaluationCallback
 
         callbacks.append(LDFEvaluationCallback(cfg.config))
+    # Keep this after generation evaluation so validation-time inference peaks
+    # are visible to the reporter before it samples the cumulative CUDA peak.
+    callbacks.append(CUDAMemoryReporter(cfg.config))
     if cfg.train:
         callbacks.append(_create_checkpoint_callback(cfg, save_dir))
     trainer_config = OmegaConf.to_container(cfg.trainer, resolve=True)

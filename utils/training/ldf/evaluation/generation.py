@@ -135,7 +135,6 @@ def generate_evaluation_sequence(
     rolling_window_tokens: int,
     max_horizon_token: int,
     num_denoise_steps: int,
-    rebase_on_roll: bool,
 ) -> GeneratedSequence:
     """Generate and causally decode one complete physical validation sequence."""
 
@@ -168,7 +167,6 @@ def generate_evaluation_sequence(
             window_tokens=window_tokens,
             max_horizon_token=int(max_horizon_token),
             num_denoise_steps=int(num_denoise_steps),
-            rebase_on_roll=bool(rebase_on_roll),
             rolling=rolling,
         ),
         guidance=GuidanceConfig(

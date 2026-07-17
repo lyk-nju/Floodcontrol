@@ -50,7 +50,6 @@ class InferenceConfig:
     window_tokens: int
     max_horizon_token: int = 0
     num_denoise_steps: int | None = None
-    rebase_on_roll: bool = True
     rolling: bool = True
 
     def __post_init__(self) -> None:
@@ -356,20 +355,15 @@ class InferenceSession:
         ):
             raise ValueError("decoded body contains non-finite values")
 
-        candidate_origin = self.origin_xz.clone()
-        rebased = False
+        # ``stream_generate_step`` has already rebased its persistent model
+        # state by this committed token's final model-space XZ.  World output
+        # must use the old origin; only the next transaction sees the update.
+        translation = physical_model_root[:, 0, -1, [0, 2]].clone()
+        candidate_origin = self.origin_xz + translation.to(self.origin_xz)
+        rebased = True
         if candidate_ldf.epoch != old_epoch:
             if candidate_ldf.epoch != old_epoch + 1:
                 raise RuntimeError("one inference step may roll the LDF window at most once")
-            if self.config.rebase_on_roll:
-                if candidate_ldf.previous_root_frame is None:
-                    raise RuntimeError("rolled LDF state is missing its root boundary")
-                translation = candidate_ldf.previous_root_frame[:, [0, 2]].clone()
-                candidate_ldf = self.ldf.rebase_stream_state(
-                    candidate_ldf, translation
-                )
-                candidate_origin = candidate_origin + translation.to(candidate_origin)
-                rebased = True
 
         trace = InferenceStepTrace(
             token_index=token_index,

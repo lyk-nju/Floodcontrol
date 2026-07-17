@@ -70,7 +70,6 @@ RootTransformer
 BodyTransformer
 LDF.forward
 LDF.generate
-LDF.stream_generate
 LDF.stream_generate_step
 LDF.init_stream_state
 LDF.create_stream_snapshot
@@ -373,11 +372,13 @@ cfg:
 
 ## 7. 完整流式外壳的接管点
 
-旧实现中 `generate`、`stream_generate` 与 `stream_generate_step` 都调用 `_denoise_with_cfg`。新版将这一唯一 seam 替换为：
+旧实现中的生成入口都调用 `_denoise_with_cfg`。新版将这一唯一 seam 替换为：
 
 ```python
 _predict_hybrid_with_cfg(ldf_input) -> LDFPrediction
 ```
+
+`LDF.stream_generate_step()`只负责一个model-space commit事务。累计world origin、world route重编译、VAE decode和多token迭代属于`InferenceSession.generate()`；因此`LDF`不再公开无法自包含world坐标合同的`stream_generate()`。
 
 以下外层概念保留：
 

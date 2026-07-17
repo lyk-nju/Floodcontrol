@@ -3572,3 +3572,191 @@
 尚未完成的后续事项：
 
 - 需要在目标8卡NCCL服务器重新启动训练，确认短窗口batch经过原故障步数后不再发生collective分叉；无需改为`ddp_find_unused_parameters_true`。
+
+## 2026-07-16 · LDF启动显存预算与运行峰值报告
+
+改动类型：训练可观测性 / CUDA显存诊断 / OOM预警
+
+实际改动内容：
+
+- 新增通用`CUDAMemoryReporter` callback，并在每次LDF fit中默认启用。
+- fit启动时按per-GPU口径打印设备容量、precision、train/validation batch、最大窗口和条件horizon。
+- 启动预算分别统计当前参数与buffer、梯度、Adam/AdamW moment、EMA shadow以及多卡时可能存在的DDP通信bucket；同时给出留给activation、CUDA context、allocator fragmentation与kernel workspace的剩余容量。
+- 明确静态结果是固定显存预算而不是伪精确硬上限；sanity check后重置CUDA peak，在首个完整训练step完成backward和首次optimizer state分配后，汇总所有rank中的最大`allocated/reserved`实测值。
+- validation/generation刷新累计峰值时继续报告，fit结束时输出整轮峰值。
+- 新增固定显存估算单元测试，覆盖AdamW、EMA、buffer和单卡/多卡DDP bucket口径。
+
+改动理由：
+
+- LDF显存不仅由window token数决定，还包含227M级模型、冻结VAE、梯度、optimizer、EMA、DDP通信和动态activation；仅用窗口大小换算一个“最大显存”会误导OOM判断。
+- 启动静态预算可以在首个step前暴露固定开销，首step与后续validation的CUDA实测峰值则补足无法可靠静态建模的动态部分。
+
+验证：
+
+- 显存估算、LDF training/data定向测试：`36 passed`。
+- 更广定向测试中显存实现相关用例全部通过；另外3个migration-guard失败来自仓库当前正式配置不同步：`ldf.yaml`已经是40-token/160-frame/35-horizon，而`ldf_multi.yaml`及冻结断言仍保持50-token/200-frame/45-horizon。本任务没有覆盖用户正在调整的窗口配置。
+- 全仓测试：`241 passed, 5 skipped, 3 failed`；3个失败均为上述既有配置迁移不一致。
+- 修改文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/memory.py`
+- `train_ldf.py`
+- `tests/test_training_memory.py`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 需要在目标GPU服务器运行至少一个完整train step和一次generation validation，记录实际输出的per-rank峰值，并据此选择window与per-device batch。
+- 当前40-token HumanML配置尚未同步到multi配置和migration guards；该窗口迁移不属于本次显存报告改动。
+
+## 2026-07-17 · LDF轨迹改为固定相机场景内渲染
+
+改动类型：训练期可视化 / HumanML3D视频 / FloodNet渲染语义对齐
+
+实际改动内容：
+
+- 将上一轮独立俯视轨迹面板替换为FloodNet风格的场景内轨迹：人物、目标路线和生成root路线共用一个固定正交相机。
+- `video/`恢复为单画面生成动作；目标/条件XZ路线以红色绘制在地面上，生成root已走过的路线以蓝色逐帧延伸。
+- `composite/`从“GT + 生成 + 俯视轨迹”三栏改为“GT场景 + 生成场景”两栏；轨迹直接存在于各自运动场景中。
+- 底层root5/body265渲染器增加可选`traj_xz`、`traj_mask`、完整目标路线和生成轨迹开关；相机投影范围同时覆盖人物和路线，全片只计算一次并保持固定。
+- dense-XZ artifact将实际条件mask传给渲染器；未来稀疏条件也可以只显示被观测的waypoint/goal时间点。
+
+改动理由：
+
+- 用户需要像FloodNet一样直接看到人物沿世界路线行走，而不是在骨架旁边阅读另一个二维图。
+- 共用相机能直观看出人物脚下的目标路线、当前实际位置和累计偏离，同时保留固定视角下的动作姿态与速度感。
+
+验证：
+
+- visualization与LDF evaluation定向测试：`19 passed`；覆盖红色目标路线、蓝色生成路线、单场景video调用和两栏composite合同。
+- 使用现有HumanML3D `000818_run0` dense-XZ artifact真实重渲染112帧：`video`为`480×480`单场景，`composite`编码为`960×512`两栏；中间帧可见固定相机、人物、红色目标路线和蓝色生成路线。
+- 全仓测试：`247 passed, 3 failed`；3个失败均为工作区已有的40-token `ldf.yaml`与仍锁定50-token的`ldf_multi.yaml`/migration guard不一致，与本轮渲染修改无关。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `utils/visualization/motion_video.py`
+- `utils/training/ldf/evaluation/artifacts.py`
+- `tests/test_visualization.py`
+- `tests/test_ldf_evaluation.py`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+
+尚未完成的后续事项：
+
+- 历史checkpoint目录中的旧MP4不会自动重写；需要重新运行对应generation evaluation才能采用固定相机场景内轨迹布局。
+- 正式配置中的40/50-token不一致仍需作为独立配置迁移处理，本轮没有擅自修改用户正在调整的训练窗口。
+
+## 2026-07-17 · Per-commit anchor与persistent solver-state self-forcing
+
+改动类型：流式坐标协议 / 训练—推理状态分布对齐 / self-forcing / rollout loss
+
+实际改动内容：
+
+- 为`LDF`增加训练与runtime共用的`denoise_step()`，统一使用`delta_beta = beta - next_beta`同时推进root与latent；`generate()`和流式事务均复用这一Euler更新入口。
+- 流式事务改为每次commit后立即执行坐标rebase：先保存rebase前的committed token供world-space输出，再按`(1-beta)`平移persistent root state，最后执行不含translation的纯buffer rolling。
+- `InferenceSession`每次commit都累加committed token末帧的model-space XZ到world origin；删除`rebase_on_roll`配置与旧的roll-time二次平移路径。
+- 新增`utils/training/ldf/rollout.py`。K>1时只在rollout起点调用一次`mix_fixed_noise()`，随后按runtime相同的denoise-step/commit节奏持续携带root与latent noisy state；每个commit只编译一次condition，事务内所有denoise steps共享该condition。
+- K>1的前序commit以及最终commit的前序denoise steps均在`no_grad`下运行，只有最后一个denoise step保留梯度；预测的committed token detach后进入history。K=1继续保留原有ideal bridge、随机phase与velocity MSE路径。
+- 训练侧每次commit同步rebase当前noisy root、clean GT root与XZ约束坐标；latent和fixed source noise不随translation变化。true cold-start继续固定为K=1，persistent rollout要求至少一个真实history token。
+- 新增带beta下限保护的endpoint-stabilizing SmoothL1 loss：由`x0_hat = x_current + beta * v_pred`监督off-path state回到clean endpoint；root与latent分别归约。实现physical XZ boundary displacement辅助loss，但默认权重为0。
+- 配置新增`rollout_weight=1.0`、`offpath_beta_min=0.1`和`root_boundary_weight=0.0`；teacher replay更新为K=2/3/5对应0.5/0.3/0.2，正式配置仍保持`self_forcing.enabled=false`。
+- 启动校验增加persistent rollout scheduler整除条件及loss权重合法性检查；现有checkpoint没有新增参数或持久buffer，仍可直接加载。
+
+改动理由：
+
+- 训练窗口以最后一个history frame为XZ原点，而旧runtime长期使用初始原点，构成明确的anchor contract mismatch，并在Patch4边界放大轨迹锯齿。
+- 旧self-forcing只替换generated clean history，每一步仍从ideal bridge重新构造active noisy state；它没有覆盖runtime通过Euler积分实际访问的off-path root/latent solver state。
+- endpoint-stabilizing loss在ideal路径上与原velocity目标一致，同时对off-path状态提供返回clean endpoint的反馈；beta下限与SmoothL1避免接近零beta时的不稳定目标。
+
+验证：
+
+- LDF stream/self-forcing/inference等定向测试：`58 passed`；migration/config守卫：`36 passed`。
+- 完整测试：`253 passed`。
+- `denoise_step()`Euler parity、perfect velocity的ideal-path推进、per-commit rebase、纯buffer rolling、一次mix、每commit一次condition、K=2/3/5 commit语义、最终step梯度、small-beta finite与boundary gradient均有回归覆盖。
+- 使用EMA权重`step_150000.ckpt`、HumanML3D样本`000021`和相同seed复测dense-XZ stream：ADE从旧artifact的`0.4404 m`降至`0.2217 m`，root token边界跳变从`0.1807 m`降至`0.1240 m`，满足本轮`ADE <= 0.25 m`与`boundary jump <= 0.13 m`目标。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `models/diffusion_forcing_wan.py`
+- `utils/inference/session.py`
+- `utils/training/ldf/{batch,flow,losses,self_forcing,rollout,lightning_module}.py`
+- `configs/{ldf,ldf_multi,stream}.yaml`
+- `train_ldf.py`
+- LDF stream、training、self-forcing、inference与migration guard测试
+- streaming/training/evaluation设计文档
+
+尚未完成的后续事项：
+
+- 本轮没有启动新训练；persistent solver-state rollout用于后续checkpoint微调，需显式启用`self_forcing`后按K curriculum训练。
+- `root_boundary_weight`默认关闭，应在完成persistent rollout微调后再单独消融，不能用它替代solver-state分布对齐。
+
+## 2026-07-17 · 收敛world-space流式公共接口
+
+改动类型：公共接口 / world-model坐标所有权 / 条件重编译合同
+
+实际改动内容：
+
+- 删除`LDF.stream_generate()`。该便利接口只返回每次per-commit rebase之前的model-space token，却不拥有累计`origin_xz`，无法形成自包含的world-space多token输出。
+- 保留`LDF.stream_generate_step()`作为单commit、model-space scheduler primitive；它继续供`InferenceSession`调用，但不负责world route编译、VAE decode或完整输出拼接。
+- 将`InferenceSession.generate()`冻结为唯一公开的world-space多token流式接口。Session在每次commit后更新`origin_xz`，下一事务重新将权威world route/root observations编译到新的model frame。
+- README与LDF model/stream设计文档同步移除`LDF.stream_generate()`，明确model/session的坐标所有权边界。
+- 新增公共接口守卫，拒绝重新暴露缺少world origin的raw多token API；新增两commit回归，验证第二次condition compilation收到第一次commit更新后的world origin。
+
+改动理由：
+
+- per-commit rebase后，相邻committed token属于不同model坐标系；直接拼接raw `HybridMotion`会产生错误world轨迹。
+- 固定`LDFCondition`相对旧origin编译，第一次rebase后便与persistent state错位。允许调用方用外部closure手动维护origin会重复实现`InferenceSession`并造成双重累加风险。
+- `LDFStreamState`继续只拥有normalized solver state；把world origin再加入其中会与`InferenceSession`现有snapshot和route编译职责形成双重所有权。
+
+验证：
+
+- stream/inference/migration定向测试：`53 passed`。
+- 完整测试：`255 passed`。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `models/diffusion_forcing_wan.py`
+- `tests/test_ldf_stream.py`
+- `tests/test_inference.py`
+- `README.md`
+- `docs/rearchitecture/{01_MODEL_ARCHITECTURE_AND_IO,03_STREAMING_ACTIVE_WINDOW,06_LDF_IMPLEMENTATION_DESIGN}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+## 2026-07-17 · 300k self-forcing三段curriculum配置
+
+改动类型：正式训练配置 / self-forcing curriculum
+
+实际改动内容：
+
+- HumanML与HumanML+BABEL正式LDF配置均启用self-forcing，并冻结为三个absolute global-step阶段：`[0,100000)`使用K=1、`[100000,200000)`使用K=2、`[200000,300000)`使用K=5。
+- 配置使用`phase_start_step=100000`、`phase_steps=200000`及阈值`[[0.0,2],[0.5,5]]`；100k之前由现有phase gate强制K=1。
+- K=2与K=5的`teacher_replay`均设为0，保证后两个100k区间不会随机退回K=1。
+- 同步训练配置文档，并新增精确边界回归，覆盖step 99,999、100,000、199,999、200,000和299,999。
+
+改动理由：
+
+- 原配置默认关闭self-forcing，并面向300k之后的额外fine-tune；不符合用户希望在同一次300k训练中依次执行K=1/K=2/K=5的实验设计。
+- 非零teacher replay会使阶段内K不再严格固定，因此本次显式关闭replay，而不是只调整schedule阈值。
+
+验证：
+
+- self-forcing/config/training定向测试：`69 passed`。
+- 完整测试：`256 passed`。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `configs/ldf.yaml`
+- `configs/ldf_multi.yaml`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+使用注意：
+
+- curriculum按checkpoint中的absolute `global_step`计算。只有从step 0启动时三个区间才分别对应本次进程的前三个100k；完整resume非零step会从其所在absolute阶段继续。

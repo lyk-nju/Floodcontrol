@@ -9,7 +9,7 @@
 两种模式共用同一套`InferenceSession`、三角调度、Root/Body forward、constraint CFG、dense XZ route compiler和VAE逐token解码。它们只在LDF窗口是否滚动上有区别：
 
 - `stream`：创建覆盖完整目标序列的固定buffer，从第一个token依次解析到最后一个token；不移动`window_origin`，用于观察完整三角调度在固定序列上的生成质量。
-- `rolling`：使用固定大小在线窗口；达到roll边界后执行真实的window roll、噪声补充和可选XZ rebase，用于模拟部署时的长期rollout。
+- `rolling`：使用固定大小在线窗口；每次commit执行与stream相同的model-origin rebase，达到roll边界后再执行纯buffer roll和噪声补充，用于模拟部署时的长期rollout。
 
 两种模式都一次只commit一个hybrid token，并立即通过持久VAE decoder state解码四帧。`stream`不是一次性offline denoise，`rolling`也不是事后切片模拟。
 
@@ -51,7 +51,6 @@ validation:
     max_horizon_token: 10
     rolling:
       window_tokens: 50
-      rebase_on_roll: true
 
   dense_xz:
     enabled: true
@@ -96,10 +95,10 @@ DDP聚合遵守以下边界：
 
 `probe`为`dense_xz_stream`、`dense_xz_rolling`、`t2m_stream`或`t2m_rolling`。视频失败只产生warning；数值artifact与summary仍然保留。
 
-对于dense XZ probe，两个视频目录承担不同职责：
+对于dense XZ probe，人物和轨迹共享同一个固定正交相机，轨迹直接画在人物脚下的世界地面上，而不是放入独立俯视面板：
 
-- `video/`输出“生成动作 + 俯视XZ轨迹”两栏，便于直接检查动作状态和控制误差；轨迹面板中目标轨迹为绿色，生成轨迹为红色，圆点表示当前帧位置。
-- `composite/`输出“GT动作 + 生成动作 + 同一轨迹面板”三栏，用于同时比较重建姿态、时序和轨迹跟踪。
+- `video/`输出单画面的生成动作；目标/条件轨迹为红色，生成root已走过的轨迹为蓝色，并随人物逐帧延伸。
+- `composite/`输出“GT场景 + 生成场景”两栏；两栏使用相同的目标轨迹和固定相机语义，生成侧额外显示蓝色实际轨迹。
 
 历史checkpoint目录中的旧视频不会被自动重写；重新运行对应generation evaluation后才会采用上述布局。
 

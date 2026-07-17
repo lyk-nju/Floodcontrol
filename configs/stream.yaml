@@ -11,7 +11,6 @@ web:
     window_tokens: 50
     max_horizon_token: 10
     num_denoise_steps: 10
-    rebase_on_roll: true
 
   guidance:
     mode: separated

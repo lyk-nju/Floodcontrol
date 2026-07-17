@@ -10,6 +10,10 @@ from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import make_vae
 from train_ldf import _validate_training_config, main as train_main
 from utils.initialize import instantiate_target, load_config
+from utils.training.ldf.self_forcing import (
+    resolve_self_forcing_k,
+    self_forcing_phase_progress,
+)
 from web_demo.runtime.model_loader import WEB_RUNTIME_BLOCKER, load_model_bundle
 
 
@@ -79,10 +83,14 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     )
     assert cfg.validation.t2m.enabled is True
     assert "max_samples" not in cfg.validation.t2m
-    assert cfg.self_forcing.phase_start_step == 300000
+    assert cfg.self_forcing.enabled is True
+    assert cfg.self_forcing.phase_start_step == 100000
     assert cfg.self_forcing.phase_steps == 200000
-    assert list(cfg.self_forcing.k_schedule) == [[0.0, 2], [0.4, 3], [0.7, 5]]
-    assert cfg.self_forcing.teacher_replay[2] == 0.2
+    assert list(cfg.self_forcing.k_schedule) == [[0.0, 2], [0.5, 5]]
+    assert dict(cfg.self_forcing.teacher_replay) == {2: 0.0, 5: 0.0}
+    assert cfg.loss.rollout_weight == pytest.approx(1.0)
+    assert cfg.loss.offpath_beta_min == pytest.approx(0.1)
+    assert cfg.loss.root_boundary_weight == pytest.approx(0.0)
     assert (
         cfg.lr_scheduler.target
         == "diffusers.optimization.get_cosine_schedule_with_warmup"
@@ -117,7 +125,7 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
         for item in cfg.data.datasets
     )
     assert cfg.model.params.text_len == cfg.text_encoder.text_len == 128
-    assert cfg.self_forcing.enabled is False
+    assert cfg.self_forcing == human_cfg.self_forcing
     assert cfg.data.text_embeddings_path.endswith(
         "HumanML3D_BABEL_t5_text_embeddings.pt"
     )
@@ -128,6 +136,24 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     assert cfg.training.max_horizon_token == 45
     assert cfg.training.constraint_sampling == human_cfg.training.constraint_sampling
     assert cfg.lr_scheduler == human_cfg.lr_scheduler
+
+
+def test_formal_self_forcing_recipe_has_exact_100k_k_boundaries():
+    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+
+    def rollout_steps(global_step: int) -> int:
+        if global_step < cfg.self_forcing.phase_start_step:
+            return 1
+        progress = self_forcing_phase_progress(
+            global_step,
+            phase_start_step=cfg.self_forcing.phase_start_step,
+            phase_steps=cfg.self_forcing.phase_steps,
+        )
+        return resolve_self_forcing_k(progress, cfg.self_forcing.k_schedule)
+
+    assert rollout_steps(0) == rollout_steps(99_999) == 1
+    assert rollout_steps(100_000) == rollout_steps(199_999) == 2
+    assert rollout_steps(200_000) == rollout_steps(299_999) == 5
 
 
 def test_tiny_vae_config_instantiates_public_body_vae():
@@ -328,6 +354,7 @@ def test_training_entry_rejects_invalid_self_forcing_contract(
 def test_training_entry_rejects_enabled_phase_outside_training_run():
     cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
     cfg.config.self_forcing.enabled = True
+    cfg.config.self_forcing.phase_start_step = cfg.trainer.max_steps
     with pytest.raises(ValueError, match="phase_start_step < trainer.max_steps"):
         _validate_training_config(cfg)
 

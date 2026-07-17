@@ -25,7 +25,7 @@ from utils.training.ldf.conditioning import (
     sample_constraint_keep_mask,
     sample_xz_constraint_mask,
 )
-from utils.training.ldf.losses import compute_velocity_loss
+from utils.training.ldf.losses import compute_offpath_loss, compute_velocity_loss
 from utils.training.ldf.self_forcing import (
     SelfForcingState,
     run_self_forcing_rollout,
@@ -327,9 +327,9 @@ class LDFLightningModule(BasicLightningModule):
         )
         constraint_mask &= constraint_keep[:, None, None, None]
 
-        def condition_builder(view):
+        def condition_builder(view, condition_motion):
             return create_xz_condition(
-                clean_root_motion=clean_motion.root_motion,
+                clean_root_motion=condition_motion.root_motion,
                 token_valid_mask=token_valid,
                 constraint_mask=constraint_mask,
                 view=view,
@@ -351,6 +351,20 @@ class LDFLightningModule(BasicLightningModule):
         if validate_contract:
             result.final_step.inputs.validate()
         weights = self.cfg.get("loss") or {}
+        if result.is_rollout:
+            return compute_offpath_loss(
+                result.prediction,
+                result.final_step,
+                root_mean=self.model.root_mean,
+                root_std=self.model.root_std,
+                root_weight=float(weights.get("root_weight", 1.0)),
+                body_weight=float(weights.get("body_weight", 1.0)),
+                rollout_weight=float(weights.get("rollout_weight", 1.0)),
+                offpath_beta_min=float(weights.get("offpath_beta_min", 0.1)),
+                root_boundary_weight=float(
+                    weights.get("root_boundary_weight", 0.0)
+                ),
+            )
         return compute_velocity_loss(
             result.prediction,
             result.final_step,

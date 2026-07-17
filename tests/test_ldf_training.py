@@ -620,14 +620,14 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
         rollout_steps=2,
         latent_dim=module.model.latent_dim,
         initial_history_tokens=2,
-        phase_offset=torch.tensor([0.05]),
+        phase_offset=torch.zeros(1),
         generator=torch.Generator().manual_seed(9),
     )
     anchored = anchor_physical_batch(batch, plan.translation_anchor_xz)
     clean_motion, token_valid = module._create_clean_motion(anchored)
     assert token_valid.all()
 
-    def condition_builder(_view):
+    def condition_builder(_view, _clean_motion):
         null = torch.zeros(1, 8)
         return LDFCondition(
             text_context=[null for _ in range(clean_motion.token_length)],
@@ -642,7 +642,14 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
         previous_root_valid_mask=anchored["previous_root_valid_mask"],
         condition_builder=condition_builder,
     )
-    losses = compute_velocity_loss(result.prediction, result.final_step)
+    from utils.training.ldf.losses import compute_offpath_loss
+
+    losses = compute_offpath_loss(
+        result.prediction,
+        result.final_step,
+        root_mean=module.model.root_mean,
+        root_std=module.model.root_std,
+    )
     losses["total"].backward()
 
     assert all(parameter.grad is None for parameter in module.vae.parameters())
@@ -654,7 +661,7 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
         parameter.grad is not None
         for parameter in module.model.body_transformer.parameters()
     )
-    assert len(result.replacements) == 1
+    assert len(result.replacements) == 2
     assert result.replacements[0].root_motion.grad_fn is None
     assert result.replacements[0].latent_motion.grad_fn is None
     assert result.final_step.loss_mask.sum().item() == 5

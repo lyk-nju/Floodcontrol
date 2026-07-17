@@ -67,46 +67,6 @@ def write_json(path: str | Path, payload: Any) -> Path:
     return destination
 
 
-def _trajectory_panel(
-    target_xz: np.ndarray,
-    predicted_xz: np.ndarray,
-    *,
-    frame_index: int,
-    size: tuple[int, int] = (480, 480),
-) -> Image.Image:
-    width, height = size
-    image = Image.new("RGB", size, "white")
-    draw = ImageDraw.Draw(image)
-    points = np.concatenate([target_xz, predicted_xz], axis=0)
-    lower = points.min(axis=0)
-    upper = points.max(axis=0)
-    span = np.maximum(upper - lower, 1e-4)
-    padding = 40
-    scale = min((width - 2 * padding) / span[0], (height - 2 * padding) / span[1])
-
-    def project(path: np.ndarray) -> list[tuple[float, float]]:
-        center = 0.5 * (lower + upper)
-        x = width / 2.0 + (path[:, 0] - center[0]) * scale
-        y = height / 2.0 - (path[:, 1] - center[1]) * scale
-        return list(zip(x.tolist(), y.tolist()))
-
-    target_points = project(target_xz)
-    predicted_points = project(predicted_xz)
-    if len(target_points) > 1:
-        draw.line(target_points, fill=(20, 150, 20), width=4)
-    if len(predicted_points) > 1:
-        draw.line(predicted_points, fill=(210, 40, 40), width=4)
-    index = min(max(int(frame_index), 0), len(target_points) - 1)
-    for point, color in (
-        (target_points[index], (20, 150, 20)),
-        (predicted_points[index], (210, 40, 40)),
-    ):
-        x, y = point
-        draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=color)
-    draw.text((16, 14), "Dense XZ: target (green) / generated (red)", fill="black")
-    return image
-
-
 def _compose_video_frame(
     images: tuple[Image.Image, ...],
     labels: tuple[str, ...],
@@ -144,59 +104,56 @@ def render_comparison_video(
     composite_path: str | Path,
     caption: str,
     fps: float,
+    trajectory_mask: torch.Tensor | None = None,
 ) -> None:
-    """Render generated+trajectory and GT/generated/trajectory videos."""
+    """Render fixed-camera motion with trajectories embedded in the 3D scene."""
 
     predicted_video_path = Path(predicted_video_path)
     composite_path = Path(composite_path)
     predicted_video_path.parent.mkdir(parents=True, exist_ok=True)
     composite_path.parent.mkdir(parents=True, exist_ok=True)
+    target_xz = target_root.detach().cpu()[:, [0, 2]]
+    if trajectory_mask is None:
+        trajectory_mask = torch.ones(target_xz.shape[0], dtype=torch.bool)
+    else:
+        trajectory_mask = trajectory_mask.detach().cpu().bool()
     with tempfile.TemporaryDirectory(prefix="floodcontrol_eval_") as temporary:
         target_path = Path(temporary) / "target.mp4"
-        predicted_motion_path = Path(temporary) / "predicted.mp4"
-        render_motion_video(target_root, target_body, target_path, fps=fps)
+        render_motion_video(
+            target_root,
+            target_body,
+            target_path,
+            fps=fps,
+            traj_xz=target_xz,
+            traj_mask=trajectory_mask,
+            show_full_trajectory=True,
+        )
         render_motion_video(
             predicted_root,
             predicted_body,
-            predicted_motion_path,
+            predicted_video_path,
             fps=fps,
+            traj_xz=target_xz,
+            traj_mask=trajectory_mask,
+            show_full_trajectory=True,
+            show_generated_trajectory=True,
         )
         target_reader = imageio.get_reader(str(target_path))
-        predicted_reader = imageio.get_reader(str(predicted_motion_path))
-        predicted_writer = imageio.get_writer(
-            str(predicted_video_path), fps=float(fps)
-        )
+        predicted_reader = imageio.get_reader(str(predicted_video_path))
         composite_writer = imageio.get_writer(str(composite_path), fps=float(fps))
-        target_xz = target_root.detach().cpu().numpy()[:, [0, 2]]
-        predicted_xz = predicted_root.detach().cpu().numpy()[:, [0, 2]]
         try:
-            for frame_index, (target_frame, predicted_frame) in enumerate(
-                zip(target_reader, predicted_reader)
-            ):
+            for target_frame, predicted_frame in zip(target_reader, predicted_reader):
                 target_image = Image.fromarray(target_frame).convert("RGB")
                 predicted_image = Image.fromarray(predicted_frame).convert("RGB")
-                panel = _trajectory_panel(
-                    target_xz,
-                    predicted_xz,
-                    frame_index=frame_index,
-                    size=target_image.size,
-                )
-                predicted_writer.append_data(
-                    _compose_video_frame(
-                        (predicted_image, panel),
-                        ("Generated", str(caption)),
-                    )
-                )
                 composite_writer.append_data(
                     _compose_video_frame(
-                        (target_image, predicted_image, panel),
-                        ("Ground truth", "Generated", str(caption)),
+                        (target_image, predicted_image),
+                        ("Ground truth", f"Generated | {caption}"),
                     )
                 )
         finally:
             target_reader.close()
             predicted_reader.close()
-            predicted_writer.close()
             composite_writer.close()
 
 
@@ -256,6 +213,7 @@ def save_dense_xz_sample(
             composite_path=dirs["composite"] / f"{sample_id}.mp4",
             caption=caption,
             fps=fps,
+            trajectory_mask=trajectory_mask,
         )
     return dirs
 

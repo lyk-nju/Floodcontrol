@@ -280,14 +280,33 @@ def test_session_failure_discards_ldf_and_decoder_candidates():
     )
 
 
-def test_session_rebases_only_after_ldf_window_roll():
+def test_session_rebases_every_commit_before_optional_window_roll():
     session = make_session(root_x=2.0)
     chunks = list(session.generate(5))
     assert chunks[-1].trace.window_origin_after == 2
-    assert chunks[-1].trace.rebased
-    assert torch.allclose(session.origin_xz, torch.tensor([[12.0, 20.0]]))
+    assert all(chunk.trace.rebased for chunk in chunks)
     assert torch.allclose(
-        session.ldf_state.previous_root_frame[:, [0, 2]], torch.zeros(1, 2)
+        chunks[-1].root_motion[:, -1, [0, 2]],
+        session.origin_xz,
+    )
+
+
+def test_session_recompiles_each_commit_with_the_updated_world_origin():
+    session = make_session(root_x=2.0)
+    compile_origins = []
+    original_compile = session.condition_compiler.compile
+
+    def recording_compile(*args, origin_xz, **kwargs):
+        compile_origins.append(torch.as_tensor(origin_xz).clone())
+        return original_compile(*args, origin_xz=origin_xz, **kwargs)
+
+    session.condition_compiler.compile = recording_compile
+    chunks = list(session.generate(2))
+    assert len(compile_origins) == 2
+    assert torch.equal(compile_origins[0], torch.tensor([10.0, 20.0]))
+    assert torch.equal(
+        compile_origins[1],
+        chunks[0].root_motion[0, -1, [0, 2]],
     )
 
 
@@ -297,7 +316,25 @@ def test_fixed_stream_session_commits_without_rolling_the_window():
     assert len(chunks) == 5
     assert session.ldf_state.window_origin == 0
     assert session.ldf_state.epoch == 0
-    assert all(not chunk.trace.rebased for chunk in chunks)
+    assert all(chunk.trace.rebased for chunk in chunks)
+    assert torch.allclose(
+        chunks[-1].root_motion[:, -1, [0, 2]],
+        session.origin_xz,
+    )
+
+
+def test_rolling_is_a_pure_buffer_change_after_per_commit_rebase():
+    rolling = make_session(root_x=2.0, rolling=True)
+    fixed = make_session(root_x=2.0, rolling=False)
+    rolling_chunks = list(rolling.generate(5))
+    fixed_chunks = list(fixed.generate(5))
+    assert rolling.ldf_state.epoch == 1
+    assert fixed.ldf_state.epoch == 0
+    assert torch.equal(
+        torch.cat([chunk.root_motion for chunk in rolling_chunks], dim=1),
+        torch.cat([chunk.root_motion for chunk in fixed_chunks], dim=1),
+    )
+    assert torch.equal(rolling.origin_xz, fixed.origin_xz)
 
 
 def test_guidance_is_session_local_and_does_not_mutate_shared_model_defaults():

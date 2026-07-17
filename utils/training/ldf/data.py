@@ -729,7 +729,9 @@ def create_dataloaders(
         if train_dataset is not None:
             train_dataset = MinimumFrameDataset(
                 train_dataset,
-                min_frames=(generation_tokens + maximum_rollout - 1)
+                # Persistent rollout requires one real history token in
+                # addition to C active tokens and K-1 future commits.
+                min_frames=(generation_tokens + maximum_rollout)
                 * FRAMES_PER_TOKEN,
             )
     common = {

@@ -89,7 +89,7 @@ coordinate/value types
 ### 当前状态：新版LDF模型核心已落地
 
 - `models/diffusion_forcing_wan.py` 已公开 `RootTransformer/BodyTransformer/LDF`，两阶段不出现在公共文件名或类名中。
-- `generate/stream_generate/stream_generate_step` 已迁移为显式 `HybridMotion/LDFStreamState`，并通过合成张量的commit、rolling和snapshot/restore测试。
+- `generate/stream_generate_step` 已迁移为显式 `HybridMotion/LDFStreamState`，并通过合成张量的commit、rolling和snapshot/restore测试。`LDF`不公开缺少world origin所有权的多token `stream_generate()`；完整流式生成统一由`InferenceSession.generate()`负责。
 - 旧附加控制网络、专用轨迹编码器、专用attention、tiny模型和外置root planner已经物理删除；constraint CFG由主干接管。
 - body VAE核心、唯一`humanml265`转换、全量本地motion artifacts/VAE statistics、首个300k EMA tokenizer、`body265 -> latent_motion`和显式`VAEDecoderState`已经实现；真实LDF训练改为冻结EMA encoder在线产生deterministic `mu`，其context sampler、latent statistics和hybrid batch已经落地。Web通过`InferenceSession`完成LDF commit、causal decode、四帧chunk与session锁接线；真实LDF训练仍等待正式H/G/F/C、noise/beta、condition与v-predict loss，Web模型加载则等待由该训练冻结的checkpoint合同。
 

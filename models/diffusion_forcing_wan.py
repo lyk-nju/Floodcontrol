@@ -9,7 +9,6 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import replace
-from typing import Iterator
 
 import torch
 import torch.nn as nn
@@ -779,19 +778,104 @@ class LDF(nn.Module):
             local_root_feature_valid=local_valid,
         )
 
+    def denoise_step(
+        self,
+        inputs: LDFInput,
+        next_beta: torch.Tensor,
+        *,
+        use_cfg: bool,
+        cfg_mode: str | None = None,
+        cfg_scale_text: float | None = None,
+        cfg_scale_constraint: float | None = None,
+        cfg_scale_joint: float | None = None,
+    ) -> tuple[HybridMotion, LDFPrediction]:
+        """Advance one Euler denoise step from ``beta`` to ``next_beta``.
+
+        This is the shared solver-state transition used by offline generation,
+        streaming inference, and persistent self-forcing training.  It does not
+        compile conditions, commit tokens, rebase coordinates, or roll buffers.
+        """
+
+        inputs.validate_structure()
+        if not torch.is_tensor(next_beta) or tuple(next_beta.shape) != tuple(
+            inputs.beta.shape
+        ):
+            raise ValueError("next_beta must match inputs.beta [B,T]")
+        next_beta = next_beta.to(device=inputs.beta.device, dtype=inputs.beta.dtype)
+        prediction = (
+            self.predict_with_cfg(
+                inputs,
+                mode=cfg_mode,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_constraint=cfg_scale_constraint,
+                cfg_scale_joint=cfg_scale_joint,
+            )
+            if bool(use_cfg)
+            else self(inputs)
+        )
+        delta_beta = inputs.beta - next_beta
+        next_motion = HybridMotion(
+            inputs.noisy_motion.root_motion
+            + prediction.velocity.root_motion * delta_beta[..., None, None],
+            inputs.noisy_motion.latent_motion
+            + prediction.velocity.latent_motion * delta_beta[..., None],
+        )
+        return next_motion, prediction
+
     def triangular_beta(
         self,
         *,
         timeline_position_ids: torch.Tensor,
-        diffusion_time: float,
+        diffusion_time: float | torch.Tensor,
     ) -> torch.Tensor:
+        time = torch.as_tensor(
+            diffusion_time,
+            device=timeline_position_ids.device,
+            dtype=torch.float32,
+        )
+        if time.ndim == 1:
+            if time.shape[0] != timeline_position_ids.shape[0]:
+                raise ValueError("per-sample diffusion_time must have shape [B]")
+            time = time[:, None]
+        elif time.ndim != 0:
+            raise ValueError("diffusion_time must be scalar or [B]")
         return torch.clamp(
             1.0
             + timeline_position_ids.float() / float(self.chunk_size)
-            - float(diffusion_time),
+            - time,
             min=0.0,
             max=1.0,
         )
+
+    def rebase_motion_state(
+        self,
+        motion: HybridMotion,
+        beta: torch.Tensor,
+        translation_xz: torch.Tensor,
+    ) -> HybridMotion:
+        """Change the model XZ origin without moving the Gaussian source."""
+
+        motion.validate()
+        if tuple(beta.shape) != tuple(motion.root_motion.shape[:2]):
+            raise ValueError("beta must match motion [B,T]")
+        translation = torch.as_tensor(
+            translation_xz,
+            device=motion.root_motion.device,
+            dtype=motion.root_motion.dtype,
+        )
+        if translation.ndim == 1:
+            translation = translation[None]
+        if tuple(translation.shape) != (motion.batch_size, 2):
+            raise ValueError("translation_xz must have shape [2] or [B,2]")
+        normalized_translation = translation / self.root_std[[0, 2]].to(
+            translation
+        )
+        root = motion.root_motion.clone()
+        root[..., [0, 2]] -= (
+            (1.0 - beta)[..., None, None].to(root)
+            * normalized_translation[:, None, None, :].to(root)
+        )
+        return HybridMotion(root, motion.latent_motion.clone())
 
     def _create_step_input(
         self,
@@ -850,10 +934,12 @@ class LDF(nn.Module):
         )[None].expand(
             batch, -1
         )
-        total_microsteps = steps + math.ceil((tokens - 1) * steps / self.chunk_size)
-        for microstep in range(total_microsteps):
-            time = microstep / float(steps)
-            next_time = (microstep + 1) / float(steps)
+        total_denoise_steps = steps + math.ceil(
+            (tokens - 1) * steps / self.chunk_size
+        )
+        for denoise_step_index in range(total_denoise_steps):
+            time = denoise_step_index / float(steps)
+            next_time = (denoise_step_index + 1) / float(steps)
             beta = self.triangular_beta(
                 timeline_position_ids=timeline_positions,
                 diffusion_time=time,
@@ -862,7 +948,6 @@ class LDF(nn.Module):
                 timeline_position_ids=timeline_positions,
                 diffusion_time=next_time,
             )
-            delta = beta - next_beta
             inputs = self._create_step_input(
                 motion,
                 beta=beta,
@@ -873,18 +958,14 @@ class LDF(nn.Module):
                 previous_root_frame=None,
                 previous_root_valid_mask=None,
             )
-            prediction = self.predict_with_cfg(
+            motion, _ = self.denoise_step(
                 inputs,
-                mode=cfg_mode,
+                next_beta,
+                use_cfg=True,
+                cfg_mode=cfg_mode,
                 cfg_scale_text=cfg_scale_text,
                 cfg_scale_constraint=cfg_scale_constraint,
                 cfg_scale_joint=cfg_scale_joint,
-            )
-            motion = HybridMotion(
-                motion.root_motion
-                + prediction.velocity.root_motion * delta[..., None, None],
-                motion.latent_motion
-                + prediction.velocity.latent_motion * delta[..., None],
             )
         return HybridMotion(
             self._project_normalized_root(motion.root_motion),
@@ -1019,7 +1100,7 @@ class LDF(nn.Module):
         if not bool(torch.isfinite(translation).all()):
             raise ValueError("translation_xz must contain only finite values")
 
-        root = state.noisy_motion.root_motion.clone()
+        root = state.noisy_motion.root_motion
         positions = torch.arange(
             state.window_origin,
             state.window_origin + state.noisy_motion.token_length,
@@ -1030,11 +1111,7 @@ class LDF(nn.Module):
             timeline_position_ids=positions,
             diffusion_time=state.current_step / float(state.num_denoise_steps),
         ).to(dtype=root.dtype)
-        normalized_translation = translation / self.root_std[[0, 2]].to(root)
-        root[..., [0, 2]] -= (
-            (1.0 - beta)[..., None, None]
-            * normalized_translation[:, None, None, :]
-        )
+        motion = self.rebase_motion_state(state.noisy_motion, beta, translation)
 
         previous = state.previous_root_frame
         if previous is not None:
@@ -1042,7 +1119,7 @@ class LDF(nn.Module):
             previous[..., [0, 2]] -= translation.to(previous)
         rebased = replace(
             state,
-            noisy_motion=HybridMotion(root, state.noisy_motion.latent_motion.clone()),
+            noisy_motion=motion,
             previous_root_frame=previous,
         )
         rebased.validate()
@@ -1076,13 +1153,13 @@ class LDF(nn.Module):
             * steps
             / float(self.chunk_size)
         )
-        microsteps = end_step - state.current_step
-        if microsteps <= 0:
+        denoise_steps = end_step - state.current_step
+        if denoise_steps <= 0:
             raise RuntimeError("stream scheduler did not advance")
-        for offset in range(microsteps):
-            microstep = state.current_step + offset
-            time = microstep / float(steps)
-            next_time = (microstep + 1) / float(steps)
+        for offset in range(denoise_steps):
+            denoise_step_index = state.current_step + offset
+            time = denoise_step_index / float(steps)
+            next_time = (denoise_step_index + 1) / float(steps)
             beta = self.triangular_beta(
                 timeline_position_ids=timeline_positions,
                 diffusion_time=time,
@@ -1091,7 +1168,6 @@ class LDF(nn.Module):
                 timeline_position_ids=timeline_positions,
                 diffusion_time=next_time,
             )
-            delta = beta - next_beta
             inputs = self._create_step_input(
                 motion,
                 beta=beta,
@@ -1108,18 +1184,14 @@ class LDF(nn.Module):
                     )
                 ),
             )
-            prediction = self.predict_with_cfg(
+            motion, _ = self.denoise_step(
                 inputs,
-                mode=cfg_mode,
+                next_beta,
+                use_cfg=True,
+                cfg_mode=cfg_mode,
                 cfg_scale_text=cfg_scale_text,
                 cfg_scale_constraint=cfg_scale_constraint,
                 cfg_scale_joint=cfg_scale_joint,
-            )
-            motion = HybridMotion(
-                motion.root_motion
-                + prediction.velocity.root_motion * delta[..., None, None],
-                motion.latent_motion
-                + prediction.velocity.latent_motion * delta[..., None],
             )
 
         new_commit = state.commit_index + 1
@@ -1142,40 +1214,12 @@ class LDF(nn.Module):
             current_step=end_step,
             commit_index=new_commit,
         )
+        committed_physical = self.denormalize_root(committed.root_motion)
+        translation_xz = committed_physical[:, 0, -1, [0, 2]]
+        new_state = self.rebase_stream_state(new_state, translation_xz)
         return (
             self._roll_window(new_state) if bool(roll_window) else new_state
         ), committed
-
-    @torch.no_grad()
-    def stream_generate(
-        self,
-        state: LDFStreamState,
-        condition_provider,
-        *,
-        num_chunks: int,
-        roll_window: bool = True,
-        cfg_mode: str | None = None,
-        cfg_scale_text: float | None = None,
-        cfg_scale_constraint: float | None = None,
-        cfg_scale_joint: float | None = None,
-    ) -> Iterator[HybridMotion]:
-        current = state
-        for _ in range(int(num_chunks)):
-            condition = (
-                condition_provider(current)
-                if callable(condition_provider)
-                else condition_provider
-            )
-            current, committed = self.stream_generate_step(
-                current,
-                condition,
-                roll_window=roll_window,
-                cfg_mode=cfg_mode,
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_constraint=cfg_scale_constraint,
-                cfg_scale_joint=cfg_scale_joint,
-            )
-            yield committed
 
     @staticmethod
     def create_stream_snapshot(state: LDFStreamState) -> dict:

@@ -14,7 +14,7 @@ root_motion + latent_motion
 - strict `4 frames / token` 时间协议；
 - body-only causal VAE核心、body265 codec、分组loss和仅含cache的显式`VAEDecoderState`已经落地；
 - `HybridMotion`、typed condition、Root/Body non-causal LDF、constraint CFG以及dense trajectory / sparse waypoint / future goal XZ训练bridge已经落地；
-- `generate/stream_generate/stream_generate_step`已经使用显式Hybrid流式状态；
+- `generate/stream_generate_step`已经使用显式Hybrid流式状态；多token世界坐标生成统一由`InferenceSession.generate()`负责；
 - HumanML3D/BABEL的独立body265 artifact、联合statistics与同构multi-dataset训练入口；
 - 分主题架构文档和契约测试。
 

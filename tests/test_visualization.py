@@ -66,6 +66,38 @@ def test_joint_renderer_writes_one_frame_per_motion_frame(tmp_path, monkeypatch)
     assert writer.closed
 
 
+def test_joint_renderer_embeds_target_and_generated_trajectories_in_scene(
+    tmp_path,
+    monkeypatch,
+):
+    writer = RecordingWriter()
+    monkeypatch.setattr(
+        motion_video.imageio,
+        "get_writer",
+        lambda path, fps: writer,
+    )
+    joints = _joints(3)
+    joints[..., 0] += torch.linspace(0.0, 1.0, 3)[:, None]
+    target_xz = torch.tensor([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]])
+    motion_video.render_joint_video(
+        joints,
+        tmp_path / "motion_with_route.mp4",
+        traj_xz=target_xz,
+        traj_mask=torch.ones(3, dtype=torch.bool),
+        show_full_trajectory=True,
+        show_generated_trajectory=True,
+    )
+
+    final_frame = writer.frames[-1]
+    scene = final_frame[30:]
+    assert np.any(
+        np.all(scene == motion_video.TARGET_TRAJECTORY_COLOR, axis=-1)
+    )
+    assert np.any(
+        np.all(scene == motion_video.GENERATED_TRAJECTORY_COLOR, axis=-1)
+    )
+
+
 def test_joint_renderer_closes_writer_when_encoding_fails(tmp_path, monkeypatch):
     writer = RecordingWriter(fail_on_append=True)
     monkeypatch.setattr(

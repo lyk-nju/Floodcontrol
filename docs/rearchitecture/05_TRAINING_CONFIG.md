@@ -30,11 +30,11 @@ model.params:
   chunk_size: 5
 
 self_forcing:
-  enabled: false
-  phase_start_step: 300000
+  enabled: true
+  phase_start_step: 100000
   phase_steps: 200000
-  k_schedule: [[0.0, 2], [0.4, 3], [0.7, 5]]
-  teacher_replay: {2: 0.2, 3: 0.1, 5: 0.1}
+  k_schedule: [[0.0, 2], [0.5, 5]]
+  teacher_replay: {2: 0.0, 5: 0.0}
 
 text_encoder:
   text_len: 128
@@ -80,13 +80,15 @@ validation:
 
 `max_frames=200`与`window.max_tokens=50`共同定义每个sample最多10秒的parent窗口；短动作保留自然长度，长动作随机裁50 tokens，batch仅右padding。`chunk_size`与`window.generation_tokens`必须同为5。每个sample独立采样generation start，由此得到`H_i`和`F_i`，唯一预算是`H_i+5+F_i<=50`；不再存在独立history上限。`H=0`严格表示true cold start，只允许parent从真实序列第0 token开始，并要求VAE context为0、previous-root无效；中间parent的合法范围从`H=1`开始。`max_horizon_token=45`是future XZ的最大时间范围，实际可见范围为`min(45,F_i)`，并不表示每次都提供45个观测。首轮teacher baseline使用K=1；self-forcing K步会从同一预算预留`K-1`个rollout token，并自动过滤短于`5+K-1` tokens的训练sample。LDF在300k训练内使用5k-step linear warmup后的cosine decay。约束按50% dense trajectory、25% 1–4个frame-level waypoints（每个waypoint是一帧XZ观测）、25%单一future goal采样；constraint dropout与text dropout独立覆盖四种CFG条件组合。
 
-`phase_start_step`是硬启动边界而不只是progress原点：此前固定K=1，到达边界后才采样schedule与teacher replay。启动入口会一次性校验phase非负/正长度、threshold位于`[0,1]`且严格递增、K严格递增且不小于2、replay keys与schedule K完全一致且概率合法，以及最大K的窗口预算。`enabled=true`时还要求`phase_start_step < trainer.max_steps`；因此从300k checkpoint完整resume做fine-tune时，应把`trainer.max_steps`延长到例如500k。若只加载权重并重置global step，则应同步把`phase_start_step`改为0。
+`phase_start_step`是硬启动边界而不只是progress原点：此前固定K=1，到达边界后才采样schedule与teacher replay。当前300k recipe对应`0–100k: K=1`、`100k–200k: K=2`、`200k–300k: K=5`，并将replay概率设为0以保持严格分段。启动入口会一次性校验phase非负/正长度、threshold位于`[0,1]`且严格递增、K严格递增且不小于2、replay keys与schedule K完全一致且概率合法，以及最大K的窗口预算。该进度使用checkpoint中的absolute `global_step`；若从非零step完整resume，分段不会相对新进程重新计时。
 
 WandB的key/entity仍由共享环境配置提供，但实验级project由各训练配置所有：`vae*.yaml`显式使用`VAE_Flood`，`ldf*.yaml`显式使用`Floodcontrol`，避免共享路径配置改变某一类实验的冻结recipe。
 
 `configs/ldf.yaml`是HumanML3D teacher baseline；`configs/ldf_multi.yaml`拼接HumanML3D+BABEL，并与baseline共享HumanML3D canonical root statistics、VAE physical/latent statistics和模型合同。这样无论multi模型从头训练还是从HumanML checkpoint继续训练，normalized root语义都不会随数据mixture变化；multi配置只切换Dataset与包含BABEL caption的联合T5表。两个入口默认使用单卡Lightning，也支持将`trainer.devices`设为多卡并使用`strategy: ddp`；普通loss validation、dense-XZ/video和完整T2M均走同一DDP作业，不需要关闭训练期生成评测。LDF使用EMA并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`，后者覆盖全部正式split，而不依赖当前训练或评测配置。`tools/pretokenize_t5_text.py`据此生成包含空文本、完整数据集caption和离线内容`content_id`的表。resume同时校验路径、数值statistics与文本内容身份。
 
 训练DataLoader内部固定使用20-frame（1秒）长度bucket减少batch右侧padding。这是20 FPS项目合同下的加载实现细节，不改变crop或窗口语义，因此不暴露为正式YAML实验参数。DDP时sampler先构造`per_device_batch_size * world_size`的全局同长度batch，再为每个rank切分自己的per-device batch；不足一个全局batch的bucket会确定性重复少量样本，使所有rank拥有完全相同的step数。validation使用无重复的strided rank shard。由于这两条sampler都由项目显式拥有，Trainer固定`use_distributed_sampler: false`，禁止Lightning再次注入一层DistributedSampler。
+
+每次LDF fit启动都会打印per-GPU显存预算。启动报告分别列出当前参数与buffer、梯度、Adam/AdamW moment、EMA shadow及可能的DDP通信bucket，并用设备总显存减去这些固定项，显示留给activation、CUDA context、allocator fragmentation和kernel workspace的余量。该值是保守的固定显存预算，不伪装成无法静态确定的硬上限。sanity check结束后会重置CUDA peak；首个完整训练step（包括backward和首次optimizer state分配）打印所有rank中的最大`allocated/reserved`实测值，后续validation或generation刷新峰值时继续报告，fit结束时输出整轮累计峰值。
 
 正式YAML不再暴露`contract_validation_every_n_steps`。`debug: false`时只执行structure validation；需要定位动态合同问题时设置`debug: true`，代码会在debug路径执行完整plan/input检查并承担相应GPU同步开销。
 

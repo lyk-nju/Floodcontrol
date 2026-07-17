@@ -22,6 +22,7 @@ __all__ = [
     "anchor_physical_batch",
     "build_ldf_training_step",
     "create_xz_condition",
+    "compute_offpath_loss",
     "compute_velocity_loss",
     "create_dataloaders",
     "create_dataset",
@@ -64,6 +65,10 @@ _EXPORTS = {
     "compute_velocity_loss": (
         "utils.training.ldf.losses",
         "compute_velocity_loss",
+    ),
+    "compute_offpath_loss": (
+        "utils.training.ldf.losses",
+        "compute_offpath_loss",
     ),
     "create_dataloaders": ("utils.training.ldf.data", "create_dataloaders"),
     "create_dataset": ("utils.training.ldf.data", "create_dataset"),

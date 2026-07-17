@@ -4,6 +4,7 @@ import torch
 
 from models.diffusion_forcing_wan import LDF
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
+from utils.training.ldf.flow import mix_fixed_noise
 
 
 def make_model():
@@ -39,6 +40,12 @@ def stream_condition(tokens=6):
     return LDFCondition([prompt for _ in range(tokens)], [torch.zeros(1, 4)])
 
 
+def test_ldf_does_not_expose_world_incomplete_multi_token_stream_api():
+    model = make_model()
+    assert not hasattr(model, "stream_generate")
+    assert callable(model.stream_generate_step)
+
+
 def test_step_input_excludes_the_untouched_pure_noise_frontier():
     model = make_model()
     motion = HybridMotion(torch.zeros(1, 6, 4, 5), torch.zeros(1, 6, 3))
@@ -56,6 +63,55 @@ def test_step_input_excludes_the_untouched_pure_noise_frontier():
     )
     assert inputs.generation_mask.tolist() == [[True, False, False, False, False, False]]
     inputs.validate()
+
+
+def test_denoise_step_matches_euler_update_and_preserves_ideal_bridge():
+    model = make_model()
+    clean = HybridMotion(
+        torch.randn(1, 6, 4, 5),
+        torch.randn(1, 6, 3),
+    )
+    noise = HybridMotion(
+        torch.randn_like(clean.root_motion),
+        torch.randn_like(clean.latent_motion),
+    )
+    beta = torch.tensor([[0.0, 0.4, 0.7, 1.0, 1.0, 1.0]])
+    next_beta = torch.tensor([[0.0, 0.2, 0.5, 0.8, 1.0, 1.0]])
+    current = mix_fixed_noise(clean, noise, beta)
+    target = HybridMotion(
+        clean.root_motion - noise.root_motion,
+        clean.latent_motion - noise.latent_motion,
+    )
+
+    def perfect_forward(self, inputs):
+        local = torch.zeros(*inputs.noisy_motion.root_motion.shape[:3], 4)
+        return LDFPrediction(
+            velocity=target,
+            clean_root_motion=clean.root_motion,
+            local_root_motion=local,
+            local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
+        )
+
+    model.forward = types.MethodType(perfect_forward, model)
+    inputs = model._create_step_input(
+        current,
+        beta=beta,
+        next_beta=next_beta,
+        timeline_position_ids=torch.arange(6)[None],
+        commit_index=1,
+        condition=stream_condition(),
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+    )
+    advanced, prediction = model.denoise_step(
+        inputs,
+        next_beta,
+        use_cfg=False,
+    )
+    expected = mix_fixed_noise(clean, noise, next_beta)
+    assert torch.allclose(advanced.root_motion, expected.root_motion)
+    assert torch.allclose(advanced.latent_motion, expected.latent_motion)
+    assert prediction.velocity is target
 
 
 def test_stream_updates_both_fields_and_snapshot_restore_is_deterministic():

@@ -23,6 +23,8 @@ from utils.visualization.skeleton import HUMANML22_CHAINS, HUMANML22_CHAIN_COLOR
 DEFAULT_IMAGE_SIZE = (480, 480)
 DEFAULT_BACKGROUND_COLOR = (255, 255, 255)
 DEFAULT_JOINT_COLOR = (0, 100, 255)
+TARGET_TRAJECTORY_COLOR = (255, 0, 0)
+GENERATED_TRAJECTORY_COLOR = (0, 0, 255)
 
 
 def _numpy_float32(value: np.ndarray | torch.Tensor, *, name: str) -> np.ndarray:
@@ -50,14 +52,15 @@ def _validate_image_size(image_size: tuple[int, int]) -> tuple[int, int]:
     return width, height
 
 
-def _project_motion(
+def _project_scene(
     joint_positions: np.ndarray,
     *,
+    trajectory_xz: np.ndarray | None,
     width: int,
     height: int,
     padding: int,
-) -> np.ndarray:
-    """Project a complete world-space motion into one fixed orthographic view."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Project motion and ground-plane paths with one fixed orthographic camera."""
     elevation = -math.pi / 10.0
     azimuth = -3.0 * math.pi / 4.0
     view = np.asarray(
@@ -75,8 +78,29 @@ def _project_motion(
     camera_up = np.cross(camera_right, view)
     camera_up /= np.linalg.norm(camera_up)
 
-    horizontal = joint_positions @ camera_right
-    vertical = joint_positions @ camera_up
+    root_ground = np.stack(
+        (
+            joint_positions[:, 0, 0],
+            np.zeros(joint_positions.shape[0], dtype=np.float32),
+            joint_positions[:, 0, 2],
+        ),
+        axis=-1,
+    )
+    scene_points = [joint_positions.reshape(-1, 3), root_ground]
+    trajectory_ground = None
+    if trajectory_xz is not None:
+        trajectory_ground = np.stack(
+            (
+                trajectory_xz[:, 0],
+                np.zeros(trajectory_xz.shape[0], dtype=np.float32),
+                trajectory_xz[:, 1],
+            ),
+            axis=-1,
+        )
+        scene_points.append(trajectory_ground)
+    bounds_points = np.concatenate(scene_points, axis=0)
+    horizontal = bounds_points @ camera_right
+    vertical = bounds_points @ camera_up
     horizontal_min, horizontal_max = float(horizontal.min()), float(horizontal.max())
     vertical_min, vertical_max = float(vertical.min()), float(vertical.max())
     horizontal_range = max(horizontal_max - horizontal_min, 1e-6)
@@ -89,9 +113,18 @@ def _project_motion(
 
     horizontal_center = 0.5 * (horizontal_min + horizontal_max)
     vertical_center = 0.5 * (vertical_min + vertical_max)
-    screen_x = width / 2.0 + (horizontal - horizontal_center) * scale
-    screen_y = height / 2.0 - (vertical - vertical_center) * scale
-    return np.stack((screen_x, screen_y), axis=-1)
+    def project(points: np.ndarray) -> np.ndarray:
+        projected_horizontal = points @ camera_right
+        projected_vertical = points @ camera_up
+        screen_x = width / 2.0 + (projected_horizontal - horizontal_center) * scale
+        screen_y = height / 2.0 - (projected_vertical - vertical_center) * scale
+        return np.stack((screen_x, screen_y), axis=-1)
+
+    return (
+        project(joint_positions),
+        project(root_ground),
+        None if trajectory_ground is None else project(trajectory_ground),
+    )
 
 
 def render_joint_video(
@@ -103,6 +136,10 @@ def render_joint_video(
     padding: int = 24,
     bone_width: int = 4,
     joint_radius: int = 3,
+    traj_xz: np.ndarray | torch.Tensor | None = None,
+    traj_mask: np.ndarray | torch.Tensor | None = None,
+    show_full_trajectory: bool = False,
+    show_generated_trajectory: bool = False,
 ) -> None:
     """Render world-space HumanML22 joints as a fixed-camera MP4.
 
@@ -114,6 +151,12 @@ def render_joint_video(
         padding: Minimum projection margin in pixels.
         bone_width: Bone line width in pixels.
         joint_radius: Joint circle radius in pixels.
+        traj_xz: Optional physical target/conditioning path ``[F,2]`` as x/z.
+        traj_mask: Optional observed-frame mask ``[F]`` for the target path.
+        show_full_trajectory: Draw the complete target path from frame zero;
+            otherwise reveal it up to the current frame.
+        show_generated_trajectory: Draw the generated root path up to the
+            current frame using the same timestamps as ``traj_mask``.
     """
     joints = _numpy_float32(joint_positions, name="joint_positions")
     if joints.ndim != 3 or tuple(joints.shape[1:]) != (NUM_JOINTS, 3):
@@ -135,14 +178,89 @@ def render_joint_video(
             raise ValueError(f"{name} must be a non-negative integer")
     padding, bone_width, joint_radius = int(padding), int(bone_width), int(joint_radius)
 
-    projected = _project_motion(joints, width=width, height=height, padding=padding)
+    trajectory = None
+    trajectory_mask = None
+    if traj_xz is not None:
+        trajectory = _numpy_float32(traj_xz, name="traj_xz")
+        if trajectory.ndim != 2 or trajectory.shape != (joints.shape[0], 2):
+            raise ValueError(
+                f"traj_xz must be [F,2] and match motion length, got {tuple(trajectory.shape)}"
+            )
+        if traj_mask is None:
+            trajectory_mask = np.ones(joints.shape[0], dtype=bool)
+        else:
+            if isinstance(traj_mask, torch.Tensor):
+                traj_mask = traj_mask.detach().cpu().numpy()
+            trajectory_mask = np.asarray(traj_mask)
+            if trajectory_mask.shape != (joints.shape[0],):
+                raise ValueError(
+                    "traj_mask must be [F] and match motion length, "
+                    f"got {tuple(trajectory_mask.shape)}"
+                )
+            trajectory_mask = trajectory_mask.astype(bool, copy=False)
+    elif traj_mask is not None:
+        raise ValueError("traj_mask requires traj_xz")
+    if show_generated_trajectory and trajectory is None:
+        raise ValueError("show_generated_trajectory requires traj_xz")
+
+    projected, projected_root, projected_trajectory = _project_scene(
+        joints,
+        trajectory_xz=trajectory,
+        width=width,
+        height=height,
+        padding=padding,
+    )
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     writer = imageio.get_writer(str(destination), fps=fps)
     try:
-        for frame_positions in projected:
+        for frame_index, frame_positions in enumerate(projected):
             image = Image.new("RGB", (width, height), DEFAULT_BACKGROUND_COLOR)
             draw = ImageDraw.Draw(image)
+            if projected_trajectory is not None and trajectory_mask is not None:
+                target_limit = len(trajectory_mask) if show_full_trajectory else frame_index + 1
+                target_indices = np.flatnonzero(trajectory_mask[:target_limit])
+                target_points = [
+                    tuple(projected_trajectory[index]) for index in target_indices
+                ]
+                if len(target_points) > 1:
+                    draw.line(target_points, fill=TARGET_TRAJECTORY_COLOR, width=3)
+                for point in target_points:
+                    x, y = point
+                    draw.ellipse(
+                        (x - 2, y - 2, x + 2, y + 2),
+                        fill=TARGET_TRAJECTORY_COLOR,
+                    )
+
+                if show_generated_trajectory:
+                    generated_indices = np.flatnonzero(
+                        trajectory_mask[: frame_index + 1]
+                    )
+                    generated_points = [
+                        tuple(projected_root[index]) for index in generated_indices
+                    ]
+                    if len(generated_points) > 1:
+                        draw.line(
+                            generated_points,
+                            fill=GENERATED_TRAJECTORY_COLOR,
+                            width=3,
+                        )
+                    if generated_points:
+                        x, y = generated_points[-1]
+                        draw.ellipse(
+                            (x - 5, y - 5, x + 5, y + 5),
+                            fill=GENERATED_TRAJECTORY_COLOR,
+                        )
+
+                draw.line((12, 17, 34, 17), fill=TARGET_TRAJECTORY_COLOR, width=3)
+                draw.text((40, 10), "target", fill=(0, 0, 0))
+                if show_generated_trajectory:
+                    draw.line(
+                        (104, 17, 126, 17),
+                        fill=GENERATED_TRAJECTORY_COLOR,
+                        width=3,
+                    )
+                    draw.text((132, 10), "generated", fill=(0, 0, 0))
             for chain_index, chain in enumerate(HUMANML22_CHAINS):
                 color = HUMANML22_CHAIN_COLORS[chain_index]
                 for start, end in zip(chain[:-1], chain[1:], strict=True):
@@ -173,8 +291,12 @@ def render_motion_video(
     *,
     fps: float = 20.0,
     image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE,
+    traj_xz: np.ndarray | torch.Tensor | None = None,
+    traj_mask: np.ndarray | torch.Tensor | None = None,
+    show_full_trajectory: bool = False,
+    show_generated_trajectory: bool = False,
 ) -> None:
-    """Recover and render one physical root5/body265 motion."""
+    """Recover and render one physical root5/body265 motion and optional route."""
     root = torch.from_numpy(_numpy_float32(root_motion, name="root_motion"))
     body = torch.from_numpy(_numpy_float32(body_motion, name="body_motion"))
     if root.ndim != 2 or root.shape[-1] != ROOT_DIM:
@@ -184,7 +306,16 @@ def render_motion_video(
     if root.shape[0] != body.shape[0]:
         raise ValueError("root_motion and body_motion must share frame length")
     joints = recover_joint_positions(root, body)
-    render_joint_video(joints, output_path, fps=fps, image_size=image_size)
+    render_joint_video(
+        joints,
+        output_path,
+        fps=fps,
+        image_size=image_size,
+        traj_xz=traj_xz,
+        traj_mask=traj_mask,
+        show_full_trajectory=show_full_trajectory,
+        show_generated_trajectory=show_generated_trajectory,
+    )
 
 
 __all__ = ["render_joint_video", "render_motion_video"]

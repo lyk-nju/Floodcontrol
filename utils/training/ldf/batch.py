@@ -41,9 +41,11 @@ class LDFTrainingStep:
     loss_mask: torch.Tensor
     noise: HybridMotion
     view: LDFStepView
+    clean_motion: HybridMotion
+    is_rollout: bool = False
 
 
-ConditionBuilder = Callable[[LDFStepView], LDFCondition]
+ConditionBuilder = Callable[[LDFStepView, HybridMotion], LDFCondition]
 
 
 def anchor_physical_batch(
@@ -97,7 +99,7 @@ def build_ldf_training_step(
     previous_root_valid_mask: torch.Tensor | None,
     condition_builder: ConditionBuilder,
 ) -> LDFTrainingStep:
-    """Build one padded, per-sample history/active/future LDF contract."""
+    """Build the unchanged K=1 ideal-bridge training contract."""
 
     clean_motion.validate()
     batch = clean_motion.batch_size
@@ -162,7 +164,7 @@ def build_ldf_training_step(
         rope_position_ids=rope,
         beta=beta,
     )
-    condition = condition_builder(view)
+    condition = condition_builder(view, clean_motion)
     if not isinstance(condition, LDFCondition):
         raise TypeError("condition_builder must return LDFCondition")
     inputs = LDFInput(
@@ -183,6 +185,95 @@ def build_ldf_training_step(
         loss_mask=loss_mask,
         noise=noise,
         view=view,
+        clean_motion=clean_motion,
+    )
+
+
+def build_ldf_rollout_step(
+    *,
+    noisy_motion: HybridMotion,
+    clean_motion: HybridMotion,
+    noise: HybridMotion,
+    beta: torch.Tensor,
+    source_start_token: torch.Tensor,
+    span_token_count: torch.Tensor,
+    history_end: torch.Tensor,
+    active_tokens: int,
+    step_index: int,
+    previous_root_frame: torch.Tensor | None,
+    previous_root_valid_mask: torch.Tensor | None,
+    condition: LDFCondition,
+) -> LDFTrainingStep:
+    """Build an LDF input around an already-evolved solver state.
+
+    Unlike :func:`build_ldf_training_step`, this function never calls
+    ``mix_fixed_noise`` and never recompiles the condition.  The caller owns
+    the persistent noisy state and may reuse the returned condition contract
+    for every denoise step in one commit transaction.
+    """
+
+    noisy_motion.validate()
+    clean_motion.validate()
+    noise.validate()
+    batch = noisy_motion.batch_size
+    span_tokens = noisy_motion.token_length
+    if clean_motion.root_motion.shape != noisy_motion.root_motion.shape or (
+        clean_motion.latent_motion.shape != noisy_motion.latent_motion.shape
+    ):
+        raise ValueError("clean_motion and noisy_motion must share shapes")
+    if tuple(beta.shape) != (batch, span_tokens):
+        raise ValueError("beta must match the rollout [B,T] axis")
+
+    device = noisy_motion.root_motion.device
+    source_start = source_start_token.to(device=device, dtype=torch.long).view(-1)
+    span_count = span_token_count.to(device=device, dtype=torch.long).view(-1)
+    history_end = history_end.to(device=device, dtype=torch.long).view(-1)
+    if any(tuple(value.shape) != (batch,) for value in (source_start, span_count, history_end)):
+        raise ValueError("source_start, span_count and history_end must be [B]")
+
+    positions = torch.arange(span_tokens, device=device, dtype=torch.long)[None].expand(
+        batch, -1
+    )
+    timeline = source_start[:, None] + positions
+    valid = positions < span_count[:, None]
+    active_end = history_end + int(active_tokens)
+    history_mask = valid & (positions < history_end[:, None])
+    loss_mask = (
+        valid
+        & (positions >= history_end[:, None])
+        & (positions < active_end[:, None])
+    )
+    rope = positions - history_end[:, None]
+    view = LDFStepView(
+        step_index=int(step_index),
+        history_end=history_end,
+        active_start=history_end,
+        active_end=active_end,
+        frontier_start=active_end,
+        timeline_position_ids=timeline,
+        rope_position_ids=rope,
+        beta=beta,
+    )
+    inputs = LDFInput(
+        noisy_motion=noisy_motion,
+        beta=beta,
+        history_mask=history_mask,
+        generation_mask=loss_mask,
+        timeline_position_ids=timeline,
+        rope_position_ids=rope,
+        previous_root_frame=previous_root_frame,
+        previous_root_valid_mask=previous_root_valid_mask,
+        condition=condition,
+    )
+    inputs.validate_structure()
+    return LDFTrainingStep(
+        inputs=inputs,
+        target_velocity=flow_velocity_target(clean_motion, noise),
+        loss_mask=loss_mask,
+        noise=noise,
+        view=view,
+        clean_motion=clean_motion,
+        is_rollout=True,
     )
 
 
@@ -191,5 +282,6 @@ __all__ = [
     "LDFStepView",
     "LDFTrainingStep",
     "anchor_physical_batch",
+    "build_ldf_rollout_step",
     "build_ldf_training_step",
 ]

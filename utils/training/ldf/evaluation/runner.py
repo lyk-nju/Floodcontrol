@@ -266,7 +266,6 @@ class LDFEvaluationRunner:
             "num_denoise_steps": int(generation.num_denoise_steps),
             "max_horizon_token": int(generation.max_horizon_token),
             "rolling_window_tokens": int(generation.rolling.window_tokens),
-            "rebase_on_roll": bool(generation.rolling.get("rebase_on_roll", True)),
             "render": bool(generation.get("render", True)),
         }
 
@@ -339,7 +338,6 @@ class LDFEvaluationRunner:
                         rolling_window_tokens=config["rolling_window_tokens"],
                         max_horizon_token=config["max_horizon_token"],
                         num_denoise_steps=config["num_denoise_steps"],
-                        rebase_on_roll=config["rebase_on_roll"],
                     )
                     record = compute_dense_xz_metrics(
                         generated.root_motion,
@@ -502,7 +500,6 @@ class LDFEvaluationRunner:
                     rolling_window_tokens=config["rolling_window_tokens"],
                     max_horizon_token=config["max_horizon_token"],
                     num_denoise_steps=config["num_denoise_steps"],
-                    rebase_on_roll=config["rebase_on_roll"],
                 )
                 reference = convert_root5_body265_to_humanml263(
                     sample["root_motion"][:frames],

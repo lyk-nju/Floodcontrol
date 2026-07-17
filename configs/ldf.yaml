@@ -33,8 +33,7 @@ validation:
     num_denoise_steps: 10
     max_horizon_token: 10
     rolling:
-      window_tokens: 40
-      rebase_on_roll: true
+      window_tokens: 50
 
   dense_xz:
     enabled: true
@@ -43,7 +42,7 @@ validation:
     segment_frames: 20
 
   t2m:
-    enabled: false
+    enabled: true
     steps: 10000
 
 vae:
@@ -75,7 +74,7 @@ data:
   artifact_path: artifacts
   text_path: texts
   min_frames: 20
-  max_frames: 160
+  max_frames: 200
   random_yaw: true
   train_batch_size: 8
   val_batch_size: 16
@@ -126,10 +125,10 @@ training:
   text_dropout: 0.1
   constraint_dropout: 0.1
   window:
-    max_tokens: 40
+    max_tokens: 50
     generation_tokens: 5
     sampling: random_generation_start
-  max_horizon_token: 35
+  max_horizon_token: 45
   constraint_sampling:
     dense_probability: 0.5
     waypoint_probability: 0.25
@@ -139,20 +138,21 @@ training:
 loss:
   root_weight: 1.0
   body_weight: 1.0
+  rollout_weight: 1.0
+  offpath_beta_min: 0.1
+  root_boundary_weight: 0.0
 
 self_forcing:
-  enabled: false
-  phase_start_step: 300000
+  enabled: true
+  # global_step [0,100k): K=1; [100k,200k): K=2; [200k,300k): K=5.
+  phase_start_step: 100000
   phase_steps: 200000
-  # Fine-tune progress thresholds. K=1 remains the teacher-forcing baseline.
   k_schedule:
     - [0.0, 2]
-    - [0.4, 3]
-    - [0.7, 5]
+    - [0.5, 5]
   teacher_replay:
-    2: 0.2
-    3: 0.1
-    5: 0.1
+    2: 0.0
+    5: 0.0
 
 model:
   target: models.diffusion_forcing_wan.LDF

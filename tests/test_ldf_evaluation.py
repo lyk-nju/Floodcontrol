@@ -313,7 +313,7 @@ def test_dense_xz_artifacts_follow_floodnet_layout(tmp_path):
     assert json.loads((expected / "sample.json").read_text())["invalid"] is None
 
 
-def test_dense_xz_video_contains_generated_motion_and_trajectory_panel(
+def test_dense_xz_video_embeds_trajectory_in_fixed_camera_scene(
     tmp_path,
     monkeypatch,
 ):
@@ -322,6 +322,7 @@ def test_dense_xz_video_contains_generated_motion_and_trajectory_panel(
         for value in (32, 64)
     ]
     written: dict[str, list[np.ndarray]] = {}
+    render_calls = []
 
     class Reader:
         def __iter__(self):
@@ -341,11 +342,10 @@ def test_dense_xz_video_contains_generated_motion_and_trajectory_panel(
         def close(self):
             return None
 
-    monkeypatch.setattr(
-        evaluation_artifacts,
-        "render_motion_video",
-        lambda *args, **kwargs: None,
-    )
+    def record_render(*args, **kwargs):
+        render_calls.append((args, kwargs))
+
+    monkeypatch.setattr(evaluation_artifacts, "render_motion_video", record_render)
     monkeypatch.setattr(
         evaluation_artifacts.imageio,
         "get_reader",
@@ -375,13 +375,20 @@ def test_dense_xz_video_contains_generated_motion_and_trajectory_panel(
         fps=20.0,
     )
 
-    video_frame = written[str(video_path)][0]
     composite_frame = written[str(composite_path)][0]
-    assert video_frame.shape == (160, 256, 3)
-    assert composite_frame.shape == (160, 384, 3)
-    trajectory_panel = video_frame[32:, 128:]
-    assert np.any(np.all(trajectory_panel == (20, 150, 20), axis=-1))
-    assert np.any(np.all(trajectory_panel == (210, 40, 40), axis=-1))
+    assert composite_frame.shape == (160, 256, 3)
+    assert len(render_calls) == 2
+    target_call, predicted_call = render_calls
+    assert target_call[0][2] != video_path
+    assert target_call[1]["show_full_trajectory"] is True
+    assert target_call[1]["traj_mask"].all()
+    assert "show_generated_trajectory" not in target_call[1]
+    assert torch.equal(target_call[1]["traj_xz"], target_root[:, [0, 2]])
+    assert predicted_call[0][2] == video_path
+    assert predicted_call[1]["show_full_trajectory"] is True
+    assert predicted_call[1]["show_generated_trajectory"] is True
+    assert predicted_call[1]["traj_mask"].all()
+    assert torch.equal(predicted_call[1]["traj_xz"], target_root[:, [0, 2]])
 
 
 @pytest.mark.parametrize(
@@ -421,7 +428,6 @@ def test_generation_modes_share_runtime_but_only_rolling_moves_window(
         rolling_window_tokens=4,
         max_horizon_token=2,
         num_denoise_steps=2,
-        rebase_on_roll=False,
     )
     assert generated.normalized_motion.root_motion.shape == (1, 4, 4, 5)
     assert generated.normalized_motion.latent_motion.shape == (1, 4, 3)

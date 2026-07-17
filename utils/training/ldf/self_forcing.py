@@ -20,7 +20,7 @@ from utils.training.ldf.flow import recover_clean_for_self_forcing
 
 
 DEFAULT_K_SCHEDULE = ((0.0, 2), (0.4, 3), (0.7, 5))
-DEFAULT_TEACHER_REPLAY = {2: 0.2, 3: 0.1, 5: 0.1}
+DEFAULT_TEACHER_REPLAY = {2: 0.5, 3: 0.3, 5: 0.2}
 
 
 def _require_integer(name: str, value: object) -> int:
@@ -249,7 +249,7 @@ class SelfForcingState:
             raise ValueError("clean motion does not match the rollout span")
         if self.clean_motion.batch_size != plan.root_noise.shape[0]:
             raise ValueError("clean motion does not match the rollout batch")
-        if not 0 <= self.completed_steps < plan.rollout_steps:
+        if not 0 <= self.completed_steps <= plan.rollout_steps:
             raise ValueError("completed_steps lies outside the rollout")
 
     def replace_committed_token(
@@ -279,6 +279,8 @@ class SelfForcingResult:
     prediction: LDFPrediction
     state: SelfForcingState
     replacements: tuple[HybridMotion, ...]
+    is_rollout: bool = False
+    solver_state: object | None = None
 
 
 def resolve_self_forcing_k(
@@ -391,7 +393,13 @@ def sample_window_plan(
             "context_token_count and previous_root_valid_mask must be [B]"
         )
     maximum_history = span_count - active_tokens - (rollout_steps - 1)
-    minimum_history = (source_start > 0).to(dtype=torch.long)
+    # Persistent solver rollout models steady-state continuation transactions.
+    # True cold start has a longer first warm-up transaction and remains covered
+    # by the unchanged K=1 ideal path.
+    minimum_history = torch.maximum(
+        (source_start > 0).to(dtype=torch.long),
+        torch.full_like(source_start, 1 if rollout_steps > 1 else 0),
+    )
     if initial_history_tokens is None:
         draws = torch.rand(
             batch_size,
@@ -438,12 +446,17 @@ def sample_window_plan(
     anchor_xz = root[batch_indices, anchor_frame][:, [0, 2]].clone()
 
     if phase_offset is None:
-        phase = torch.rand(
-            batch_size,
-            device=root.device,
-            dtype=root.dtype,
-            generator=generator,
-        ) / float(active_tokens)
+        if rollout_steps == 1:
+            phase = torch.rand(
+                batch_size,
+                device=root.device,
+                dtype=root.dtype,
+                generator=generator,
+            ) / float(active_tokens)
+        else:
+            phase = torch.zeros(
+                batch_size, device=root.device, dtype=root.dtype
+            )
     else:
         phase = phase_offset.to(device=root.device, dtype=root.dtype).clone()
     if root_noise is None:
@@ -498,6 +511,29 @@ def run_self_forcing_rollout(
 
     plan.validate_structure()
     state.validate(plan)
+    if plan.rollout_steps > 1:
+        from utils.training.ldf.rollout import run_persistent_rollout
+
+        final_step, prediction, solver_state, replacements = run_persistent_rollout(
+            model,
+            state.clean_motion,
+            plan,
+            previous_root_frame=previous_root_frame,
+            previous_root_valid_mask=previous_root_valid_mask,
+            condition_builder=condition_builder,
+        )
+        final_clean = solver_state.clean_motion
+        return SelfForcingResult(
+            final_step=final_step,
+            prediction=prediction,
+            state=SelfForcingState(
+                final_clean,
+                completed_steps=plan.rollout_steps,
+            ),
+            replacements=replacements,
+            is_rollout=True,
+            solver_state=solver_state,
+        )
     replacements: list[HybridMotion] = []
     final_step = None
     final_prediction = None
