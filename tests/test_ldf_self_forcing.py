@@ -460,6 +460,18 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
         root_mean=model.root_mean,
         root_std=model.root_std,
     )
+    ideal_losses = compute_velocity_loss(
+        result.prediction,
+        type(
+            "IdealStep",
+            (),
+            {
+                "loss_mask": result.final_step.loss_mask,
+                "target_velocity": result.prediction.velocity,
+            },
+        )(),
+    )
+    assert tuple(losses) == tuple(ideal_losses)
     losses["total"].backward()
     assert model.scale.grad is not None
 

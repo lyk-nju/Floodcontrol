@@ -33,9 +33,13 @@ def compute_velocity_loss(
     root_loss = root_error[mask].mean()
     body_loss = body_error[mask].mean()
     total = float(root_weight) * root_loss + float(body_weight) * body_loss
+    zero = total.detach() * 0.0
     return {
         "anchor_root_flow_v": root_loss,
         "latent_body_flow_v": body_loss,
+        "anchor_root_offpath_endpoint": zero,
+        "latent_body_offpath_endpoint": zero,
+        "root_boundary_displacement": zero,
         "total": total,
     }
 
@@ -138,7 +142,10 @@ def compute_offpath_loss(
     total = float(rollout_weight) * (
         float(root_weight) * root_loss + float(body_weight) * body_loss
     ) + float(root_boundary_weight) * boundary_loss
+    zero = total.detach() * 0.0
     return {
+        "anchor_root_flow_v": zero,
+        "latent_body_flow_v": zero,
         "anchor_root_offpath_endpoint": root_loss,
         "latent_body_offpath_endpoint": body_loss,
         "root_boundary_displacement": boundary_loss,

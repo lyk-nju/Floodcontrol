@@ -21,6 +21,7 @@ wandb/
 lightning_logs/
 
 # Local data, dependencies, outputs, and model artifacts
+/debug/
 data/
 raw_data/
 deps/

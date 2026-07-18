@@ -53,6 +53,7 @@ L_latent_body_flow_v
 - 每次训练commit后把预测token detach为history，并以其最后一帧physical XZ执行与runtime相同的`(1-beta)`root state rebase；clean GT root、generated history、previous-root boundary和future XZ condition一起换到新model origin，latent与fixed Gaussian source保持不变。
 - persistent rollout要求至少一个真实history token；true cold-start及其较长首次warm-up事务继续由K=1路径覆盖。启用self-forcing时训练Dataset会过滤到至少`C+K`个token，保证`H>=1`仍有足够frontier完成K次commit。
 - 当前300k正式训练使用硬分段curriculum：`[0,100k)`为K=1 ideal bridge，`[100k,200k)`为K=2 persistent rollout，`[200k,300k)`为K=5 persistent rollout。`phase_start_step=100000`之前由硬gate保持K=1；之后以`phase_steps=200000`计算进度，并在0.5阈值切换到K=5。两个rollout阶段的`teacher_replay`均为0，因此不会随机退回K=1。
+- K与teacher-replay是global-batch决策：所有DDP rank使用只依赖`seed/global_step`的同一个CPU RNG结果；root/body noise、H、yaw和constraint仍使用rank-local RNG。Ideal与rollout路径始终返回相同且顺序固定的loss metric键，未启用的指标显式记零，避免不同rank的标量日志collective与梯度bucket错位。
 
 训练实现分为`flow.py`的flow/endpoint代数、`batch.py`的ideal与arbitrary-state输入合同、`self_forcing.py`的K curriculum/window plan、`rollout.py`的persistent denoise/commit/rebase循环，以及`losses.py`的ideal flow-v与off-path endpoint reduction。训练与runtime共同调用`LDF.denoise_step()`，因此root/body beta、`delta_beta`和Euler更新只有一个实现；buffer rolling仍只属于runtime。数据内容合同由CPU collator在构造时保证；GPU热路径只保留shape/dtype检查，完整plan/input内容校验仅按debug周期抽查，不能在每个denoise step重复同步。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ；冻结UMT5只在训练前运行一次并生成caption-to-embedding table，训练热路径按prompt字符串lookup token-aligned context，不在LDF GPU上加载11GB文本编码器。LDF checkpoint只保存LDF/EMA，但附带VAE/statistics/text路径与VAE统计用于resume前校验。
 

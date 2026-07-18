@@ -3760,3 +3760,192 @@
 使用注意：
 
 - curriculum按checkpoint中的absolute `global_step`计算。只有从step 0启动时三个区间才分别对应本次进程的前三个100k；完整resume非零step会从其所在absolute阶段继续。
+
+## 2026-07-18 · Self-forcing阶段切换的DDP collective分叉修复
+
+改动类型：分布式训练正确性 / self-forcing curriculum / loss logging合同
+
+实际改动内容：
+
+- 将K与teacher-replay采样从rank-local训练generator中分离，改用只依赖实验seed与absolute global step的CPU generator；同一步的所有DDP rank现在必然选择相同K。
+- 保留rank-local generator用于motion noise、history、yaw、caption和constraint采样，避免把数据增强错误同步成各rank相同样本视图。
+- 将ideal velocity路径与persistent off-path路径的loss字典统一为固定顺序的6个键：两个flow指标、两个off-path指标、boundary指标和total；当前路径未启用的指标显式记录为零。
+- 增加global curriculum RNG确定性和ideal/off-path loss键顺序一致性回归。
+
+改动理由：
+
+- 另一台8卡服务器在step 200k切入K=5后发生NCCL timeout。同一个collective序号上，7个rank执行`Numel=1`的标量all-reduce，而rank 3执行`Numel=2,230,400`的梯度bucket；rank 3随后比其他rank多入队30个collective。
+- 原实现使用含`global_rank`的generator采样teacher replay，允许某个rank选择K=1而其他rank选择K=5。同时K=1只记录3个loss键，K>1记录4个；K=1 rank少一次`sync_dist`标量归约并提前进入backward，collective序列由此精确错位。
+- 增大NCCL timeout或启用`find_unused_parameters`无法修复collective调用顺序不一致，必须从全局K决策和固定日志schema两处消除分叉。
+
+验证：
+
+- LDF training/self-forcing/DDP-forward定向测试：`50 passed`。
+- 全仓测试中本轮相关实现与其余`254`项通过；另有3个migration guard失败，原因是用户并行将`ldf.yaml`改为40-token/160-frame/35-horizon并关闭T2M，而`ldf_multi.yaml`及冻结断言仍保留50-token/200-frame/45-horizon与T2M开启。本轮未覆盖该并行配置调整。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/losses.py`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_self_forcing.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+服务器恢复注意：
+
+- 需要将修复后的代码同步到训练服务器后，从step 200k checkpoint恢复；若服务器仍使用旧的非零`teacher_replay`配置，该配置现在也不会造成rank间K分叉，但正式三段recipe仍建议保持K=2/K=5 replay为0。
+
+## 2026-07-18 · 转向180度问题的隔离调试工作区
+
+改动类型：本地调试工具 / 表示审计 / CFG对照实验
+
+实际改动内容：
+
+- 新建本地`debug/`工作区并在`.gitignore`中显式忽略，避免一次性诊断结果、图片和checkpoint实验进入公开仓库。
+- 在该目录实现独立的root5/body265朝向分析：分别计算explicit root heading、body265 pelvis global rotation heading和中心差分XZ tangent，并报告三组两两角度误差、180度反向比例及`pelvis vs -root`符号假设。
+- 增加批量Dataset/生成artifact审计CLI、单样本路径/角度/误差可视化，以及固定sample、seed、route和checkpoint的`separated/joint/nocfg`生成对照CLI；对照入口默认使用EMA参数。
+- 增加纯合成测试，分别覆盖root/body/path完全对齐、body相对root反向、人物一致但沿路径倒退，以及静止轨迹不参与path-heading统计。
+- 使用当前HumanML3D处理后数据抽检2000个artifact。结果显示body265 pelvis global yaw与`-root_yaw`的逐文件P90误差最大仅约`3.1e-05°`；这是系统性的转换约定关系，后续应先核实HumanML global rotation恢复的符号所有权，再决定是否修转换器并重训VAE/LDF。
+
+改动理由：
+
+- 视频中“人物朝向和运动方向相差180度”可能来自合法倒退运动、Root Stage与body latent不一致、HumanML转换符号错误或separated CFG缺少文本/路径交互；只观察渲染视频无法区分这些原因。
+- 将三种朝向分别测量，可以先判断错误已经存在于训练artifact，还是只在生成/CFG阶段出现，避免用额外loss掩盖数据协议问题。
+
+验证：
+
+- `python -m py_compile`通过全部5个debug Python文件。
+- `python debug/test_heading_metrics.py`：`4 tests passed`。
+- `python debug/compare_cfg_modes.py --help`可正常加载完整对照入口。
+- HumanML3D真实artifact审计：成功读取2000个样本并生成JSON汇总与单样本PNG。
+- `git diff --check`通过。
+- 未运行全仓pytest：本轮没有修改任何生产Python模块，debug目录被Git隔离；使用独立合成测试验证新增计算。
+
+涉及文件：
+
+- `.gitignore`
+- `debug/{README,heading_metrics,audit_heading,plot_heading_case,compare_cfg_modes,test_heading_metrics}.py`（本地忽略工作区）
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 尚未修改HumanML转换器或已有artifact；必须先用原始263D、官方恢复和当前root5/body265三方对照确认应由root heading还是global rotations改变符号。
+- 尚未运行200k checkpoint的三种CFG固定噪声对照；需要用户提供本机可访问的checkpoint路径后执行。
+
+## 2026-07-18 · 180度朝向错位的深度因果审计
+
+改动类型：本地诊断工具 / 模型合同审计 / 固定噪声反事实实验
+
+实际改动内容：
+
+- 将此前只读取body265第一个6D旋转的分析扩展为四条独立信号：explicit root heading、由髋部与肩部位置恢复的实际渲染身体朝向、body265 root/pelvis 6D旋转通道，以及XZ路径切线。普通渲染器使用joint-position分支，因此以髋肩几何作为可见身体朝向的权威指标。
+- 新增checkpoint序列审计、冻结EMA VAE重建审计、相同committed latent的offline/stream decoder parity、固定噪声CFG模式对照和cold-start initial-yaw对照脚本；所有脚本与结果继续保存在被Git忽略的`debug/`目录。
+- 对当前本机可访问的step 5k至165k评估artifact做时间趋势审计；本机没有用户当前远端200k artifact，因此本轮结论不伪装成200k checkpoint实测。
+
+关键结果：
+
+- 2,000个处理后HumanML GT artifact中，explicit root与渲染身体朝向的逐文件平均误差均值为`8.50°`、中位数`6.43°`、P90 `17.44°`，没有样本被判为经常180度相反。可见朝向的系统性预处理翻转不成立。
+- step 165k的24个dense-XZ stream生成样本中，同一误差的均值升至`53.08°`、中位数`42.72°`、P90 `101.45°`；12.5%的样本经常相反，最坏`004822_run2`平均`156.16°`且84.4%帧超过135度。Root/Body生成解耦得到直接确认。
+- 冻结EMA VAE对4个GT样本做`encode(mu) -> detokenize`，joint-position RMSE为2.3–6.4毫米，重建前后root/body可见朝向误差基本不变；VAE本身能够重建合法latent的朝向。
+- 对最坏生成样本使用相同committed hybrid tokens分别做保存的stream decode与offline decode，continuous-body RMSE仅`8.28e-5`、最大误差约`1.0e-3`，两者均保持约156度错位。decoder cache和stream state不是根因。
+- 固定sample/route/noise/checkpoint的`separated`与`nocfg`对照只产生约2度root/body误差差异；当前separated CFG确有Root/Body分支不对称，但不是该样本错位的主要来源。
+- 显式提供GT initial yaw可将两个固定噪声案例的root/body平均误差分别降低约5.8度和6.8度，但不能消除错位。cold-start yaw未观测是放大器而不是充分根因。
+- step 5k至165k的生成朝向误差没有稳定下降趋势；继续增加普通ideal-bridge训练步数并不保证自行消失。
+
+因果判断：
+
+- body265及其VAE latent仍携带world-orientation信息，而VAE decoder只接收`yaw_rate/local_vx/local_vz/root_y`，这些local-root特征对全局yaw偏移不敏感。同一个latent与不同global root heading组合在结构上是允许的。
+- LDF的Root Stage直接生成root5；Body Stage只通过derived local root和一个由首个clean-root frame派生、沿窗口重复的2D heading hint感知绝对朝向。它们是软条件，不构成几何一致性约束。
+- root flow loss与body latent flow loss分别优化；当前没有decoded-body-facing与explicit-root-heading一致性损失。可选root boundary loss只比较XZ且正式配置权重为零，因此不能修复整段180度模式错位。
+- GT artifact的body265 root/pelvis 6D通道与`-root_yaw`几乎精确一致，说明HumanML world-to-canonical quaternion被存入了声明为global rotation的字段。这是独立的表示合同异常，需在下一次完整重训前明确修复或重新定义；由于当前渲染不读取该通道，它不能单独解释可见身体翻转。
+
+改动理由：
+
+- 只比较heading与路径切线会把倒退、侧走误判为人物朝向错误；只比较pelvis 6D通道又会忽略实际视频来自position分支。四信号分离后才能定位错误位于数据、Root Stage、Body latent还是decoder runtime。
+- 固定噪声和相同latent反事实实验用于排除随机生成差异，避免把CFG、initial yaw或cache相关性错误地当成主要因果。
+
+验证：
+
+- `python -m py_compile debug/*.py`通过。
+- `python debug/test_heading_metrics.py`：`4 tests passed`。
+- 生成并核查GT 2000样本、step 165k生成24样本、4个VAE重建、1个stream parity、2组CFG/initial-yaw固定噪声报告。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `debug/{heading_metrics,audit_heading,audit_heading_checkpoints,audit_vae_reconstruction,audit_stream_decode_parity,compare_cfg_modes,compare_initial_yaw,plot_heading_case,test_heading_metrics,README}.py`及本地结果（全部被Git忽略）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续建议：
+
+- 先在远端200k checkpoint上复跑同一组heading audit，若root/body误差仍显著高于GT，不建议只依靠剩余普通训练步数等待其消失。
+- 短期实验应加入逐token clean-root absolute heading条件和直接的root/body heading一致性测量；boundary heading loss只能处理跨token连续性，不能替代整段绝对朝向绑定。
+- 长期最强合同是把body表示改为root-heading-local，使explicit root成为全局朝向唯一所有者；若保留ARDY式world-orientation latent，则至少需要显式per-token heading coupling与可计算的heading一致性目标。
+
+## 2026-07-18 · step-200k朝向固定噪声复核
+
+改动类型：checkpoint诊断 / CFG反事实 / cold-start yaw反事实
+
+实际改动内容：
+
+- 使用`/data1/yuankai/text2Motion/Floodcontrol/ldf/step_200000.ckpt`的EMA参数，对`000021`圆周行走和`004822`静止/转身样本复跑固定sample、route、noise的`separated/joint/nocfg`对照。
+- 调试加载器增加显式的跨服务器资产迁移模式：只有VAE四组statistics逐元素完全一致时才允许替换保存的绝对路径；文本表content ID不一致仍默认失败，只有额外指定re-encoded-text诊断开关才允许继续并打印非精确复现警告。
+- checkpoint训练时的旧文本表已不在本机。当前`all.txt`表与本机legacy表在空prompt和圆周caption上的embedding最大绝对差异约为`0.008–0.012`，因此本轮结果只用于结构性诊断，不声明为原训练资产的bit-exact重放。
+
+关键结果：
+
+- `000021`的GT参考为root/body `7.19°`、root/path `16.68°`、body/path `19.85°`。三个固定噪声seed中，separated平均ADE `2.94 cm`、root/body `30.16°`、root/path `56.19°`；joint平均ADE `2.35 cm`、root/body `26.53°`、root/path `38.12°`。joint总体更好，但仍存在明显seed-dependent错误yaw mode。
+- `004822`的GT本身是静止/转身动作，root/path `106.25°`属于数据语义而不是错误；其GT root/body为`15.93°`。seed 4321下separated为ADE `1.76 cm`、root/body `39.59°`，joint为ADE `1.38 cm`、root/body `7.86°`。该案例中joint恢复了合理的Root/Body联合模式。
+- scale为1时joint与nocfg结果完全一致，符合当前公式。separated并不等价于joint，因为它丢失文本与轨迹的联合残差；200k实验证明这种差异可显著改变yaw mode。
+- 对`000021`提供GT initial yaw后，root/path由`48.05°`改善至`34.86°`，但root/body由`20.91°`恶化至`32.65°`。这直接说明root yaw锚点可以修正Root Stage，却不能让Body latent保证同步旋转。
+- 对`004822`提供GT initial yaw仅产生小幅改善：root/body `39.59° -> 35.72°`，root/path `102.95° -> 94.74°`。initial yaw不是充分修复。
+
+结论：
+
+- step 200k已经具备生成正确Root/Body联合模式的能力，但模式选择在噪声和CFG下仍不稳定。
+- separated CFG是明确的放大器，推荐下一轮正式评估优先使用joint/nocfg作为基线；但joint仍可能生成错误body yaw，因此不能把结构问题简化为单一CFG bug。
+- 初始yaw缺失同样只是放大器。主要合同缺口仍是world-oriented body latent与explicit root heading之间只有软条件、没有逐token或几何一致性约束。
+
+验证：
+
+- 两个样本、三个seed的CFG对照及两个initial-yaw反事实均成功生成80帧结果。
+- debug脚本`py_compile`和4个合成heading测试通过。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `debug/{compare_cfg_modes,compare_initial_yaw,README}.py`与`debug/results/*step200000*`（全部被Git忽略）
+- `docs/DEVELOPMENT_LOG.md`
+
+## 2026-07-18 · HumanML旋转主动/被动语义审计
+
+改动类型：本地诊断工具 / 数据表示合同审计
+
+实际改动内容：
+
+- 在被Git忽略的`debug/`工作区新增HumanML rotation-FK三方审计：将原始`new_joint_vecs`分别通过RIC位置恢复、官方root quaternion的rotation-FK和root quaternion取逆后的rotation-FK，与`new_joints`逐帧比较。
+- 在调试说明中修正此前“pelvis 6D与`-root_yaw`一致即可通过整体取逆修复”的不完整判断，明确区分physical heading、HumanML heading-to-canonical root gauge和active per-bone rotations。
+
+改动理由：
+
+- HumanML 263D的root quaternion来自`qbetween(person_forward, +Z)`，数值确实与physical heading符号相反；但21个child local rotations同时依赖该root gauge。只看root yaw无法判断整套rotation-FK是否发生主动/被动错误，直接取逆可能破坏所有关节姿态。
+- 现有263 round-trip测试只恢复child relative rotations并丢弃root global rotation，共同的root gauge会在`parent^T @ child`中抵消，无法发现该语义问题。
+
+验证：
+
+- `000021`：RIC相对原始关节MPJPE为`0`，官方rotation-FK为`1.169 cm`，root取逆后为`16.019 cm`。
+- `004822`：官方rotation-FK相对原始关节约`1.26e-7 m`，root取逆后为`4.835 cm`。
+- HumanML train split前50个可用样本：官方rotation-FK平均MPJPE `0.000815 m`，root取逆后`0.086663 m`；50/50样本均为官方形式更准确。
+- 诊断命令：`python debug/audit_humanml_rotation_convention.py 000021 004822 --output debug/results/humanml_rotation_convention.json`。
+
+涉及文件：
+
+- `debug/audit_humanml_rotation_convention.py`、`debug/README.md`及本地结果（均被Git忽略）
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮未修改生产converter、artifact、VAE或LDF权重；审计证明不能用整体transpose/inverse做补丁。
+- 下一版数据合同需在“从原生SMPL rotations重建ARDY式标准global rotations”和“HumanML263来源去掉/重命名root rotation gauge”之间明确选择，并加入rotation-to-position FK一致性测试。

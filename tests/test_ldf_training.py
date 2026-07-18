@@ -17,7 +17,10 @@ from utils.training.ldf.conditioning import (
 )
 from utils.training.ldf.losses import compute_velocity_loss
 from utils.training.ldf.data import LDFSpanCollator
-from utils.training.ldf.lightning_module import LDFLightningModule
+from utils.training.ldf.lightning_module import (
+    LDFLightningModule,
+    _create_curriculum_generator,
+)
 from utils.training.ldf.self_forcing import (
     SelfForcingState,
     run_self_forcing_rollout,
@@ -207,6 +210,13 @@ def test_step_starts_self_forcing_at_phase_boundary(tmp_path, monkeypatch):
         initial_history_tokens=0,
     )
     assert calls == [0.0]
+
+
+def test_curriculum_generator_is_global_step_deterministic_and_rank_independent():
+    first = _create_curriculum_generator(1234, 200_000)
+    second = _create_curriculum_generator(1234, 200_000)
+    assert first.device == second.device == torch.device("cpu")
+    assert torch.equal(torch.rand(8, generator=first), torch.rand(8, generator=second))
 
 
 def test_ldf_training_bridge_uses_frozen_ema_vae_and_shared_statistics(tmp_path):
@@ -484,6 +494,9 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
     assert set(losses) == {
         "anchor_root_flow_v",
         "latent_body_flow_v",
+        "anchor_root_offpath_endpoint",
+        "latent_body_offpath_endpoint",
+        "root_boundary_displacement",
         "total",
     }
     assert torch.isfinite(losses["total"])

@@ -52,6 +52,15 @@ _VAE_STATISTIC_NAMES = (
 )
 
 
+def _create_curriculum_generator(seed: int, global_step: int) -> torch.Generator:
+    """Create one rank-independent RNG for the global K/replay decision."""
+
+    mixed_seed = (
+        int(seed) + int(global_step) * 1_000_003 + 0x5E1F_F0CE
+    ) % (2**63 - 1)
+    return torch.Generator(device="cpu").manual_seed(mixed_seed)
+
+
 def _load_root_statistics(path: str | Path) -> tuple[torch.Tensor, torch.Tensor]:
     with np.load(path, allow_pickle=False) as data:
         values = []
@@ -263,7 +272,13 @@ class LDFLightningModule(BasicLightningModule):
                 }
                 rollout_steps = sample_rollout_steps(
                     progress,
-                    generator=generator,
+                    # K selects the objective and therefore the synchronized
+                    # metric/compute path.  It must be one global-batch choice,
+                    # not a rank-local augmentation draw.  Motion noise, H and
+                    # condition sampling continue to use the rank-local RNG.
+                    generator=_create_curriculum_generator(
+                        int(self.cfg.get("seed", 0)), int(self.global_step)
+                    ),
                     schedule=schedule,
                     teacher_replay=replay,
                 )
