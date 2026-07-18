@@ -4175,3 +4175,92 @@
 
 - 将代码同步到远端后，先在目标服务器运行一次配置启动校验，确认200k checkpoint、VAE、root/motion/latent statistics、T5表与T2M evaluator资产全部存在，再启动8卡resume。
 - 如果远端未来需要改变K切换点，应直接修改`k_schedule`中的absolute step，不再重新引入phase/progress字段。
+
+## 2026-07-18 · Token-aligned文本Cross-Attention共享Prompt K/V
+
+改动类型：显存优化 / 文本条件执行路径 / 数值回归
+
+实际改动内容：
+
+- 保留现有`B*T` prompt timeline和每个motion token只直接读取自身prompt的语义，将Transformer内部文本表示从按query展开的`[B,Q,L,D]`改为unique prompt bank `[U,L,D]`。
+- 新增`PromptQueryMap`及一次性query分组：在Root/Body blocks之前根据`prompt_ids`、有效前缀和text query mask编译使用到的prompt、query分组、组内位置与scatter索引，所有Transformer层复用同一映射。
+- `WanCrossAttention`现在只为每个实际使用的unique prompt计算一次K/V；共享prompt的motion queries被打包成同一variable-length attention row，输出再按原始query位置回填。
+- future-root constraint query继续使用无效prompt ID与false query mask，完全跳过text Q/K/V和output projection；padding query同样保持精确零输出。
+- 全部query均无文本时返回精确零，同时为Q/K/V/O和QK norm保留零值梯度依赖，避免该防御分支破坏静态DDP参数图。
+- 保留原有dense token-context分支作为兼容和数值参照，但新版Root/Body主路径不再物化或保存`[B,Q,L,D]`文本副本。
+- 更新LDF实现文档，明确这是执行层去重，不改变HumanML整段prompt、BABEL时间切换、CFG或non-causal motion self-attention语义。
+
+改动理由：
+
+- 旧实现只在text projection前按tensor identity去重，随后仍对每个motion query复制投影文本并在每层重复计算相同prompt的K/V；batch、窗口和文本长度增加时，这部分activation近似按`B×Q×L`增长。
+- 直接token-aligned文本是FloodDiffusion支持时间变化prompt和文本切换的核心条件合同，不能通过退化成全局caption换显存。共享prompt K/V可以保持同一数学结果，同时删除重复计算与保存。
+
+验证：
+
+- CPU数值回归比较unique-bank与旧dense token-context路径：forward、motion query梯度、prompt bank梯度和全部Cross-Attention参数梯度在`atol=1e-6, rtol=1e-5`内一致。
+- CUDA BF16/FlashAttention回归比较两条路径，结果在混合精度容差内一致。
+- K projection hook确认重复token prompt只产生一次`[U,L,D]` K输入，而不是`[B*Q,L,D]`。
+- LDF集成测试确认prompt bank保持unique、motion query映射正确、future-root query为`-1`且不读取文本。
+- LDF/CFG/data/evaluation/self-forcing/statistics/stream/inference/training定向测试：144项通过。
+- 全仓`pytest tests -q`：加入最终静态图防御测试前277项全部通过，其中包含CUDA BF16 grouped/dense Cross-Attention回归。
+- 最终`test_wan_model.py + test_ldf_forward.py`定向回归：25项通过、5项CUDA测试因随后本机driver/NVML暂时不可用而跳过；新增静态图防御测试已通过。
+- 相关模块`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `models/tools/wan_model.py`
+- `models/diffusion_forcing_wan.py`
+- `tests/test_wan_model.py`
+- `tests/test_ldf_forward.py`
+- `docs/rearchitecture/06_LDF_IMPLEMENTATION_DESIGN.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 在正式远端batch/window配置下记录优化前后的`torch.cuda.max_memory_allocated()`与step time；本次单元测试证明数学等价与K/V去重，但最终节省量仍取决于每个batch的unique prompt数量和实际T5长度。
+
+## 2026-07-19 · Ragged Token Text Attention与可见Prompt Projection
+
+改动类型：显存修复 / varlen attention内核 / 文本热路径优化
+
+实际改动内容：
+
+- 新增直接接收flat Q/K/V的`varlen_attention()`：CUDA BF16/FP16路径直接调用`flash_attn_varlen_func`，输入输出始终保持packed顺序，不创建`[groups,max_length,...]`矩形。
+- 无Flash/CPU fallback按prompt group逐段调用SDPA并拼接结果，保持数学与梯度语义，同时避免为了兼容路径重新制造全局矩形padding。
+- 将`PromptQueryMap`收敛为used prompt IDs、按prompt排序的flat query indices和query lengths；删除`grouped_query_ids`、组内二维位置和`max_group_length`。
+- `WanCrossAttention`现在直接投影`Q_flat [Nq,D]`与`context_flat [Nk,D]`，通过varlen attention得到flat结果后一次scatter回`[B,Q,D]`；主路径不再分配`padded_q`或同尺寸padded output。
+- 删除prompt group最大长度的`.max().item()`；varlen Flash kernel使用`B×Q`和raw text padded length作为静态安全上限，不据此分配矩形activation。
+- 拆分raw text identity准备与text projection。LDF先建立完整timeline prompt IDs，再根据有效motion query生成used prompt集合；只将这些prompt的真实有效T5 token打包并送入text projection，不可见pure-noise/future prompt及文本padding不再进入MLP。
+- 保留旧dense token-context Cross-Attention分支作为兼容和数值参照；模型参数、state dict、checkpoint、CFG及HumanML/BABEL token prompt timeline合同均未改变。
+- 空文本query仍返回精确零并保留所有Cross-Attention参数的零值梯度依赖，维持静态DDP参数图。
+
+改动理由：
+
+- 上一轮grouped实现虽然复用了unique prompt K/V，但通过`[G,max_group_length,H,Dh]`承载Q；在“一个长共享prompt加大量单次BABEL prompt”的偏斜分布下，矩形slot可以远大于真实query数并反向放大显存。
+- 旧文本准备在建立query visibility前投影完整`B*T`timeline中的所有unique prompt，虽不泄漏未来语义，但对BABEL未见文本产生无效MLP计算和训练activation。
+
+验证：
+
+- 新增640-query偏斜回归：一个prompt出现320次、其余320个prompt各出现一次；内核实际接收`Q=[640,2,4]`、`K=[321,2,4]`，未出现102720-slot矩形。
+- CPU dense/packed对照覆盖forward、motion query梯度、prompt梯度和全部Cross-Attention参数梯度，保持原容差一致。
+- CUDA BF16/FlashAttention packed/dense对照通过。
+- projection hook确认仅可见prompt的3个真实T5 token进入MLP，7-token不可见future prompt没有进入projection。
+- future-root/padding文本mask、BABEL切换语义、空query静态图和unique K/V测试通过。
+- LDF/CFG/data/evaluation/self-forcing/statistics/stream/inference/training定向测试：148项通过。
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：280项全部通过。
+- 相关模块和测试`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `models/tools/attention.py`
+- `models/tools/wan_model.py`
+- `models/diffusion_forcing_wan.py`
+- `tests/test_wan_model.py`
+- `tests/test_ldf_forward.py`
+- `docs/rearchitecture/06_LDF_IMPLEMENTATION_DESIGN.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 在远端HumanML和HumanML+BABEL正式batch上分别记录峰值显存与step time；GPU上的`nonzero/unique/sort`仍属于prompt map编译成本，若profiler确认其影响流式延迟，再将identity/group map前移到CPU condition compiler。
+- 通用Root/Body visible-length与future packing仍有既有动态长度读取，本次只删除文本group新增的最大长度同步，不宣称整个模型已经零同步。

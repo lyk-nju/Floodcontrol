@@ -8,11 +8,93 @@ BodyTransformer own their task-specific projections.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
-from .attention import attention
+from .attention import attention, varlen_attention
+
+
+@dataclass(frozen=True)
+class PromptQueryMap:
+    """Reusable packing map from motion queries to unique prompts."""
+
+    used_prompt_ids: torch.Tensor
+    grouped_flat_indices: torch.Tensor
+    query_lengths: torch.Tensor
+    max_query_length: int
+    max_context_length: int
+    batch_size: int
+    query_length: int
+
+
+def create_prompt_query_map(
+    prompt_ids: torch.Tensor,
+    query_lens: torch.Tensor,
+    *,
+    query_mask: torch.Tensor | None,
+    prompt_count: int,
+    max_context_length: int,
+) -> PromptQueryMap:
+    """Pack valid token queries by prompt once for all transformer blocks."""
+
+    if prompt_ids.ndim != 2:
+        raise ValueError("prompt_ids must be [B,T]")
+    if prompt_ids.dtype != torch.long:
+        raise TypeError("prompt_ids must be int64")
+    batch, length = prompt_ids.shape
+    if tuple(query_lens.shape) != (batch,):
+        raise ValueError("query_lens must be [B]")
+    valid_prefix = (
+        torch.arange(length, device=prompt_ids.device)[None] < query_lens[:, None]
+    )
+    if query_mask is None:
+        query_mask = valid_prefix
+    else:
+        if tuple(query_mask.shape) != (batch, length):
+            raise ValueError("query_mask must be [B,T]")
+        query_mask = query_mask.to(device=prompt_ids.device, dtype=torch.bool)
+        query_mask = query_mask & valid_prefix
+
+    flat_indices = torch.nonzero(query_mask.reshape(-1), as_tuple=False).flatten()
+    if flat_indices.numel() == 0:
+        empty = prompt_ids.new_empty(0)
+        return PromptQueryMap(
+            used_prompt_ids=empty,
+            grouped_flat_indices=empty,
+            query_lengths=empty,
+            max_query_length=batch * length,
+            max_context_length=int(max_context_length),
+            batch_size=batch,
+            query_length=length,
+        )
+
+    flat_prompt_ids = prompt_ids.reshape(-1).index_select(0, flat_indices)
+    if prompt_ids.device.type == "cpu" and bool(
+        ((flat_prompt_ids < 0) | (flat_prompt_ids >= prompt_count)).any()
+    ):
+        raise ValueError("valid prompt_ids must index the prompt bank")
+    used_prompt_ids, query_groups = torch.unique(
+        flat_prompt_ids,
+        sorted=True,
+        return_inverse=True,
+    )
+    order = torch.argsort(query_groups)
+    grouped_flat_indices = flat_indices.index_select(0, order)
+    query_lengths = torch.bincount(
+        query_groups,
+        minlength=used_prompt_ids.numel(),
+    ).to(dtype=torch.int32)
+    return PromptQueryMap(
+        used_prompt_ids=used_prompt_ids,
+        grouped_flat_indices=grouped_flat_indices,
+        query_lengths=query_lengths,
+        max_query_length=batch * length,
+        max_context_length=int(max_context_length),
+        batch_size=batch,
+        query_length=length,
+    )
 
 
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
@@ -156,8 +238,36 @@ class WanCrossAttention(nn.Module):
         context_lens: torch.Tensor,
         query_lens: torch.Tensor,
         query_mask: torch.Tensor | None = None,
+        prompt_ids: torch.Tensor | None = None,
+        prompt_map: PromptQueryMap | None = None,
     ) -> torch.Tensor:
         batch, length, _ = value.shape
+        if prompt_ids is not None and prompt_map is not None:
+            raise ValueError("provide prompt_ids or prompt_map, not both")
+        if prompt_ids is not None:
+            if context.ndim != 3:
+                raise ValueError("prompt_ids require context bank [U,L,D]")
+            prompt_map = create_prompt_query_map(
+                prompt_ids,
+                query_lens,
+                query_mask=query_mask,
+                prompt_count=context.shape[0],
+                max_context_length=context.shape[1],
+            )
+        if prompt_map is not None:
+            if context.ndim == 3:
+                context, context_lens = self._pack_prompt_bank(
+                    context,
+                    context_lens,
+                    prompt_map,
+                )
+            return self._forward_prompt_bank(
+                value,
+                context,
+                context_lens,
+                prompt_map,
+            )
+
         if context.ndim == 4:
             if tuple(context.shape[:2]) != (batch, length):
                 raise ValueError(
@@ -218,6 +328,96 @@ class WanCrossAttention(nn.Module):
             out = out * query_mask[..., None].to(out.dtype)
         return out
 
+    @staticmethod
+    def _pack_prompt_bank(
+        context: torch.Tensor,
+        context_lens: torch.Tensor,
+        prompt_map: PromptQueryMap,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select used prompts and remove key/value padding before projection."""
+
+        if context.ndim != 3:
+            raise ValueError("prompt-bank context must be [U,L,D]")
+        if tuple(context_lens.shape) != (context.shape[0],):
+            raise ValueError("prompt-bank context_lens must be [U]")
+        if prompt_map.used_prompt_ids.numel() == 0:
+            return context.reshape(-1, context.shape[-1])[:0], context_lens[:0]
+        used_context = context.index_select(0, prompt_map.used_prompt_ids)
+        used_context_lens = context_lens.index_select(
+            0, prompt_map.used_prompt_ids
+        ).clamp_min(1)
+        valid = (
+            torch.arange(context.shape[1], device=context.device)[None]
+            < used_context_lens[:, None]
+        )
+        return used_context[valid], used_context_lens
+
+    def _forward_prompt_bank(
+        self,
+        value: torch.Tensor,
+        context: torch.Tensor,
+        context_lens: torch.Tensor,
+        prompt_map: PromptQueryMap,
+    ) -> torch.Tensor:
+        """Attend token queries to a shared bank of unique prompt features.
+
+        Queries that reference the same prompt are packed into one variable-length
+        attention row.  Each block therefore projects that prompt to K/V exactly
+        once, while preserving direct token-to-prompt alignment.
+        """
+
+        batch, length, dim = value.shape
+        if context.ndim != 2:
+            raise ValueError("packed prompt context must be [Nk,D]")
+        if tuple(context_lens.shape) != (prompt_map.used_prompt_ids.numel(),):
+            raise ValueError("packed context_lens must be [G]")
+        if (prompt_map.batch_size, prompt_map.query_length) != (batch, length):
+            raise ValueError("prompt_map must match the query [B,T] shape")
+        if prompt_map.grouped_flat_indices.numel() == 0:
+            # The LDF path always owns at least one motion query.  Retain a
+            # zero-valued dependency on every projection for defensive callers
+            # and for a static DDP parameter graph.
+            zero = value.sum() * 0.0
+            zero = zero + context.sum() * 0.0
+            for projection in (
+                self.q,
+                self.k,
+                self.v,
+                self.o,
+                self.norm_q,
+                self.norm_k,
+            ):
+                zero = zero + sum(
+                    parameter.sum() for parameter in projection.parameters()
+                ) * 0.0
+            return value.new_zeros(batch, length, dim) + zero.to(value.dtype)
+
+        grouped_value = value.reshape(batch * length, dim).index_select(
+            0, prompt_map.grouped_flat_indices
+        )
+        grouped_q = self.norm_q(self.q(grouped_value)).view(
+            -1, self.num_heads, self.head_dim
+        )
+        k = self.norm_k(self.k(context)).view(
+            -1, self.num_heads, self.head_dim
+        )
+        v = self.v(context).view(-1, self.num_heads, self.head_dim)
+        grouped_out = varlen_attention(
+            grouped_q,
+            k,
+            v,
+            q_lens=prompt_map.query_lengths,
+            k_lens=context_lens,
+            max_q_len=prompt_map.max_query_length,
+            max_k_len=prompt_map.max_context_length,
+        )
+        selected_out = self.o(grouped_out.flatten(1)).to(value.dtype)
+        flat_out = value.new_zeros(batch * length, dim)
+        flat_out = flat_out.index_copy(
+            0, prompt_map.grouped_flat_indices, selected_out
+        )
+        return flat_out.reshape(batch, length, dim)
+
 
 class WanTransformerBlock(nn.Module):
     """Non-causal Wan-style block with per-token diffusion modulation."""
@@ -263,6 +463,8 @@ class WanTransformerBlock(nn.Module):
         rope_position_ids: torch.Tensor,
         context: torch.Tensor,
         context_lens: torch.Tensor,
+        text_prompt_ids: torch.Tensor | None = None,
+        text_prompt_map: PromptQueryMap | None = None,
         text_query_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if modulation.shape != (*value.shape[:2], 6, value.shape[-1]):
@@ -281,6 +483,8 @@ class WanTransformerBlock(nn.Module):
             context_lens,
             seq_lens,
             query_mask=text_query_mask,
+            prompt_ids=text_prompt_ids,
+            prompt_map=text_prompt_map,
         )
         normalized = self.norm2(value).float() * (1 + pieces[4].squeeze(2))
         normalized = normalized + pieces[3].squeeze(2)
@@ -290,14 +494,14 @@ class WanTransformerBlock(nn.Module):
         return value
 
 
-def project_unique_text_context(
+def prepare_unique_text_context(
     projection: nn.Module,
     context: list[torch.Tensor],
     *,
     text_len: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project unique tensor identities and return per-entry prompt IDs."""
+    """Stack unique raw prompt features and return per-entry prompt IDs."""
     if not context:
         raise ValueError("text context cannot be empty")
     projection_parameter = next(projection.parameters(), None)
@@ -346,12 +550,29 @@ def project_unique_text_context(
         ],
         dim=0,
     )
-    projected_unique = projection(padded_unique)
     unique_lengths = torch.tensor(
         unique_lengths_list, device=device, dtype=torch.long
     )
     indices = torch.tensor(gather_indices, device=device, dtype=torch.long)
-    return projected_unique, unique_lengths, indices
+    return padded_unique, unique_lengths, indices
+
+
+def project_unique_text_context(
+    projection: nn.Module,
+    context: list[torch.Tensor],
+    *,
+    text_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project unique tensor identities and return per-entry prompt IDs."""
+
+    raw_unique, unique_lengths, indices = prepare_unique_text_context(
+        projection,
+        context,
+        text_len=text_len,
+        device=device,
+    )
+    return projection(raw_unique), unique_lengths, indices
 
 
 def embed_text_context(
@@ -376,13 +597,16 @@ def embed_text_context(
 
 
 __all__ = [
+    "PromptQueryMap",
     "WanCrossAttention",
     "WanLayerNorm",
     "WanRMSNorm",
     "WanSelfAttention",
     "WanTransformerBlock",
     "apply_rope_with_position_ids",
+    "create_prompt_query_map",
     "embed_text_context",
+    "prepare_unique_text_context",
     "project_unique_text_context",
     "sinusoidal_embedding_1d",
 ]

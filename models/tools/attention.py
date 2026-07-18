@@ -168,9 +168,114 @@ def flash_attention(
     return out
 
 
+def varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_lens: torch.Tensor,
+    k_lens: torch.Tensor,
+    max_q_len: int,
+    max_k_len: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    q_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    deterministic: bool = False,
+) -> torch.Tensor:
+    """Attend directly over packed variable-length Q/K/V sequences.
+
+    Unlike :func:`flash_attention`, this entry point never constructs a
+    ``[groups, max_length, ...]`` rectangle.  Q/K/V are concatenated in group
+    order and the returned tensor preserves that packed Q order.
+    """
+
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("packed q, k and v must be [N,H,D]")
+    if tuple(k.shape) != tuple(v.shape):
+        raise ValueError("packed k and v must have the same shape")
+    if tuple(q.shape[1:]) != tuple(k.shape[1:]):
+        raise ValueError("packed q and k must share [H,D]")
+    if q_lens.ndim != 1 or tuple(k_lens.shape) != tuple(q_lens.shape):
+        raise ValueError("q_lens and k_lens must be matching [G] tensors")
+    if int(max_q_len) <= 0 or int(max_k_len) <= 0:
+        raise ValueError("max_q_len and max_k_len must be positive")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("packed q, k and v must share a device")
+
+    q_lens = q_lens.to(device=q.device, dtype=torch.int32)
+    k_lens = k_lens.to(device=q.device, dtype=torch.int32)
+    if q.device.type == "cpu":
+        if int(q_lens.sum()) != q.shape[0]:
+            raise ValueError("q_lens must sum to packed q length")
+        if int(k_lens.sum()) != k.shape[0]:
+            raise ValueError("k_lens must sum to packed k/v length")
+        if bool((q_lens <= 0).any()) or bool((k_lens <= 0).any()):
+            raise ValueError("packed sequence lengths must be positive")
+
+    if q_scale is not None:
+        q = q * float(q_scale)
+    can_flash = (
+        FLASH_ATTN_2_AVAILABLE
+        and q.device.type == "cuda"
+        and q.shape[-1] <= 256
+        and q.dtype in (torch.float16, torch.bfloat16)
+    )
+    if can_flash:
+        cu_q = torch.cat([q_lens.new_zeros(1), q_lens]).cumsum(
+            0, dtype=torch.int32
+        )
+        cu_k = torch.cat([k_lens.new_zeros(1), k_lens]).cumsum(
+            0, dtype=torch.int32
+        )
+        return flash_attn.flash_attn_varlen_func(
+            q=q.contiguous(),
+            k=k.contiguous(),
+            v=v.contiguous(),
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=int(max_q_len),
+            max_seqlen_k=int(max_k_len),
+            dropout_p=float(dropout_p),
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            deterministic=deterministic,
+        )
+
+    # The fallback intentionally iterates over ragged groups instead of
+    # recreating a potentially enormous padded rectangle.  Production CUDA
+    # training uses FlashAttention; this path keeps CPU tests and non-Flash
+    # inference mathematically exact and memory-safe.
+    q_lengths = q_lens.detach().cpu().tolist()
+    k_lengths = k_lens.detach().cpu().tolist()
+    outputs = []
+    q_start = 0
+    k_start = 0
+    for q_length, k_length in zip(q_lengths, k_lengths):
+        q_end = q_start + int(q_length)
+        k_end = k_start + int(k_length)
+        output = _sdpa_attention(
+            q[q_start:q_end][None],
+            k[k_start:k_end][None],
+            v[k_start:k_end][None],
+            q_lens=None,
+            k_lens=None,
+            dropout_p=float(dropout_p),
+            softmax_scale=softmax_scale,
+            q_scale=None,
+            causal=causal,
+        )
+        outputs.append(output[0])
+        q_start = q_end
+        k_start = k_end
+    return torch.cat(outputs, dim=0) if outputs else q.new_empty(q.shape)
+
+
 def attention(*args, **kwargs) -> torch.Tensor:
     """Public generic attention entry point."""
     return flash_attention(*args, **kwargs)
 
 
-__all__ = ["attention", "flash_attention"]
+__all__ = ["attention", "flash_attention", "varlen_attention"]

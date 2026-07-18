@@ -454,11 +454,11 @@ apply_rope_with_position_ids(q_or_k, rope_position_ids)
 
 token-aligned text context 与 text embedding dedup 属于在线文本能力，不是 FlexTraj。`text_context`按sample-major的`B*T`排列，每个motion query只cross-attend自己的T5 sequence；future-root query不读取文本。相同prompt的T5输出和projection输入按tensor identity复用，避免HumanML重复caption造成重复编码。
 
-条件文本不再接受`B`长度的静态caption捷径。HumanML必须显式把同一个tensor引用重复到每个token，BABEL必须提供真实切换后的timeline；`text_null_context`则严格保持`B`。CFG在构造history/constraint分支时显式把每个sample的null引用展开为`B*T`，因此不会因为误传`B`而把BABEL静默退化成整段共享caption。文本projection先按tensor identity投影unique prompt，再按当前query索引gather，不再物化完整`B*T`投影副本；future-root query的direct text mask始终为false。
+条件文本不再接受`B`长度的静态caption捷径。HumanML必须显式把同一个tensor引用重复到每个token，BABEL必须提供真实切换后的timeline；`text_null_context`则严格保持`B`。CFG在构造history/constraint分支时显式把每个sample的null引用展开为`B*T`，因此不会因为误传`B`而把BABEL静默退化成整段共享caption。文本准备先按tensor identity建立raw prompt bank和token prompt IDs，再根据当前有效motion query筛选实际使用的prompt；只有这些prompt的有效T5 token会被打包成`[Nk,text_dim]`并送入text projection。每个Transformer block将motion query打包成`[Nq,H,Dh]`、将文本投影打包成`[Nk,H,Dh]`，直接调用FlashAttention varlen并scatter回原token位置，不再物化`[B,T,L,D]`或`[G,max_group_length,D]`。该执行优化不改变逐token文本语义；future-root query的direct text mask始终为false。
 
 Transformer热路径只调用`validate_structure()`检查rank、shape、dtype、device和字段配对；`validate()`继续保留finite、mask内容、prefix、beta范围、position顺序与heading配对等完整语义检查。`LDFWindowPlan`采用相同分层：CPU collator负责构造四帧对齐、连续prefix、真实span/context和cold-start边界，普通随机H只从这些可信边界采样；只有validation/test显式传入history override时立即检查override。正式训练`debug: false`时不执行完整GPU内容校验；`debug: true`时在rollout前检查H/active/frontier/phase/cold-start和最终input合同。`flow.py`、`batch.py`、loss和Transformer forward不再逐层重复读取相同CUDA内容。XZ可变长度采样按prefix长度直接构造token range，不再逐sample执行`nonzero()`；active bounds、valid counts和mode draws按batch集中搬到CPU。
 
-该分层不追求形式上的“零同步”。Root/Body batch-max visible裁剪、future-root动态packing和waypoint个数仍需要少量动态长度读取；文本dropout也仍需把sample级选择映射到Python prompt timeline。这些是当前简单表示的明确成本，先由profiler判断，不为消除少量同步引入第二套packed contract或额外状态类。
+该分层不追求形式上的“零同步”。Root/Body batch-max visible裁剪、future-root动态packing和waypoint个数仍需要少量动态长度读取；文本dropout也仍需把sample级选择映射到Python prompt timeline。prompt query分组在进入blocks前只编译一次并由所有层复用，不在每层重复排序；varlen kernel使用`B×Q`和`text_len`作为静态安全上限，不再为prompt group读取GPU最大长度。
 
 ## 9. 已执行的迁移顺序
 

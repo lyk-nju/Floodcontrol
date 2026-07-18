@@ -392,6 +392,56 @@ def test_future_root_is_packed_after_the_visible_motion_prefix():
     assert not output.velocity.root_motion[:, 3].any()
 
 
+def test_text_preparation_keeps_unique_prompt_bank_and_query_mapping():
+    model = make_model().eval()
+    walk = torch.randn(3, 8)
+    turn = torch.randn(2, 8)
+    context, context_lens, prompt_map = (
+        model.root_transformer._prepare_text(
+            [walk, walk, turn, turn],
+            batch_size=1,
+            token_length=4,
+            query_token_indices=torch.tensor([[0, 1, 2, -1, 3]]),
+            seq_lens=torch.tensor([5]),
+            device=torch.device("cpu"),
+        )
+    )
+
+    assert context.shape == (5, model.root_transformer.hidden_dim)
+    assert context_lens.tolist() == [3, 2]
+    assert prompt_map.used_prompt_ids.tolist() == [0, 1]
+    assert prompt_map.grouped_flat_indices.tolist() == [0, 1, 2, 4]
+    assert prompt_map.query_lengths.tolist() == [2, 2]
+
+
+def test_text_preparation_projects_only_visible_prompt_tokens():
+    model = make_model().eval()
+    walk = torch.randn(3, 8)
+    future_turn = torch.randn(7, 8)
+    projection_shapes: list[tuple[int, ...]] = []
+    handle = model.root_transformer.text_projection[0].register_forward_pre_hook(
+        lambda _module, arguments: projection_shapes.append(
+            tuple(arguments[0].shape)
+        )
+    )
+    try:
+        context, context_lens, prompt_map = model.root_transformer._prepare_text(
+            [walk, walk, future_turn, future_turn],
+            batch_size=1,
+            token_length=4,
+            query_token_indices=torch.tensor([[0, 1]]),
+            seq_lens=torch.tensor([2]),
+            device=torch.device("cpu"),
+        )
+    finally:
+        handle.remove()
+
+    assert projection_shapes == [(3, 8)]
+    assert context.shape == (3, model.root_transformer.hidden_dim)
+    assert context_lens.tolist() == [3]
+    assert prompt_map.used_prompt_ids.tolist() == [0]
+
+
 def test_future_root_mask_blocks_unobserved_features_before_projection():
     model = make_model().eval()
     future = torch.arange(20, dtype=torch.float32).reshape(1, 1, 4, 5)

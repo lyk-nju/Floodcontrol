@@ -1,5 +1,8 @@
 import torch
 import pytest
+from torch.testing import assert_close
+
+import models.tools.wan_model as wan_model_tools
 
 from models.tools.attention import (
     FLASH_ATTN_2_AVAILABLE,
@@ -44,6 +47,197 @@ def test_token_aligned_cross_attention_masks_non_motion_queries():
     )
     assert not output[:, :2].eq(0).all()
     assert not output[:, 2].any()
+
+
+def _dense_prompt_context(
+    context_bank: torch.Tensor,
+    context_lens: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    query_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    safe_ids = prompt_ids.clamp_min(0)
+    batch, length = prompt_ids.shape
+    dense_context = context_bank.index_select(0, safe_ids.reshape(-1)).reshape(
+        batch,
+        length,
+        context_bank.shape[1],
+        context_bank.shape[2],
+    )
+    dense_lens = context_lens.index_select(0, safe_ids.reshape(-1)).reshape(
+        batch, length
+    )
+    dense_lens = torch.where(query_mask, dense_lens, torch.zeros_like(dense_lens))
+    return dense_context, dense_lens
+
+
+def test_prompt_bank_cross_attention_matches_dense_token_context():
+    torch.manual_seed(23)
+    dense_attention = WanCrossAttention(8, 2).eval()
+    grouped_attention = WanCrossAttention(8, 2).eval()
+    grouped_attention.load_state_dict(dense_attention.state_dict())
+
+    dense_value = torch.randn(2, 4, 8, requires_grad=True)
+    grouped_value = dense_value.detach().clone().requires_grad_(True)
+    dense_bank = torch.randn(3, 5, 8, requires_grad=True)
+    grouped_bank = dense_bank.detach().clone().requires_grad_(True)
+    context_lens = torch.tensor([5, 3, 4])
+    prompt_ids = torch.tensor([[0, 0, 1, -1], [2, 1, -1, -1]])
+    query_lens = torch.tensor([4, 3])
+    query_mask = torch.tensor(
+        [[True, True, True, False], [True, True, False, False]]
+    )
+    dense_context, dense_lens = _dense_prompt_context(
+        dense_bank,
+        context_lens,
+        prompt_ids,
+        query_mask,
+    )
+
+    dense_output = dense_attention(
+        dense_value,
+        dense_context,
+        dense_lens,
+        query_lens,
+        query_mask=query_mask,
+    )
+    grouped_output = grouped_attention(
+        grouped_value,
+        grouped_bank,
+        context_lens,
+        query_lens,
+        query_mask=query_mask,
+        prompt_ids=prompt_ids,
+    )
+    assert_close(grouped_output, dense_output, atol=1e-6, rtol=1e-5)
+    assert not grouped_output[~query_mask].any()
+
+    dense_output.square().sum().backward()
+    grouped_output.square().sum().backward()
+    assert_close(grouped_value.grad, dense_value.grad, atol=1e-6, rtol=1e-5)
+    assert_close(grouped_bank.grad, dense_bank.grad, atol=1e-6, rtol=1e-5)
+    for dense_parameter, grouped_parameter in zip(
+        dense_attention.parameters(), grouped_attention.parameters()
+    ):
+        assert_close(
+            grouped_parameter.grad,
+            dense_parameter.grad,
+            atol=1e-6,
+            rtol=1e-5,
+        )
+
+
+def test_prompt_bank_projects_key_value_once_per_used_prompt():
+    torch.manual_seed(29)
+    attention = WanCrossAttention(8, 2).eval()
+    value = torch.randn(2, 5, 8)
+    context_bank = torch.randn(3, 4, 8)
+    prompt_ids = torch.tensor([[0, 0, 0, 1, 1], [2, 2, 0, 1, 2]])
+    seen_key_shapes: list[tuple[int, ...]] = []
+    handle = attention.k.register_forward_pre_hook(
+        lambda _module, arguments: seen_key_shapes.append(tuple(arguments[0].shape))
+    )
+    try:
+        output = attention(
+            value,
+            context_bank,
+            torch.tensor([4, 3, 2]),
+            torch.tensor([5, 5]),
+            prompt_ids=prompt_ids,
+        )
+    finally:
+        handle.remove()
+
+    assert output.shape == value.shape
+    assert seen_key_shapes == [(9, 8)]
+
+
+def test_skewed_prompt_groups_stay_fully_packed(monkeypatch):
+    attention = WanCrossAttention(8, 2).eval()
+    value = torch.randn(1, 640, 8)
+    context_bank = torch.randn(321, 1, 8)
+    prompt_ids = torch.tensor([[0] * 320 + list(range(1, 321))])
+    captured: dict[str, tuple[int, ...]] = {}
+    original = wan_model_tools.varlen_attention
+
+    def capture(q, k, v, **kwargs):
+        captured["q"] = tuple(q.shape)
+        captured["k"] = tuple(k.shape)
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(wan_model_tools, "varlen_attention", capture)
+    output = attention(
+        value,
+        context_bank,
+        torch.ones(321, dtype=torch.long),
+        torch.tensor([640]),
+        prompt_ids=prompt_ids,
+    )
+
+    assert output.shape == value.shape
+    assert captured == {"q": (640, 2, 4), "k": (321, 2, 4)}
+
+
+def test_empty_prompt_query_map_keeps_static_parameter_graph():
+    attention = WanCrossAttention(8, 2)
+    value = torch.randn(1, 3, 8, requires_grad=True)
+    context_bank = torch.randn(1, 2, 8, requires_grad=True)
+    output = attention(
+        value,
+        context_bank,
+        torch.tensor([2]),
+        torch.tensor([3]),
+        query_mask=torch.zeros(1, 3, dtype=torch.bool),
+        prompt_ids=torch.full((1, 3), -1, dtype=torch.long),
+    )
+    output.sum().backward()
+
+    assert not output.any()
+    assert value.grad is not None
+    assert context_bank.grad is not None
+    assert all(parameter.grad is not None for parameter in attention.parameters())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prompt_bank_flash_attention_matches_dense_token_context():
+    torch.manual_seed(37)
+    device = torch.device("cuda")
+    dense_attention = WanCrossAttention(32, 4).to(device).eval()
+    grouped_attention = WanCrossAttention(32, 4).to(device).eval()
+    grouped_attention.load_state_dict(dense_attention.state_dict())
+    value = torch.randn(2, 7, 32, device=device)
+    context_bank = torch.randn(3, 6, 32, device=device)
+    context_lens = torch.tensor([6, 4, 2], device=device)
+    prompt_ids = torch.tensor(
+        [[0, 0, 1, 1, 2, -1, -1], [2, 2, 0, 1, 1, 0, -1]],
+        device=device,
+    )
+    query_lens = torch.tensor([6, 7], device=device)
+    query_mask = prompt_ids >= 0
+    dense_context, dense_lens = _dense_prompt_context(
+        context_bank,
+        context_lens,
+        prompt_ids,
+        query_mask,
+    )
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        dense_output = dense_attention(
+            value,
+            dense_context,
+            dense_lens,
+            query_lens,
+            query_mask=query_mask,
+        )
+        grouped_output = grouped_attention(
+            value,
+            context_bank,
+            context_lens,
+            query_lens,
+            query_mask=query_mask,
+            prompt_ids=prompt_ids,
+        )
+
+    assert_close(grouped_output, dense_output, atol=2e-2, rtol=2e-2)
 
 
 def test_text_context_is_cast_to_projection_dtype_without_autocast():

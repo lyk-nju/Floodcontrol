@@ -14,9 +14,11 @@ import torch
 import torch.nn as nn
 
 from models.tools.wan_model import (
+    PromptQueryMap,
     WanLayerNorm,
     WanTransformerBlock,
-    project_unique_text_context,
+    create_prompt_query_map,
+    prepare_unique_text_context,
     sinusoidal_embedding_1d,
 )
 from utils.conditions.ldf import (
@@ -122,7 +124,7 @@ class TransformerStage(nn.Module):
         query_token_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, PromptQueryMap]:
         if tuple(query_token_indices.shape[:1]) != (batch_size,):
             raise ValueError("query_token_indices must have shape [B,L]")
         if query_token_indices.dtype != torch.long:
@@ -133,7 +135,7 @@ class TransformerStage(nn.Module):
                 "text_context must contain exactly B*T token entries, "
                 f"got {len(text_context)} for B={batch_size}, T={token_length}"
             )
-        projected, unique_lengths, prompt_ids = project_unique_text_context(
+        raw_context, unique_lengths, prompt_ids = prepare_unique_text_context(
             self.text_projection,
             text_context,
             text_len=self.text_len,
@@ -152,22 +154,35 @@ class TransformerStage(nn.Module):
         indices = query_token_indices.clamp(min=0, max=max(token_length - 1, 0))
         batch_indices = torch.arange(batch_size, device=device)[:, None]
         gathered_prompt_ids = prompt_ids[batch_indices, indices]
-        gathered = projected.index_select(0, gathered_prompt_ids.reshape(-1)).reshape(
-            batch_size,
-            query_length,
-            projected.shape[1],
-            projected.shape[2],
+        gathered_prompt_ids = torch.where(
+            text_query_mask,
+            gathered_prompt_ids,
+            torch.full_like(gathered_prompt_ids, -1),
         )
-        gathered_lengths = unique_lengths.index_select(
-            0, gathered_prompt_ids.reshape(-1)
-        ).reshape(batch_size, query_length)
-        gathered = torch.where(
-            text_query_mask[..., None, None], gathered, torch.zeros_like(gathered)
+        prompt_map = create_prompt_query_map(
+            gathered_prompt_ids,
+            seq_lens,
+            query_mask=text_query_mask,
+            prompt_count=raw_context.shape[0],
+            max_context_length=raw_context.shape[1],
         )
-        gathered_lengths = torch.where(
-            text_query_mask, gathered_lengths, torch.zeros_like(gathered_lengths)
-        )
-        return gathered, gathered_lengths, text_query_mask
+        if prompt_map.used_prompt_ids.numel() == 0:
+            packed_raw_context = raw_context.new_empty(0, raw_context.shape[-1])
+            used_lengths = unique_lengths.new_empty(0)
+        else:
+            used_raw_context = raw_context.index_select(
+                0, prompt_map.used_prompt_ids
+            )
+            used_lengths = unique_lengths.index_select(
+                0, prompt_map.used_prompt_ids
+            ).clamp_min(1).to(dtype=torch.int32)
+            valid_context = (
+                torch.arange(raw_context.shape[1], device=device)[None]
+                < used_lengths[:, None]
+            )
+            packed_raw_context = used_raw_context[valid_context]
+        projected_context = self.text_projection(packed_raw_context)
+        return projected_context, used_lengths, prompt_map
 
     def _run_blocks(
         self,
@@ -195,7 +210,7 @@ class TransformerStage(nn.Module):
         modulation = self.time_projection(time).reshape(
             batch, length, 6, self.hidden_dim
         )
-        context, context_lens, text_query_mask = self._prepare_text(
+        context, context_lens, text_prompt_map = self._prepare_text(
             text_context,
             batch_size=batch,
             token_length=motion_token_length,
@@ -211,7 +226,7 @@ class TransformerStage(nn.Module):
                 rope_position_ids=rope_position_ids,
                 context=context,
                 context_lens=context_lens,
-                text_query_mask=text_query_mask,
+                text_prompt_map=text_prompt_map,
             )
         return self.output_projection(self.output_norm(hidden))
 
