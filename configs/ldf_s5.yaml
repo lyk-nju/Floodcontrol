@@ -1,23 +1,23 @@
 dirs:
-  deps: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/deps
-  outputs: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/outputs
-  raw_data: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/raw_data
+  deps: /data1/yuankai/text2Motion/FloodDiffusion/deps
+  outputs: /data1/yuankai/text2Motion/FloodDiffusion/outputs
+  raw_data: /data1/yuankai/text2Motion/FloodDiffusion/raw_data
 
 exp_name: ldf_hybrid
 seed: 1234
 debug: false
 train: true
-save_dir: ./outputs/ldf
-resume_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260717_123044_ldf_hybrid/step_200000.ckpt
-test_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260717_123044_ldf_hybrid/step_200000.ckpt
+save_dir: /data1/yuankai/text2Motion/Floodcontrol/ldf
+resume_ckpt: null
+test_ckpt: null
 
 wandb_info:
   project: Floodcontrol
 
 trainer:
-  max_steps: 500000
+  max_steps: 300000
   accelerator: gpu
-  devices: 8
+  devices: 1
   strategy: auto
   precision: bf16-mixed
   log_every_n_steps: 50
@@ -47,12 +47,12 @@ validation:
     segment_frames: 20
 
   t2m:
-    enabled: true
+    enabled: false
     steps: 10000
 
 vae:
   target: models.vae_wan_1d.BodyVAE
-  checkpoint_path: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/vae/step_299999.ckpt
+  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/last.ckpt
   params:
     latent_dim: 128
     hidden_dim: 512
@@ -61,7 +61,7 @@ vae:
     kernel_size: 3
     dropout: 0.0
     motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
-    latent_stats_path: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/vae/latent_stats.npz
+    latent_stats_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/latent_stats.npz
 
 data:
   target: datasets.humanml3d.HumanML3DDataset
@@ -81,9 +81,9 @@ data:
   min_frames: 20
   max_frames: 160
   random_yaw: true
-  train_batch_size: 32
+  train_batch_size: 8
   val_batch_size: 16
-  num_workers: 4
+  num_workers: 16
   pin_memory: true
 
 text_encoder:
@@ -150,17 +150,13 @@ loss:
 self_forcing:
   # Cold replay is sampled before K and therefore covers the complete run.
   cold_start_replay: 0.1
-  # Absolute global-step schedule.  This preserves the former 200k-start,
-  # 300k-phase recipe while remaining stable when max_steps changes.
   k_schedule:
     - [0, 1]
-    - [200000, 2]
-    - [290000, 3]
-    - [350000, 5]
+    - [100000, 2]
+    - [200000, 5]
   teacher_replay:
-    2: 0.1
-    3: 0.1
-    5: 0.1
+    2: 0.0
+    5: 0.0
 
 model:
   target: models.diffusion_forcing_wan.LDF

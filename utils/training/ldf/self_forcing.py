@@ -14,13 +14,14 @@ from utils.token_frame import FRAMES_PER_TOKEN
 from utils.training.ldf.batch import (
     ConditionBuilder,
     LDFTrainingStep,
+    build_cold_start_training_step,
     build_ldf_training_step,
 )
 from utils.training.ldf.flow import recover_clean_for_self_forcing
 
 
-DEFAULT_K_SCHEDULE = ((0.0, 2), (0.4, 3), (0.7, 5))
-DEFAULT_TEACHER_REPLAY = {2: 0.5, 3: 0.3, 5: 0.2}
+DEFAULT_K_SCHEDULE = ((0, 1), (100_000, 2), (200_000, 5))
+DEFAULT_TEACHER_REPLAY = {2: 0.5, 5: 0.2}
 
 
 def _require_integer(name: str, value: object) -> int:
@@ -36,29 +37,31 @@ def _require_integer(name: str, value: object) -> int:
     return converted
 
 
-def _normalize_k_schedule(schedule) -> tuple[tuple[float, int], ...]:
+def _normalize_k_schedule(schedule) -> tuple[tuple[int, int], ...]:
     rows = []
     for index, row in enumerate(schedule):
         try:
             row_length = len(row)
         except TypeError as error:
             raise ValueError(
-                f"self-forcing schedule row {index} must be [threshold,K]"
+                f"self-forcing schedule row {index} must be [start_step,K]"
             ) from error
         if row_length != 2:
-            raise ValueError(f"self-forcing schedule row {index} must be [threshold,K]")
-        threshold = float(row[0])
+            raise ValueError(
+                f"self-forcing schedule row {index} must be [start_step,K]"
+            )
+        start_step = _require_integer("self-forcing schedule start step", row[0])
         rollout_steps = _require_integer("self-forcing K", row[1])
-        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
-            raise ValueError("self-forcing thresholds must lie in [0,1]")
-        if rollout_steps < 2:
-            raise ValueError("self-forcing K values must be at least 2")
-        rows.append((threshold, rollout_steps))
-    if not rows or rows[0][0] != 0.0:
-        raise ValueError("self-forcing schedule must start at threshold 0")
+        if start_step < 0:
+            raise ValueError("self-forcing schedule start steps must be non-negative")
+        if rollout_steps < 1:
+            raise ValueError("self-forcing K values must be at least 1")
+        rows.append((start_step, rollout_steps))
+    if not rows or rows[0] != (0, 1):
+        raise ValueError("self-forcing schedule must start with [0,1]")
     if any(right[0] <= left[0] for left, right in zip(rows, rows[1:])):
         raise ValueError(
-            "self-forcing thresholds must be strictly increasing and unique"
+            "self-forcing schedule start steps must be strictly increasing and unique"
         )
     if any(right[1] <= left[1] for left, right in zip(rows, rows[1:])):
         raise ValueError("self-forcing K values must be strictly increasing")
@@ -71,19 +74,21 @@ def validate_self_forcing_config(
     generation_tokens: int,
     max_window_tokens: int,
     max_steps: int,
-) -> tuple[tuple[float, int], ...]:
-    """Validate the complete self-forcing phase before training starts."""
+) -> tuple[tuple[int, int], ...]:
+    """Validate the unified K=1/persistent-rollout curriculum."""
 
-    phase_start_step = _require_integer(
-        "self_forcing.phase_start_step", config.get("phase_start_step", -1)
-    )
-    phase_steps = _require_integer(
-        "self_forcing.phase_steps", config.get("phase_steps", 0)
-    )
-    if phase_start_step < 0:
-        raise ValueError("self_forcing.phase_start_step must be non-negative")
-    if phase_steps <= 0:
-        raise ValueError("self_forcing.phase_steps must be positive")
+    if "enabled" in config:
+        raise ValueError(
+            "self_forcing.enabled has been removed; K=1 is the baseline "
+            "self-forcing stage and the curriculum is always active"
+        )
+
+    for removed_name in ("phase_start_step", "phase_steps"):
+        if removed_name in config:
+            raise ValueError(
+                f"self_forcing.{removed_name} has been removed; encode every "
+                "K stage directly in the absolute-step k_schedule"
+            )
 
     schedule = _normalize_k_schedule(list(config.get("k_schedule") or []))
     replay_config = dict(config.get("teacher_replay") or {})
@@ -98,11 +103,14 @@ def validate_self_forcing_config(
                 "self-forcing teacher replay probabilities must lie in [0,1]"
             )
         replay[key] = probability
-    schedule_k = {rollout_steps for _, rollout_steps in schedule}
-    if set(replay) != schedule_k:
+    replay_k = {rollout_steps for _, rollout_steps in schedule if rollout_steps > 1}
+    if set(replay) != replay_k:
         raise ValueError(
-            "self-forcing teacher replay keys must exactly match schedule K values"
+            "self-forcing teacher replay keys must exactly match schedule K>1 values"
         )
+    cold_start_replay = float(config.get("cold_start_replay", 0.0))
+    if not math.isfinite(cold_start_replay) or not 0.0 <= cold_start_replay <= 1.0:
+        raise ValueError("self_forcing.cold_start_replay must lie in [0,1]")
 
     generation_tokens = _require_integer(
         "training.window.generation_tokens", generation_tokens
@@ -119,9 +127,9 @@ def validate_self_forcing_config(
     max_steps = _require_integer("trainer.max_steps", max_steps)
     if max_steps <= 0:
         raise ValueError("trainer.max_steps must be positive")
-    if bool(config.get("enabled", False)) and phase_start_step >= max_steps:
+    if schedule[-1][0] >= max_steps:
         raise ValueError(
-            "enabled self-forcing requires phase_start_step < trainer.max_steps"
+            "self-forcing schedule start steps must be smaller than trainer.max_steps"
         )
     return schedule
 
@@ -284,33 +292,33 @@ class SelfForcingResult:
 
 
 def resolve_self_forcing_k(
-    progress: float,
+    global_step: int,
     schedule=DEFAULT_K_SCHEDULE,
 ) -> int:
-    """Resolve the current K from monotonically increasing progress thresholds."""
+    """Resolve the current K from monotonically increasing absolute steps."""
 
-    progress = float(progress)
-    if not 0.0 <= progress <= 1.0:
-        raise ValueError("progress must lie in [0,1]")
+    global_step = _require_integer("global_step", global_step)
+    if global_step < 0:
+        raise ValueError("global_step must be non-negative")
     rows = _normalize_k_schedule(schedule)
     selected = rows[0][1]
-    for threshold, candidate in rows:
-        if progress < threshold:
+    for start_step, candidate in rows:
+        if global_step < start_step:
             break
         selected = candidate
     return selected
 
 
 def sample_rollout_steps(
-    progress: float,
+    global_step: int,
     *,
     generator: torch.Generator | None = None,
     schedule=DEFAULT_K_SCHEDULE,
     teacher_replay: Mapping[int, float] | None = DEFAULT_TEACHER_REPLAY,
 ) -> int:
-    """Sample K with configurable teacher-forcing replay during fine-tuning."""
+    """Sample K at one absolute step with configurable K=1 replay."""
 
-    rollout_steps = resolve_self_forcing_k(progress, schedule)
+    rollout_steps = resolve_self_forcing_k(global_step, schedule)
     replay_probability = 0.0 if teacher_replay is None else float(
         teacher_replay.get(rollout_steps, 0.0)
     )
@@ -327,26 +335,6 @@ def sample_rollout_steps(
     return 1 if draw < replay_probability else rollout_steps
 
 
-def self_forcing_phase_progress(
-    global_step: int,
-    *,
-    phase_start_step: int,
-    phase_steps: int,
-) -> float:
-    """Measure curriculum progress relative to the self-forcing fine-tune phase."""
-
-    phase_start_step = int(phase_start_step)
-    phase_steps = int(phase_steps)
-    if phase_start_step < 0:
-        raise ValueError("phase_start_step must be non-negative")
-    if phase_steps <= 0:
-        raise ValueError("phase_steps must be positive")
-    return min(
-        1.0,
-        max(0.0, (int(global_step) - phase_start_step) / float(phase_steps)),
-    )
-
-
 def sample_window_plan(
     batch: dict[str, object],
     *,
@@ -358,6 +346,7 @@ def sample_window_plan(
     phase_offset: torch.Tensor | None = None,
     root_noise: torch.Tensor | None = None,
     body_noise: torch.Tensor | None = None,
+    allow_cold_start: bool = True,
 ) -> LDFWindowPlan:
     """Sample H, phase and fixed absolute-token noise for one source span."""
 
@@ -394,11 +383,14 @@ def sample_window_plan(
         )
     maximum_history = span_count - active_tokens - (rollout_steps - 1)
     # Persistent solver rollout models steady-state continuation transactions.
-    # True cold start has a longer first warm-up transaction and remains covered
-    # by the unchanged K=1 ideal path.
+    # True cold start has a longer first warm-up transaction and is admitted only
+    # by the explicit K=1 cold-start replay path.
     minimum_history = torch.maximum(
         (source_start > 0).to(dtype=torch.long),
-        torch.full_like(source_start, 1 if rollout_steps > 1 else 0),
+        torch.full_like(
+            source_start,
+            1 if rollout_steps > 1 or not bool(allow_cold_start) else 0,
+        ),
     )
     if initial_history_tokens is None:
         draws = torch.rand(
@@ -506,11 +498,34 @@ def run_self_forcing_rollout(
     previous_root_frame: torch.Tensor | None,
     previous_root_valid_mask: torch.Tensor | None,
     condition_builder: ConditionBuilder,
+    cold_denoise_step: torch.Tensor | None = None,
 ) -> SelfForcingResult:
     """Run K-1 detached replacements and one differentiable final forward."""
 
     plan.validate_structure()
     state.validate(plan)
+    if cold_denoise_step is not None:
+        if plan.rollout_steps != 1 or not bool(plan.cold_start_mask.all()):
+            raise ValueError("cold denoise phases require a true-cold K=1 plan")
+        training_step = build_cold_start_training_step(
+            model=model,
+            clean_motion=state.clean_motion,
+            noise=plan.noise,
+            source_start_token=plan.source_start_token,
+            span_token_count=plan.span_token_count,
+            active_tokens=plan.active_tokens,
+            denoise_step_index=cold_denoise_step,
+            previous_root_frame=previous_root_frame,
+            previous_root_valid_mask=previous_root_valid_mask,
+            condition_builder=condition_builder,
+        )
+        prediction = model(training_step.inputs)
+        return SelfForcingResult(
+            final_step=training_step,
+            prediction=prediction,
+            state=state,
+            replacements=(),
+        )
     if plan.rollout_steps > 1:
         from utils.training.ldf.rollout import run_persistent_rollout
 
@@ -606,5 +621,4 @@ __all__ = [
     "run_self_forcing_rollout",
     "sample_rollout_steps",
     "sample_window_plan",
-    "self_forcing_phase_progress",
 ]

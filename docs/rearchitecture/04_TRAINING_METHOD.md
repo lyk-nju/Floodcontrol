@@ -44,16 +44,16 @@ L_latent_body_flow_v
 
 ## 已实现的scaled-ARDY窗口训练内核
 
-- 每个sample保留自己的自然parent长度`N_i=min(sample_tokens,50)`；长动作随机裁一个50-token父窗口，短动作不人为缩短。batch只在右侧padding，因此真实长度由`span_token_count[B]`表达。
-- active band固定为`C=chunk_size=5`。K=1时每个sample独立均匀采样`H_i∈[0,N_i-C]`，并令`F_i=N_i-H_i-C`，唯一预算为`H_i+C+F_i<=50`，不再分别截断history与future。K-step self-forcing时额外保留`R=K-1`，采样上界变为`N_i-C-R`。
+- 每个sample保留自己的自然parent长度`N_i=min(sample_tokens,40)`；长动作随机裁一个40-token/160-frame父窗口，短动作不人为缩短。batch只在右侧padding，因此真实长度由`span_token_count[B]`表达。
+- active band固定为`C=chunk_size=5`。普通batch的每个sample独立均匀采样`H_i∈[1,N_i-C]`，并令`F_i=N_i-H_i-C`；只有显式cold-start ideal replay使用`H_i=0`。唯一预算为`H_i+C+F_i<=40`，不再分别截断history与future。K-step self-forcing时额外保留`R=K-1`，采样上界变为`N_i-C-R`。
 - 第`i`步使用`history=[0,H+i)`、`active=[H+i,H+i+5)`、`frontier=[H+i+5,S)`。persistent noisy state仍保存完整S和固定frontier noise，但Transformer只接收`history+active`有效前缀；尚未开始更新的pure-noise frontier不进入self-attention。它与span外future-root condition token仍是两类对象。
 - K=1 ideal baseline只采样一次per-sample continuous phase和absolute-token root/body Gaussian noise，并用`x_beta=(1-beta)x0+beta*epsilon`及`v*=x0-epsilon`训练当前active band；该路径保持原有输入、随机分布和MSE不变。
 - K>1表示实际rollout并commit的token数，不表示denoise step数。persistent rollout从runtime commit boundary开始，只在起点调用一次`mix_fixed_noise()`，此后root与latent noisy state都通过共享`LDF.denoise_step()`的Euler更新持续演化，不再为下一commit重建理想`x_beta`。
 - 每个commit只编译一次text/XZ condition；事务内全部denoise steps共享同一condition。前K-1个commit以及最终commit除最后一次denoise step外全部在`torch.no_grad()`中运行，只有最后一次denoise step保留梯度。
 - 每次训练commit后把预测token detach为history，并以其最后一帧physical XZ执行与runtime相同的`(1-beta)`root state rebase；clean GT root、generated history、previous-root boundary和future XZ condition一起换到新model origin，latent与fixed Gaussian source保持不变。
-- persistent rollout要求至少一个真实history token；true cold-start及其较长首次warm-up事务继续由K=1路径覆盖。启用self-forcing时训练Dataset会过滤到至少`C+K`个token，保证`H>=1`仍有足够frontier完成K次commit。
-- 当前300k正式训练使用硬分段curriculum：`[0,100k)`为K=1 ideal bridge，`[100k,200k)`为K=2 persistent rollout，`[200k,300k)`为K=5 persistent rollout。`phase_start_step=100000`之前由硬gate保持K=1；之后以`phase_steps=200000`计算进度，并在0.5阈值切换到K=5。两个rollout阶段的`teacher_replay`均为0，因此不会随机退回K=1。
-- K与teacher-replay是global-batch决策：所有DDP rank使用只依赖`seed/global_step`的同一个CPU RNG结果；root/body noise、H、yaw和constraint仍使用rank-local RNG。Ideal与rollout路径始终返回相同且顺序固定的loss metric键，未启用的指标显式记零，避免不同rank的标量日志collective与梯度bucket错位。
+- persistent rollout要求至少一个真实history token，因为cold-start首个commit从全噪声状态开始，需要完整`noise_steps`次更新，而稳态commit只需要`noise_steps/chunk_size`次更新。显式cold-start ideal replay单独覆盖真实序列起点，不要求稳态history；统一课程会按最大K把训练Dataset过滤到至少`C+K`个token，保证普通`H>=1`窗口仍有足够frontier完成K次commit。
+- `self_forcing`是K=1 baseline与K>1 persistent rollout的统一课程入口，不存在独立enable或phase开关；`k_schedule`直接写成`[absolute_global_step,K]`并强制从`[0,1]`开始。远端500k resume配置在0/200k/290k/350k分别进入K=1/2/3/5，等价保留旧200k起点、300k phase和0/0.3/0.5阈值，但后续修改`max_steps`不会重标定课程；本机S5的300k配置在0/100k/200k进入K=1/2/5。`cold_start_replay=0.1`在选择当前K之前独立采样，因此从第0步到训练结束，每个阶段都有10% global batch被强制改为真实序列起点的`H=0,K=1` ideal训练；其余batch遵循当前K及其teacher replay。每个cold样本均匀采样`denoise_step∈{0,...,noise_steps-1}`，通过runtime同一个`triangular_beta()`得到当前与下一beta，并复用runtime visibility公式；在正式`noise_steps=10,chunk_size=5`下，可见motion token按`1,1,2,2,3,3,4,4,5,5`扩展。noisy state仍一次性按理想bridge构造，target仍为`x0-epsilon`，因此每个cold batch只有一次forward而不是10步solver rollout。完整off-path cold solver replay保留为后续消融。
+- K、teacher-replay与是否进入cold-start replay都是global-batch决策：K使用只依赖`seed/global_step`的CPU RNG；cold replay使用batch sampler提供的跨rank一致seed。具体cold denoise step与root/body noise、H、yaw和constraint一样使用rank-local RNG，因为它们不改变计算图或collective顺序。Ideal与rollout路径始终返回相同且顺序固定的loss metric键，未启用的指标显式记零，避免不同rank的标量日志collective与梯度bucket错位。
 
 训练实现分为`flow.py`的flow/endpoint代数、`batch.py`的ideal与arbitrary-state输入合同、`self_forcing.py`的K curriculum/window plan、`rollout.py`的persistent denoise/commit/rebase循环，以及`losses.py`的ideal flow-v与off-path endpoint reduction。训练与runtime共同调用`LDF.denoise_step()`，因此root/body beta、`delta_beta`和Euler更新只有一个实现；buffer rolling仍只属于runtime。数据内容合同由CPU collator在构造时保证；GPU热路径只保留shape/dtype检查，完整plan/input内容校验仅按debug周期抽查，不能在每个denoise step重复同步。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ；冻结UMT5只在训练前运行一次并生成caption-to-embedding table，训练热路径按prompt字符串lookup token-aligned context，不在LDF GPU上加载11GB文本编码器。LDF checkpoint只保存LDF/EMA，但附带VAE/statistics/text路径与VAE统计用于resume前校验。
 
@@ -95,10 +95,10 @@ training:
   text_dropout: 0.1
   constraint_dropout: 0.1
   window:
-    max_tokens: 50
+    max_tokens: 40
     generation_tokens: 5
     sampling: random_generation_start
-  max_horizon_token: 45
+  max_horizon_token: 35
   constraint_sampling:
     dense_probability: 0.5
     waypoint_probability: 0.25

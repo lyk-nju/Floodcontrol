@@ -4,8 +4,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from models.diffusion_forcing_wan import LDF
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
-from utils.training.ldf.batch import build_ldf_rollout_step, build_ldf_training_step
+from utils.training.ldf.batch import (
+    build_cold_start_training_step,
+    build_ldf_rollout_step,
+    build_ldf_training_step,
+)
 from utils.training.ldf.conditioning import (
     create_xz_condition,
     sample_xz_constraint_mask,
@@ -19,9 +24,9 @@ from utils.training.ldf.flow import (
 from utils.training.ldf.self_forcing import (
     SelfForcingState,
     run_self_forcing_rollout,
+    resolve_self_forcing_k,
     sample_rollout_steps,
     sample_window_plan,
-    self_forcing_phase_progress,
 )
 
 
@@ -111,6 +116,22 @@ def test_true_cold_plan_requires_sequence_start_and_uses_frame_zero_anchor():
     assert plan.cold_start_mask.tolist() == [True, True]
     assert plan.translation_anchor_frame.tolist() == [0, 0]
     assert plan.translation_anchor_xz.tolist() == [[0.0, 0.0], [0.0, 0.0]]
+
+
+def test_explicit_cold_replay_contract_removes_accidental_h_zero_sampling():
+    histories = []
+    for seed in range(20):
+        plan = sample_window_plan(
+            physical_batch(cold=True),
+            active_tokens=5,
+            rollout_steps=1,
+            latent_dim=4,
+            allow_cold_start=False,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        histories.extend(plan.initial_history_tokens.tolist())
+
+    assert min(histories) >= 1
 
 
 def test_h_zero_rejects_mid_clip_context_and_previous_root_boundaries():
@@ -243,6 +264,88 @@ def test_training_steps_reuse_absolute_noise_and_keep_fixed_span_masks():
     assert torch.equal(first.inputs.noisy_motion.root_motion[:, 3], expected)
     expected_next = second.inputs.beta[:, 3, None, None] * root_noise[:, 3]
     assert torch.equal(second.inputs.noisy_motion.root_motion[:, 3], expected_next)
+
+
+@pytest.mark.parametrize("denoise_step", range(10))
+def test_cold_ideal_phase_matches_runtime_beta_visibility_and_state(denoise_step):
+    model = LDF(
+        latent_dim=3,
+        root_mean=[0.0] * 5,
+        root_std=[1.0] * 5,
+        local_root_mean=[0.0] * 4,
+        local_root_std=[1.0] * 4,
+        hidden_dim=16,
+        ffn_dim=32,
+        freq_dim=8,
+        text_dim=1,
+        text_len=1,
+        num_heads=4,
+        root_num_layers=1,
+        body_num_layers=1,
+        chunk_size=5,
+        noise_steps=10,
+    )
+    clean = HybridMotion(
+        torch.zeros(1, 10, 4, 5),
+        torch.zeros(1, 10, 3),
+    )
+    noise = HybridMotion(
+        torch.ones_like(clean.root_motion),
+        torch.ones_like(clean.latent_motion),
+    )
+    step = build_cold_start_training_step(
+        model=model,
+        clean_motion=clean,
+        noise=noise,
+        source_start_token=torch.zeros(1, dtype=torch.long),
+        span_token_count=torch.tensor([10]),
+        active_tokens=5,
+        denoise_step_index=torch.tensor([denoise_step]),
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition_builder=empty_condition(1),
+    )
+
+    positions = torch.arange(10)[None]
+    beta = model.triangular_beta(
+        timeline_position_ids=positions,
+        diffusion_time=denoise_step / 10.0,
+    )
+    next_beta = model.triangular_beta(
+        timeline_position_ids=positions,
+        diffusion_time=(denoise_step + 1) / 10.0,
+    )
+    runtime_inputs = model._create_step_input(
+        HybridMotion(
+            beta[..., None, None] * noise.root_motion,
+            beta[..., None] * noise.latent_motion,
+        ),
+        beta=beta,
+        next_beta=next_beta,
+        timeline_position_ids=positions,
+        commit_index=0,
+        condition=step.inputs.condition,
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+    )
+
+    assert torch.equal(step.inputs.beta, runtime_inputs.beta)
+    assert torch.equal(
+        step.inputs.generation_mask,
+        runtime_inputs.generation_mask,
+    )
+    assert torch.equal(step.loss_mask, runtime_inputs.generation_mask)
+    assert torch.equal(
+        step.inputs.noisy_motion.root_motion,
+        runtime_inputs.noisy_motion.root_motion,
+    )
+    assert torch.equal(
+        step.inputs.noisy_motion.latent_motion,
+        runtime_inputs.noisy_motion.latent_motion,
+    )
+    assert torch.equal(step.inputs.timeline_position_ids, positions)
+    assert torch.equal(step.inputs.rope_position_ids, positions)
+    assert int(step.loss_mask.sum()) == 1 + denoise_step // 2
 
 
 def test_mixed_batch_uses_each_samples_own_history_and_real_span_length():
@@ -654,17 +757,30 @@ def test_one_persistent_future_goal_becomes_active_during_self_forcing():
 
 def test_teacher_replay_is_configurable_without_changing_k_curriculum():
     generator = torch.Generator().manual_seed(0)
+    schedule = ((0, 1), (10, 2), (20, 3), (30, 5))
     assert sample_rollout_steps(
-        0.2, generator=generator, teacher_replay={2: 1.0}
+        10,
+        generator=generator,
+        schedule=schedule,
+        teacher_replay={2: 1.0},
     ) == 1
     assert sample_rollout_steps(
-        0.2, generator=generator, teacher_replay={2: 0.0}
+        10,
+        generator=generator,
+        schedule=schedule,
+        teacher_replay={2: 0.0},
     ) == 2
     assert sample_rollout_steps(
-        0.5, generator=generator, teacher_replay={3: 0.0}
+        20,
+        generator=generator,
+        schedule=schedule,
+        teacher_replay={3: 0.0},
     ) == 3
     assert sample_rollout_steps(
-        0.8, generator=generator, teacher_replay={5: 0.0}
+        30,
+        generator=generator,
+        schedule=schedule,
+        teacher_replay={5: 0.0},
     ) == 5
 
 
@@ -682,8 +798,9 @@ def test_teacher_replay_draw_uses_the_generators_device(monkeypatch):
     generator = DeviceOnlyGenerator()
     monkeypatch.setattr("utils.training.ldf.self_forcing.torch.rand", fake_rand)
     assert sample_rollout_steps(
-        0.2,
+        100_000,
         generator=generator,
+        schedule=((0, 1), (100_000, 2)),
         teacher_replay={2: 0.0},
     ) == 2
     assert captured == {
@@ -692,10 +809,13 @@ def test_teacher_replay_draw_uses_the_generators_device(monkeypatch):
     }
 
 
-def test_self_forcing_curriculum_progress_is_relative_to_finetune_phase():
-    kwargs = {"phase_start_step": 300_000, "phase_steps": 200_000}
-    assert self_forcing_phase_progress(299_999, **kwargs) == 0.0
-    assert self_forcing_phase_progress(300_000, **kwargs) == 0.0
-    assert self_forcing_phase_progress(400_000, **kwargs) == 0.5
-    assert self_forcing_phase_progress(500_000, **kwargs) == 1.0
-    assert self_forcing_phase_progress(600_000, **kwargs) == 1.0
+def test_self_forcing_curriculum_uses_absolute_global_step_boundaries():
+    schedule = ((0, 1), (200_000, 2), (290_000, 3), (350_000, 5))
+    assert resolve_self_forcing_k(0, schedule) == 1
+    assert resolve_self_forcing_k(199_999, schedule) == 1
+    assert resolve_self_forcing_k(200_000, schedule) == 2
+    assert resolve_self_forcing_k(289_999, schedule) == 2
+    assert resolve_self_forcing_k(290_000, schedule) == 3
+    assert resolve_self_forcing_k(349_999, schedule) == 3
+    assert resolve_self_forcing_k(350_000, schedule) == 5
+    assert resolve_self_forcing_k(900_000, schedule) == 5

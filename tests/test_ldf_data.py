@@ -1,3 +1,4 @@
+import pytest
 import torch
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from omegaconf import OmegaConf
@@ -226,8 +227,8 @@ def test_length_bucket_sampler_does_not_mix_short_and_long_clips():
     batches = list(sampler)
     assert len(batches) == 2
     assert all(
-        max(dataset.frame_counts[index] for index, _ in batch)
-        - min(dataset.frame_counts[index] for index, _ in batch)
+        max(dataset.frame_counts[index] for index, _, _ in batch)
+        - min(dataset.frame_counts[index] for index, _, _ in batch)
         < 20
         for batch in batches
     )
@@ -280,7 +281,7 @@ def test_length_bucket_sampler_builds_equal_nonoverlapping_ddp_steps():
         index
         for batches in rank_batches
         for batch in batches
-        for index, _ in batch
+        for index, _, _ in batch
     ]
     # Ten real samples fill twelve distributed slots.  The final two slots are
     # deterministic padding, while every real sample remains represented.
@@ -289,9 +290,34 @@ def test_length_bucket_sampler_builds_equal_nonoverlapping_ddp_steps():
     seeds_by_index = {}
     for batches in rank_batches:
         for batch in batches:
-            for index, augmentation_seed in batch:
+            for index, augmentation_seed, _ in batch:
                 seeds_by_index.setdefault(index, set()).add(augmentation_seed)
     assert any(len(seeds) > 1 for seeds in seeds_by_index.values())
+    for step in range(len(rank_batches[0])):
+        assert len(
+            {
+                batch_seed
+                for batches in rank_batches
+                for _, _, batch_seed in batches[step]
+            }
+        ) == 1
+
+    collator = LDFSpanCollator(
+        min_frames=40,
+        max_frames=40,
+        generation_tokens=5,
+        encoder_context_tokens=0,
+        training=True,
+        cold_start_replay=0.5,
+    )
+    replay_by_rank = [
+        [
+            collator([dataset[index] for index in batch])["cold_start_replay"]
+            for batch in batches
+        ]
+        for batches in rank_batches
+    ]
+    assert replay_by_rank[0] == replay_by_rank[1]
 
 
 def test_distributed_validation_sampler_covers_each_sample_once():
@@ -332,6 +358,46 @@ def test_seeded_training_batch_reproduces_crop_caption_and_yaw():
     assert torch.equal(first["body_motion"], second["body_motion"])
     assert first["source_start_token"].tolist() == second["source_start_token"].tolist()
     assert first["prompt_timeline"] == second["prompt_timeline"]
+
+
+def test_cold_start_replay_forces_one_global_batch_to_the_true_sequence_start():
+    samples = [make_sample(80, f"sample-{index}") for index in range(2)]
+    for index, sample in enumerate(samples):
+        sample["_augmentation_seed"] = 100 + index
+        sample["_ldf_batch_seed"] = 77
+    collator = LDFSpanCollator(
+        min_frames=40,
+        max_frames=40,
+        generation_tokens=5,
+        encoder_context_tokens=4,
+        training=True,
+        cold_start_replay=1.0,
+    )
+
+    batch = collator(samples)
+
+    assert batch["cold_start_replay"] is True
+    assert batch["source_start_token"].tolist() == [0, 0]
+    assert batch["context_token_count"].tolist() == [0, 0]
+    assert not batch["previous_root_valid_mask"].any()
+
+
+def test_cold_start_replay_rejects_rank_local_batch_seed_disagreement():
+    samples = [make_sample(80, f"sample-{index}") for index in range(2)]
+    for index, sample in enumerate(samples):
+        sample["_augmentation_seed"] = 100 + index
+        sample["_ldf_batch_seed"] = index
+    collator = LDFSpanCollator(
+        min_frames=40,
+        max_frames=40,
+        generation_tokens=5,
+        encoder_context_tokens=4,
+        training=True,
+        cold_start_replay=0.1,
+    )
+
+    with pytest.raises(ValueError, match="share a batch seed"):
+        collator(samples)
 
 
 def test_length_bucket_sampler_indices_flow_through_dataloader():
@@ -465,10 +531,7 @@ def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
             "seed": 3,
             "train": True,
             "self_forcing": {
-                "enabled": True,
-                "phase_start_step": 0,
-                "phase_steps": 20,
-                "k_schedule": [[0.0, 2], [0.7, 5]],
+                "k_schedule": [[0, 1], [5, 2], [14, 5]],
                 "teacher_replay": {2: 0.2, 5: 0.1},
             },
             "trainer": {"max_steps": 20},

@@ -32,7 +32,6 @@ __all__ = [
     "sample_constraint_keep_mask",
     "sample_xz_constraint_mask",
     "sample_window_plan",
-    "self_forcing_phase_progress",
     "validate_self_forcing_config",
 ]
 
@@ -95,10 +94,6 @@ _EXPORTS = {
     "sample_window_plan": (
         "utils.training.ldf.self_forcing",
         "sample_window_plan",
-    ),
-    "self_forcing_phase_progress": (
-        "utils.training.ldf.self_forcing",
-        "self_forcing_phase_progress",
     ),
     "validate_self_forcing_config": (
         "utils.training.ldf.self_forcing",

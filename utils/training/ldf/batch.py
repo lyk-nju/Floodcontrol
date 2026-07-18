@@ -189,6 +189,97 @@ def build_ldf_training_step(
     )
 
 
+def build_cold_start_training_step(
+    *,
+    model,
+    clean_motion: HybridMotion,
+    noise: HybridMotion,
+    source_start_token: torch.Tensor,
+    span_token_count: torch.Tensor,
+    active_tokens: int,
+    denoise_step_index: torch.Tensor,
+    previous_root_frame: torch.Tensor | None,
+    previous_root_valid_mask: torch.Tensor | None,
+    condition_builder: ConditionBuilder,
+) -> LDFTrainingStep:
+    """Build one ideal cold-start state at an actual runtime denoise phase."""
+
+    clean_motion.validate()
+    noise.validate()
+    batch = clean_motion.batch_size
+    span_tokens = clean_motion.token_length
+    device = clean_motion.root_motion.device
+    source_start = source_start_token.to(device=device, dtype=torch.long).view(-1)
+    span_count = span_token_count.to(device=device, dtype=torch.long).view(-1)
+    denoise_step = denoise_step_index.to(device=device, dtype=torch.long).view(-1)
+    if any(
+        tuple(value.shape) != (batch,)
+        for value in (source_start, span_count, denoise_step)
+    ):
+        raise ValueError(
+            "source_start_token, span_token_count and denoise_step_index must be [B]"
+        )
+    if bool((source_start != 0).any()):
+        raise ValueError("cold-start training requires the true sequence start")
+    noise_steps = int(model.noise_steps)
+    if noise_steps <= 0:
+        raise ValueError("model.noise_steps must be positive")
+    if bool((denoise_step < 0).any()) or bool((denoise_step >= noise_steps).any()):
+        raise ValueError("cold denoise_step_index must lie in [0, noise_steps)")
+
+    positions = torch.arange(span_tokens, device=device, dtype=torch.long)[None].expand(
+        batch, -1
+    )
+    timeline = source_start[:, None] + positions
+    time = denoise_step.to(torch.float32) / float(noise_steps)
+    next_time = (denoise_step + 1).to(torch.float32) / float(noise_steps)
+    beta = model.triangular_beta(
+        timeline_position_ids=timeline,
+        diffusion_time=time,
+    )
+    next_beta = model.triangular_beta(
+        timeline_position_ids=timeline,
+        diffusion_time=next_time,
+    )
+    history_end = torch.zeros(batch, device=device, dtype=torch.long)
+    active_end = torch.full_like(history_end, int(active_tokens))
+    view = LDFStepView(
+        step_index=0,
+        history_end=history_end,
+        active_start=history_end,
+        active_end=active_end,
+        frontier_start=active_end,
+        timeline_position_ids=timeline,
+        rope_position_ids=positions,
+        beta=beta,
+    )
+    condition = condition_builder(view, clean_motion)
+    if not isinstance(condition, LDFCondition):
+        raise TypeError("condition_builder must return LDFCondition")
+    noisy_motion = mix_fixed_noise(clean_motion, noise, beta)
+    inputs = model._create_step_input(
+        noisy_motion,
+        beta=beta,
+        next_beta=next_beta,
+        timeline_position_ids=timeline,
+        commit_index=0,
+        condition=condition,
+        previous_root_frame=previous_root_frame,
+        previous_root_valid_mask=previous_root_valid_mask,
+    )
+    valid = positions < span_count[:, None]
+    loss_mask = inputs.generation_mask & valid
+    inputs.validate_structure()
+    return LDFTrainingStep(
+        inputs=inputs,
+        target_velocity=flow_velocity_target(clean_motion, noise),
+        loss_mask=loss_mask,
+        noise=noise,
+        view=view,
+        clean_motion=clean_motion,
+    )
+
+
 def build_ldf_rollout_step(
     *,
     noisy_motion: HybridMotion,
@@ -282,6 +373,7 @@ __all__ = [
     "LDFStepView",
     "LDFTrainingStep",
     "anchor_physical_batch",
+    "build_cold_start_training_step",
     "build_ldf_rollout_step",
     "build_ldf_training_step",
 ]

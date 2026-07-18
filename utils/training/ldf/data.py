@@ -116,10 +116,16 @@ class MinimumFrameDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int | tuple[int, int]):
+    def __getitem__(self, index: int | tuple[int, int] | tuple[int, int, int]):
         augmentation_seed = None
+        batch_seed = None
         if isinstance(index, tuple):
-            index, augmentation_seed = index
+            if len(index) == 2:
+                index, augmentation_seed = index
+            elif len(index) == 3:
+                index, augmentation_seed, batch_seed = index
+            else:
+                raise ValueError("LDF dataset indices must contain 2 or 3 integers")
         source, source_index = self.samples[index]
         sample = dict(source[source_index])
         # This task-local index is stable across workers and lets validation
@@ -127,10 +133,12 @@ class MinimumFrameDataset(Dataset):
         sample["_ldf_sample_index"] = int(index)
         if augmentation_seed is not None:
             sample["_augmentation_seed"] = int(augmentation_seed)
+        if batch_seed is not None:
+            sample["_ldf_batch_seed"] = int(batch_seed)
         return sample
 
 
-class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
+class LengthBucketBatchSampler(Sampler[list[tuple[int, int, int]]]):
     """Build equal-step, per-rank batches while preserving length buckets."""
 
     def __init__(
@@ -213,6 +221,10 @@ class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
         order = torch.randperm(len(batches), generator=generator).tolist()
         epoch = self.epoch
         for position in order:
+            # The batch seed deliberately excludes rank and sample identity.
+            # It selects global-batch training objectives such as cold replay,
+            # which must follow the same control flow on every DDP rank.
+            batch_seed = _mix_seed([self.seed, epoch, position])
             yield [
                 (
                     index,
@@ -221,6 +233,7 @@ class LengthBucketBatchSampler(Sampler[list[tuple[int, int]]]):
                     else _mix_seed(
                         [self.seed, epoch, rank, position, slot, index]
                     ),
+                    batch_seed,
                 )
                 for slot, index in enumerate(batches[position])
             ]
@@ -338,6 +351,7 @@ class LDFSpanCollator:
         encoder_context_tokens: int,
         training: bool,
         random_yaw: bool = False,
+        cold_start_replay: float = 0.0,
         validation_probe: str | None = None,
         validation_positions: tuple[str, ...] | None = None,
     ):
@@ -348,6 +362,7 @@ class LDFSpanCollator:
         self.context_frames = self.encoder_context_tokens * FRAMES_PER_TOKEN
         self.training = bool(training)
         self.random_yaw = bool(random_yaw and training)
+        self.cold_start_replay = float(cold_start_replay)
         self.validation_probe = validation_probe
         self.validation_positions = validation_positions
 
@@ -365,6 +380,10 @@ class LDFSpanCollator:
             raise ValueError("min_frames must fit one complete generation window")
         if self.encoder_context_tokens < 0:
             raise ValueError("encoder_context_tokens must be non-negative")
+        if not 0.0 <= self.cold_start_replay <= 1.0:
+            raise ValueError("cold_start_replay must lie in [0,1]")
+        if not self.training and self.cold_start_replay:
+            raise ValueError("cold_start_replay is only valid for training")
         if self.validation_positions is not None:
             if self.training:
                 raise ValueError("validation_positions are only valid for validation")
@@ -381,12 +400,13 @@ class LDFSpanCollator:
         *,
         available_tokens: int,
         span_tokens: int,
+        force_sequence_start: bool = False,
         rng=random,
     ) -> int:
         maximum = available_tokens - span_tokens
         if maximum <= 0:
             return 0
-        if self.validation_probe == "teacher_cold":
+        if force_sequence_start or self.validation_probe == "teacher_cold":
             return 0
         if self.training:
             return rng.randint(0, maximum)
@@ -491,6 +511,7 @@ class LDFSpanCollator:
         self,
         sample: dict[str, object],
         *,
+        force_sequence_start: bool = False,
         rng=random,
         torch_generator: torch.Generator | None = None,
     ) -> dict[str, object]:
@@ -508,6 +529,7 @@ class LDFSpanCollator:
         start_token = self._select_start_token(
             available_tokens=available_tokens,
             span_tokens=span_tokens,
+            force_sequence_start=force_sequence_start,
             rng=rng,
         )
         start = start_token * FRAMES_PER_TOKEN
@@ -572,6 +594,24 @@ class LDFSpanCollator:
         else:
             rng = random
             torch_generator = None
+        shared_batch_seeds = [sample.get("_ldf_batch_seed") for sample in samples]
+        if any(seed is not None for seed in shared_batch_seeds) and not all(
+            seed is not None for seed in shared_batch_seeds
+        ):
+            raise ValueError("training samples must share one batch seed or all omit it")
+        if all(seed is not None for seed in shared_batch_seeds):
+            if len({int(seed) for seed in shared_batch_seeds}) != 1:
+                raise ValueError("all samples in one training batch must share a batch seed")
+            replay_rng = random.Random(
+                _mix_seed([int(shared_batch_seeds[0]), 0xC01D57A7])
+            )
+        else:
+            replay_rng = rng
+        cold_start_replay = bool(
+            self.training
+            and self.cold_start_replay > 0.0
+            and replay_rng.random() < self.cold_start_replay
+        )
         spans = []
         for sample in samples:
             validation_position = None
@@ -582,6 +622,7 @@ class LDFSpanCollator:
                 ]
             span = self._crop_sample(
                 sample,
+                force_sequence_start=cold_start_replay,
                 rng=rng,
                 torch_generator=torch_generator,
             )
@@ -652,6 +693,7 @@ class LDFSpanCollator:
                 + [""] * (span_tokens - int(item["span_token_count"]))
                 for item in spans
             ],
+            "cold_start_replay": cold_start_replay,
         }
         if self.validation_probe is not None:
             output["validation_probe"] = self.validation_probe
@@ -717,23 +759,23 @@ def create_dataloaders(
     train_dataset = create_dataset(cfg, "train") if cfg.train else None
     val_dataset = create_dataset(cfg, "val")
     self_forcing = cfg.get("self_forcing")
-    maximum_rollout = 1
-    if self_forcing is not None and bool(self_forcing.get("enabled", False)):
-        schedule = validate_self_forcing_config(
-            self_forcing,
-            generation_tokens=generation_tokens,
-            max_window_tokens=max_tokens,
-            max_steps=int(cfg.trainer.max_steps),
+    if self_forcing is None:
+        raise ValueError("self_forcing curriculum configuration is required")
+    schedule = validate_self_forcing_config(
+        self_forcing,
+        generation_tokens=generation_tokens,
+        max_window_tokens=max_tokens,
+        max_steps=int(cfg.trainer.max_steps),
+    )
+    cold_start_replay = float(self_forcing.get("cold_start_replay", 0.0))
+    maximum_rollout = max(rollout_steps for _, rollout_steps in schedule)
+    if train_dataset is not None:
+        train_dataset = MinimumFrameDataset(
+            train_dataset,
+            # The unified curriculum reserves enough real tokens for its
+            # largest K even while the current phase is the K=1 baseline.
+            min_frames=(generation_tokens + maximum_rollout) * FRAMES_PER_TOKEN,
         )
-        maximum_rollout = max(rollout_steps for _, rollout_steps in schedule)
-        if train_dataset is not None:
-            train_dataset = MinimumFrameDataset(
-                train_dataset,
-                # Persistent rollout requires one real history token in
-                # addition to C active tokens and K-1 future commits.
-                min_frames=(generation_tokens + maximum_rollout)
-                * FRAMES_PER_TOKEN,
-            )
     common = {
         "num_workers": int(cfg.data.num_workers),
         "pin_memory": bool(cfg.data.get("pin_memory", True)),
@@ -757,6 +799,7 @@ def create_dataloaders(
                 encoder_context_tokens=encoder_context_tokens,
                 training=True,
                 random_yaw=cfg.data.random_yaw,
+                cold_start_replay=cold_start_replay,
             ),
             **common,
         )
@@ -799,14 +842,13 @@ def create_dataloaders(
             positions=("early", "middle", "late"),
         ),
     ]
-    if self_forcing is not None and bool(self_forcing.get("enabled", False)):
-        val_loaders.append(
-            validation_loader(
-                "self_forcing",
-                dataset=continuation_dataset,
-                positions=("early", "middle", "late"),
-            )
+    val_loaders.append(
+        validation_loader(
+            "self_forcing",
+            dataset=continuation_dataset,
+            positions=("early", "middle", "late"),
         )
+    )
     return train_loader, val_loaders
 
 

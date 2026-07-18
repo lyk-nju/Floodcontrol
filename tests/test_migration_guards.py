@@ -10,14 +10,13 @@ from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import make_vae
 from train_ldf import _validate_training_config, main as train_main
 from utils.initialize import instantiate_target, load_config
-from utils.training.ldf.self_forcing import (
-    resolve_self_forcing_k,
-    self_forcing_phase_progress,
-)
+from utils.training.ldf.self_forcing import resolve_self_forcing_k
 from web_demo.runtime.model_loader import WEB_RUNTIME_BLOCKER, load_model_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REMOTE_LDF_CONFIG = ROOT / "configs" / "ldf.yaml"
+LOCAL_LDF_CONFIG = ROOT / "configs" / "ldf_s5.yaml"
 
 
 def test_low_level_ldf_import_does_not_load_runtime_or_lightning():
@@ -41,7 +40,7 @@ for forbidden in (
 
 
 def test_formal_ldf_config_uses_the_vae_as_contract_source():
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg = load_config(str(REMOTE_LDF_CONFIG))
     assert "status" not in cfg.config
     assert cfg.wandb_info.project == "Floodcontrol"
     assert cfg.model.target == "models.diffusion_forcing_wan.LDF"
@@ -50,15 +49,15 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert "fps" not in cfg.vae.params
     assert "encoder_context_tokens" not in cfg.data
     assert cfg.data.min_frames == 20
-    assert cfg.data.max_frames == 200
+    assert cfg.data.max_frames == 160
     assert "cold_start_probability" not in cfg.data
     assert "length_bucket_frames" not in cfg.data
     assert cfg.training.text_dropout == pytest.approx(0.1)
     assert cfg.training.constraint_dropout == pytest.approx(0.1)
-    assert cfg.training.window.max_tokens == 50
+    assert cfg.training.window.max_tokens == 40
     assert cfg.training.window.generation_tokens == 5
     assert cfg.training.window.sampling == "random_generation_start"
-    assert cfg.training.max_horizon_token == 45
+    assert cfg.training.max_horizon_token == 35
     assert cfg.training.constraint_sampling.dense_probability == pytest.approx(0.5)
     assert cfg.training.constraint_sampling.waypoint_probability == pytest.approx(0.25)
     assert cfg.training.constraint_sampling.goal_probability == pytest.approx(0.25)
@@ -75,7 +74,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.validation.generation.modes
     assert set(cfg.validation.generation.modes) <= {"stream", "rolling"}
     assert cfg.validation.generation.max_horizon_token == 10
-    assert cfg.validation.generation.rolling.window_tokens == 50
+    assert cfg.validation.generation.rolling.window_tokens == 40
     assert cfg.validation.dense_xz.enabled is True
     assert cfg.validation.dense_xz.probe == "dense_xz"
     assert cfg.data.test_probe_meta_paths.dense_xz[0].endswith(
@@ -83,11 +82,24 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     )
     assert cfg.validation.t2m.enabled is True
     assert "max_samples" not in cfg.validation.t2m
-    assert cfg.self_forcing.enabled is True
-    assert cfg.self_forcing.phase_start_step == 100000
-    assert cfg.self_forcing.phase_steps == 200000
-    assert list(cfg.self_forcing.k_schedule) == [[0.0, 2], [0.5, 5]]
-    assert dict(cfg.self_forcing.teacher_replay) == {2: 0.0, 5: 0.0}
+    assert "enabled" not in cfg.self_forcing
+    assert "phase_start_step" not in cfg.self_forcing
+    assert "phase_steps" not in cfg.self_forcing
+    assert cfg.self_forcing.cold_start_replay == pytest.approx(0.1)
+    assert list(cfg.self_forcing.k_schedule) == [
+        [0, 1],
+        [200000, 2],
+        [290000, 3],
+        [350000, 5],
+    ]
+    assert dict(cfg.self_forcing.teacher_replay) == {2: 0.1, 3: 0.1, 5: 0.1}
+    assert cfg.trainer.max_steps == 500000
+    assert cfg.trainer.devices == 8
+    assert cfg.data.train_batch_size == 32
+    assert cfg.data.num_workers == 4
+    assert cfg.dirs.raw_data.startswith("/data/home/shengqiuProf_user_yuankai/")
+    assert str(cfg.resume_ckpt).endswith("step_200000.ckpt")
+    assert cfg.test_ckpt == cfg.resume_ckpt
     assert cfg.loss.rollout_weight == pytest.approx(1.0)
     assert cfg.loss.offpath_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_boundary_weight == pytest.approx(0.0)
@@ -109,7 +121,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
 
 def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     cfg = load_config(str(ROOT / "configs" / "ldf_multi.yaml"))
-    human_cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    human_cfg = load_config(str(LOCAL_LDF_CONFIG))
     _validate_training_config(cfg)
     assert "status" not in cfg.config
     assert cfg.wandb_info.project == "Floodcontrol"
@@ -133,27 +145,23 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     assert "continuation_span_frames" not in cfg.validation
     assert cfg.training.constraint_dropout == pytest.approx(0.1)
     assert cfg.training.window == human_cfg.training.window
-    assert cfg.training.max_horizon_token == 45
+    assert cfg.training.max_horizon_token == human_cfg.training.max_horizon_token
     assert cfg.training.constraint_sampling == human_cfg.training.constraint_sampling
     assert cfg.lr_scheduler == human_cfg.lr_scheduler
 
 
-def test_formal_self_forcing_recipe_has_exact_100k_k_boundaries():
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+def test_remote_self_forcing_recipe_uses_resume_stable_absolute_boundaries():
+    cfg = load_config(str(REMOTE_LDF_CONFIG))
+    schedule = cfg.self_forcing.k_schedule
 
-    def rollout_steps(global_step: int) -> int:
-        if global_step < cfg.self_forcing.phase_start_step:
-            return 1
-        progress = self_forcing_phase_progress(
-            global_step,
-            phase_start_step=cfg.self_forcing.phase_start_step,
-            phase_steps=cfg.self_forcing.phase_steps,
-        )
-        return resolve_self_forcing_k(progress, cfg.self_forcing.k_schedule)
-
-    assert rollout_steps(0) == rollout_steps(99_999) == 1
-    assert rollout_steps(100_000) == rollout_steps(199_999) == 2
-    assert rollout_steps(200_000) == rollout_steps(299_999) == 5
+    assert resolve_self_forcing_k(0, schedule) == 1
+    assert resolve_self_forcing_k(199_999, schedule) == 1
+    assert resolve_self_forcing_k(200_000, schedule) == 2
+    assert resolve_self_forcing_k(289_999, schedule) == 2
+    assert resolve_self_forcing_k(290_000, schedule) == 3
+    assert resolve_self_forcing_k(349_999, schedule) == 3
+    assert resolve_self_forcing_k(350_000, schedule) == 5
+    assert resolve_self_forcing_k(499_999, schedule) == 5
 
 
 def test_tiny_vae_config_instantiates_public_body_vae():
@@ -278,12 +286,12 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     assert "create_dataloaders" in source
     assert 'trainer_config["use_distributed_sampler"] = False' in source
     assert "BLOCKED_ON_LDF_TRAINING" not in source
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
     _validate_training_config(cfg)
     assert cfg.training.constraint_dropout == pytest.approx(0.1)
-    assert cfg.training.window.max_tokens == 50
+    assert cfg.training.window.max_tokens == 40
     assert cfg.training.window.generation_tokens == 5
-    assert cfg.training.max_horizon_token == 45
+    assert cfg.training.max_horizon_token == 35
 
     # Scheduled dense-XZ/video/T2M evaluation is sharded by the training
     # callback and therefore remains legal for a multi-device DDP run.
@@ -293,36 +301,34 @@ def test_training_entry_uses_the_public_ldf_training_stack():
 
 
 def test_training_entry_rejects_missing_xz_lookahead():
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.max_horizon_token = 0
     with pytest.raises(RuntimeError, match="LDF_XZ_CONSTRAINT_REQUIRED"):
         _validate_training_config(cfg)
 
 
 def test_training_entry_rejects_invalid_constraint_dropout():
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_dropout = 1.1
     with pytest.raises(ValueError, match="constraint_dropout"):
         _validate_training_config(cfg)
 
 
 def test_training_entry_rejects_invalid_constraint_sampling():
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_sampling.goal_probability = 0.5
     with pytest.raises(ValueError, match="must sum to one"):
         _validate_training_config(cfg)
 
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_sampling.max_waypoint_count = 0
     with pytest.raises(ValueError, match="max_waypoint_count"):
         _validate_training_config(cfg)
 
 
 def test_training_entry_rejects_self_forcing_that_exceeds_window_budget():
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
-    cfg.config.self_forcing.enabled = True
-    cfg.config.self_forcing.phase_start_step = 0
-    cfg.config.self_forcing.k_schedule = [[0.0, 47]]
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
+    cfg.config.self_forcing.k_schedule = [[0, 1], [1, 47]]
     cfg.config.self_forcing.teacher_replay = {47: 0.1}
     with pytest.raises(ValueError, match="self-forcing rollout"):
         _validate_training_config(cfg)
@@ -331,13 +337,14 @@ def test_training_entry_rejects_self_forcing_that_exceeds_window_budget():
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("phase_start_step", -1, "phase_start_step"),
-        ("phase_steps", 0, "phase_steps"),
-        ("k_schedule", [[0.0, 2], [0.0, 3]], "strictly increasing"),
-        ("k_schedule", [[0.0, 2], [1.2, 3]], "thresholds"),
-        ("k_schedule", [[0.0, 2], [0.4, 1]], "at least 2"),
-        ("teacher_replay", {2: 0.2, 3: 2.0, 5: 0.1}, "probabilities"),
-        ("teacher_replay", {2: 0.2, 4: 0.1, 5: 0.1}, "exactly match"),
+        ("phase_start_step", 0, "has been removed"),
+        ("phase_steps", 1, "has been removed"),
+        ("k_schedule", [[0, 1], [0, 2]], "strictly increasing"),
+        ("k_schedule", [[0, 1], [1.2, 2]], "must be an integer"),
+        ("k_schedule", [[0, 1], [2, 0]], "at least 1"),
+        ("teacher_replay", {2: 2.0, 5: 0.1}, "probabilities"),
+        ("teacher_replay", {2: 0.2, 4: 0.1}, "exactly match"),
+        ("cold_start_replay", 1.1, "cold_start_replay"),
     ],
 )
 def test_training_entry_rejects_invalid_self_forcing_contract(
@@ -345,17 +352,31 @@ def test_training_entry_rejects_invalid_self_forcing_contract(
     value,
     message,
 ):
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.self_forcing[field] = value
     with pytest.raises(ValueError, match=message):
         _validate_training_config(cfg)
 
 
-def test_training_entry_rejects_enabled_phase_outside_training_run():
-    cfg = load_config(str(ROOT / "configs" / "ldf.yaml"))
-    cfg.config.self_forcing.enabled = True
-    cfg.config.self_forcing.phase_start_step = cfg.trainer.max_steps
-    with pytest.raises(ValueError, match="phase_start_step < trainer.max_steps"):
+def test_training_entry_rejects_schedule_stage_outside_training_run():
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
+    cfg.config.self_forcing.k_schedule.append([cfg.trainer.max_steps, 6])
+    cfg.config.self_forcing.teacher_replay[6] = 0.0
+    with pytest.raises(ValueError, match="start steps must be smaller"):
+        _validate_training_config(cfg)
+
+
+def test_training_entry_rejects_removed_self_forcing_enabled_switch():
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
+    cfg.config.self_forcing.enabled = False
+    with pytest.raises(ValueError, match="enabled has been removed"):
+        _validate_training_config(cfg)
+
+
+def test_training_entry_requires_unified_self_forcing_curriculum():
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
+    del cfg.config.self_forcing
+    with pytest.raises(ValueError, match="curriculum configuration is required"):
         _validate_training_config(cfg)
 
 

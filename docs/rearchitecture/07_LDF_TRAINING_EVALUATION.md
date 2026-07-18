@@ -50,7 +50,7 @@ validation:
     num_denoise_steps: 10
     max_horizon_token: 10
     rolling:
-      window_tokens: 50
+      window_tokens: 40
 
   dense_xz:
     enabled: true

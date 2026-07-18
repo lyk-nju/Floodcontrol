@@ -109,8 +109,20 @@ def test_denoise_step_matches_euler_update_and_preserves_ideal_bridge():
         use_cfg=False,
     )
     expected = mix_fixed_noise(clean, noise, next_beta)
-    assert torch.allclose(advanced.root_motion, expected.root_motion)
-    assert torch.allclose(advanced.latent_motion, expected.latent_motion)
+    # Euler update and direct bridge mixing use different floating-point
+    # operation orders; compare at an explicit FP32 numerical tolerance.
+    assert torch.allclose(
+        advanced.root_motion,
+        expected.root_motion,
+        atol=1e-6,
+        rtol=1e-5,
+    )
+    assert torch.allclose(
+        advanced.latent_motion,
+        expected.latent_motion,
+        atol=1e-6,
+        rtol=1e-5,
+    )
     assert prediction.velocity is target
 
 

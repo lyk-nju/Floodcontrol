@@ -3949,3 +3949,229 @@
 
 - 本轮未修改生产converter、artifact、VAE或LDF权重；审计证明不能用整体transpose/inverse做补丁。
 - 下一版数据合同需在“从原生SMPL rotations重建ARDY式标准global rotations”和“HumanML263来源去掉/重命名root rotation gauge”之间明确选择，并加入rotation-to-position FK一致性测试。
+
+## 2026-07-18 · LDF显式cold-start replay
+
+改动类型：训练采样合同 / self-forcing curriculum / DDP一致性
+
+实际改动内容：
+
+- 为正式LDF配置增加`self_forcing.cold_start_replay: 0.1`。每个global batch以10%概率切换到真实序列起点的`H=0,K=1` ideal训练，直接监督最初5个motion token；其余batch继续遵循现有K=1/K=2/K=5 curriculum。
+- training collator在cold replay时强制parent window从absolute token 0开始，因此同时满足`source_start_token=0`、`context_token_count=0`和`previous_root_valid_mask=false`，不再把mid-clip reset误称为cold start。
+- 普通curriculum batch显式禁止偶然采到`H=0`；K>1 persistent rollout继续只覆盖至少一个真实history token的稳态事务。cold replay会绕过K采样并固定走现有K=1 ideal bridge，不把K=5最后一步梯度错误地当作首token监督。
+- `LengthBucketBatchSampler`为每个global batch生成不含rank和sample identity的共享seed；各DDP rank据此作相同的cold replay决策。sample级crop、caption和yaw仍使用rank-local augmentation seed。
+- self-forcing启动校验新增cold replay概率的finite与`[0,1]`检查；数据、window-plan、Lightning控制流与配置测试同步更新。
+
+改动理由：
+
+- persistent rollout的稳态commit只执行`noise_steps/chunk_size`次更新，而真实cold-start首个commit需要从全噪声状态执行完整`noise_steps`次更新。直接允许cold K>1会混合两种求解事务，并且当前只在最终denoise step保留梯度，不能直接改善最初几帧。
+- 将cold start变成独立、可配置且可测量的batch objective，可在从200k checkpoint继续self-forcing时保留明确的启动监督，而不改变persistent solver-state rollout本身。
+- K决定不同的计算图和日志collective；cold replay若由各rank独立随机采样会造成DDP控制流分叉，因此必须使用global-batch共享决策。
+
+验证：
+
+- `python -m pytest tests/test_ldf_data.py tests/test_ldf_self_forcing.py tests/test_ldf_training.py -q`：55项通过。
+- `python -m pytest tests/test_migration_guards.py -q -k 'invalid_self_forcing_contract'`：8项通过。
+- 全仓`python -m pytest tests -q`：259项通过，3项失败；失败均为本轮前已存在的冻结配置期望不一致（测试期望HumanML `max_frames=200/window=50`及Multi同窗，当前配置为HumanML `160/40`、Multi `200/50`），与cold replay路径无关。
+- 相关文件`py_compile`和`git diff --check`通过。
+
+涉及文件：
+
+- `configs/ldf.yaml`
+- `configs/ldf_multi.yaml`
+- `utils/training/ldf/data.py`
+- `utils/training/ldf/self_forcing.py`
+- `utils/training/ldf/lightning_module.py`
+- `tests/test_ldf_data.py`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 训练日志应单独观察cold-start probe与首token/前20帧质量，确认10% replay能改善启动质量且不会明显牺牲稳态rollout。
+- 本轮有意不实现cold K>1；若未来需要从cold start连续rollout多个commit，应先为首commit加入完整warm-up scheduler，并重新设计首token梯度覆盖。
+
+## 2026-07-18 · LDF 40-token训练合同与cold-start监督边界澄清
+
+改动类型：配置合同统一 / 设计文档校正 / 冻结测试修复
+
+实际改动内容：
+
+- 将正式LDF parent窗口统一冻结为`40 tokens = 160 frames = 8 seconds`：HumanML+BABEL配置从旧`50/200`同步为`40/160`，future XZ训练上限同步从45改为35 tokens，与HumanML配置一致。
+- README、数据管线、训练方法、训练配置和训练期评估文档全部改用40/160合同；正式validation rolling buffer同步记录为40 tokens。独立`configs/stream.yaml`仍是专用runtime实验配置，不反向定义训练parent。
+- 修正冻结测试对旧50/200、45-token horizon、rolling 50和训练期T2M开启状态的陈旧期望；当前正式配置明确关闭训练期T2M。
+- 将现有`cold_start_replay`准确记录为`H=0,K=1`的cold-start ideal replay：它当前只覆盖首次runtime commit的`diffusion_time∈[0.8,1.0)`末段，并一次暴露全部5个active token，尚不是完整cold solver rollout。
+- 文档冻结下一步优先级：先用一次ideal forward采样首次commit的全部10个离散denoise阶段，并复用runtime动态1–5 token visibility，让不同beta噪声等级获得直接梯度；完整10步off-path solver replay作为后续消融，不作为当前训练前置条件。
+
+改动理由：
+
+- 40/160已经是HumanML正式配置的实际窗口；继续让Multi、文档和测试保留50/200会产生两套训练分布，并使配置验证失去意义。
+- cold-start前几帧质量首先取决于模型是否见过全噪声到低噪声的完整启动beta分布及逐步扩大的可见范围。为此不必立即运行前9步no-grad；先做离散phase的ideal监督成本更低、梯度覆盖更直接，也更适合单独判断beta/visibility分布是否为主要原因。
+
+验证：
+
+- `python -m pytest tests/test_migration_guards.py -q`：38项通过。
+- `python -m pytest tests -q`：262项全部通过。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `configs/ldf_multi.yaml`
+- `README.md`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `tests/test_migration_guards.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 若当前`root_stats.npz`由旧50-token窗口生成，应在新正式训练前使用当前40-token配置重新计算。
+- 本轮只冻结cold-start训练方向，没有实现全10阶段beta采样和动态visibility；该实现需要继续复用runtime的`triangular_beta()`与step-input visibility规则，避免训练/runtime再次出现两套调度语义。
+
+## 2026-07-18 · Cold-start完整beta与动态可见性训练
+
+改动类型：cold-start ideal训练 / runtime parity / 配置保护
+
+实际改动内容：
+
+- 新增独立的`build_cold_start_training_step()`。显式cold batch不再复用稳态K=1的`phase_offset∈[0,1/chunk_size)`，而是为每个sample均匀采样`denoise_step∈{0,...,noise_steps-1}`。
+- Cold builder直接调用模型的`triangular_beta()`计算当前与下一denoise阶段的beta，并复用模型runtime `_create_step_input()`生成visibility。因此正式`noise_steps=10,chunk_size=5`时，motion可见token数严格按`1,1,2,2,3,3,4,4,5,5`变化。
+- Noisy root与latent仍只构造一次理想bridge状态`x_beta=(1-beta)x0+beta*epsilon`，target继续使用`x0-epsilon`；loss mask只监督当前runtime实际可见的motion token。每个cold batch保持一次forward，不运行额外9次no-grad solver。
+- `run_self_forcing_rollout()`新增显式cold ideal分支。该分支只接受true-start、H=0、K=1计划；普通K=1 continuous phase和K>1 persistent off-path rollout均保持原有分布与实现。
+- Cold分支选择继续由跨DDP rank共享batch seed决定；具体denoise step作为sample增强使用rank-local generator，不改变计算图或collective顺序。
+- 配置校验和DataLoader共同禁止`self_forcing.enabled=false`配非零`cold_start_replay`，避免collator在关闭self-forcing后仍静默启用cold objective。
+- 更新正式配置注释和训练文档，明确当前实现是覆盖完整runtime beta/visibility的cold-start ideal训练，不宣称已经实现off-path cold solver rollout。
+- 将Euler parity测试改为显式FP32容差，避免“Euler update”和“直接bridge混合”因浮点运算顺序不同产生随机假失败；模型公式和实现未改变。
+
+改动理由：
+
+- 旧cold路径只对应首次commit的`diffusion_time∈[0.8,1.0)`，并始终暴露全部5个active token，无法直接训练全噪声和早期1–4 token可见状态。
+- 对全部runtime denoise阶段进行单forward ideal监督，可以让每个启动噪声等级获得直接梯度，同时保持训练成本和现有flow target不变。完整solver replay主要用于进一步覆盖off-path积分误差，应在观察本修复效果后单独消融。
+
+验证：
+
+- 10个参数化cold阶段逐项比较训练/runtime的beta、generation mask、noisy root/latent、timeline/rope position和loss mask，全部通过。
+- `python -m pytest tests/test_ldf_data.py tests/test_ldf_self_forcing.py tests/test_ldf_training.py tests/test_migration_guards.py -q`：104项通过。
+- `python -m pytest tests -q`：273项全部通过。
+- 相关模块`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/batch.py`
+- `utils/training/ldf/data.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/self_forcing.py`
+- `configs/ldf.yaml`
+- `configs/ldf_multi.yaml`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_stream.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 训练时分别跟踪cold-start各denoise阶段的loss和首20帧生成质量；若完整beta/visibility覆盖后仍有明显启动锯齿，再增加从pure noise执行完整首次commit的off-path solver replay消融。
+
+## 2026-07-18 · LDF统一K课程与全程cold-start replay
+
+改动类型：训练配置收敛 / 课程控制流统一 / 回归测试
+
+实际改动内容：
+
+- 删除正式LDF配置中的`self_forcing.enabled`开关，将`self_forcing`固定为K=1 baseline与K>1 persistent rollout的唯一课程入口；缺少该配置块或继续提供旧`enabled`字段都会在训练启动前明确失败。
+- 保持`phase_start_step`之前自然使用K=1，到达边界后再根据`k_schedule`与`teacher_replay`选择K；两种阶段继续进入同一个`run_self_forcing_rollout()`训练内核，没有新增第二套普通训练路径。
+- 将`cold_start_replay`从可选enable分支中解耦。DataLoader在全部训练step都按配置概率采样cold batch，Lightning在选择当前课程K之前优先处理cold batch，因此`0.1`同时覆盖phase前K=1阶段和phase后K>1阶段。
+- DataLoader始终按统一课程的最大K过滤训练样本并始终构造self-forcing validation probe；启动校验始终检查noise-step/chunk整除、最大K窗口预算及phase边界。
+- 更新HumanML与Multi配置、训练方法及配置文档，明确当前300k语义为`0–100k: K=1`、`100k–200k: K=2`、`200k–300k: K=5`，且每一段均有10% global batch进入`H=0,K=1` cold ideal训练。
+- 新增回归覆盖：分别在phase前和phase后验证cold replay绕过K课程；验证缺失统一课程配置和遗留`enabled`开关都会fail-fast。
+
+改动理由：
+
+- 普通teacher训练在执行语义上就是K=1 rollout，不应再由`enabled`开关制造一条看似独立的训练入口。
+- Cold-start监督解决的是无历史启动分布，不应依附于K>1阶段。将它放在K选择之前，可以保证10%概率对完整训练过程生效，并避免恢复训练或修改phase时静默丢失cold样本。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_ldf_training.py tests/test_ldf_data.py tests/test_migration_guards.py -q`：79项通过。
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：275项全部通过。
+- 相关Python入口、训练模块和测试执行`py_compile`通过。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `train_ldf.py`
+- `utils/training/ldf/self_forcing.py`
+- `utils/training/ldf/data.py`
+- `utils/training/ldf/lightning_module.py`
+- `configs/ldf.yaml`
+- `configs/ldf_multi.yaml`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_data.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 新训练与resume均应使用已删除`self_forcing.enabled`字段的当前配置；checkpoint权重本身不受本次纯控制流/配置合同调整影响。
+- 继续单独记录cold-start probe与普通K阶段指标，确认固定10%全程replay对首帧质量和稳态rollout之间的实际权衡。
+
+## 2026-07-18 · 远端/本机LDF配置拆分与绝对step课程
+
+改动类型：训练配置拆分 / self-forcing课程协议 / resume稳定性
+
+实际改动内容：
+
+- 将`configs/ldf.yaml`固定为远端服务器HumanML训练配置：显式写入远端deps/raw-data路径、8卡、单卡batch 32、500k终止步数、200k LDF resume/test checkpoint、远端VAE checkpoint/statistics路径，并启用训练期T2M。
+- 新增`configs/ldf_s5.yaml`保存本机S5 HumanML配置：显式使用`/data1/yuankai/...`路径、单卡、batch 8、300k终止步数、本机164325 VAE和默认关闭训练期T2M。原有未跟踪的同名Multi副本已按用户指定职责替换。
+- 将self-forcing schedule从`phase_start_step + phase_steps + normalized threshold`改成统一的`[absolute_global_step,K]`。首行强制为`[0,1]`，普通训练不再是课程外的特殊分支；遗留phase字段会明确fail-fast。
+- 远端配置将旧`phase_start=200k, phase_steps=300k, thresholds=0/0.3/0.5`等价展开为`[0,1]、[200000,2]、[290000,3]、[350000,5]`。因此从200k checkpoint恢复时立即处于K=2，后续修改`trainer.max_steps`不会让课程倒退。
+- 远端保留K=2/3/5各10%的teacher replay，并增加全程独立的`cold_start_replay=0.1`；cold先于K选择执行。两者语义不同：前者将普通continuation rollout退回K=1，后者强制真实序列起点的`H=0,K=1`训练。
+- 本机S5和Multi配置使用绝对边界`[0,1]、[100000,2]、[200000,5]`，teacher replay保持0；Multi配置同步迁移是因为训练入口已不再接受旧phase协议。
+- 更新课程解析、Lightning调用、lazy exports和测试；删除不再使用的`self_forcing_phase_progress()`。配置校验现在检查absolute step/K严格递增、stage位于max steps内、K>1 replay键完全匹配和最大K窗口预算。
+- README和训练/数据文档明确远端`ldf.yaml`与本机`ldf_s5.yaml`入口，以及本机统计/T5工具应显式使用S5配置。
+
+改动理由：
+
+- 远端从200k checkpoint继续到500k时，若以`global_step/max_steps`重新计算归一化phase，改变max steps会改变当前K；绝对step schedule可以保持恢复前后的课程身份。
+- 服务器路径、GPU数量、checkpoint和本机实验配置不应继续挤在同一个YAML中通过临时覆盖切换，独立配置更容易审查和复现实验。
+
+验证：
+
+- 远端配置解析确认：`max_steps=500000`、`devices=8`、batch 32、workers 4，K在200k/290k/350k准确切换为2/3/5；本机配置解析为单卡batch 8及100k/200k边界。
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_ldf_self_forcing.py tests/test_ldf_training.py tests/test_ldf_data.py tests/test_migration_guards.py -q`：104项通过。
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：273项全部通过。
+- 相关模块和测试`py_compile`通过；`git diff --check`通过。
+- 未在本机执行远端checkpoint/数据文件存在性校验，因为`/data/home/shengqiuProf_user_yuankai/...`只存在于目标服务器；本机完整训练入口校验继续通过`ldf_s5.yaml`覆盖。
+
+涉及文件：
+
+- `configs/ldf.yaml`
+- `configs/ldf_s5.yaml`
+- `configs/ldf_multi.yaml`
+- `utils/training/ldf/self_forcing.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/__init__.py`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_data.py`
+- `tests/test_migration_guards.py`
+- `README.md`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 将代码同步到远端后，先在目标服务器运行一次配置启动校验，确认200k checkpoint、VAE、root/motion/latent statistics、T5表与T2M evaluator资产全部存在，再启动8卡resume。
+- 如果远端未来需要改变K切换点，应直接修改`k_schedule`中的absolute step，不再重新引入phase/progress字段。

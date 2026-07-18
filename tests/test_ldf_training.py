@@ -106,10 +106,7 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
             },
             "loss": {"root_weight": 1.0, "body_weight": 1.0},
             "self_forcing": {
-                "enabled": False,
-                "phase_start_step": 10,
-                "phase_steps": 20,
-                "k_schedule": [[0.0, 2], [0.4, 3], [0.7, 5]],
+                "k_schedule": [[0, 1], [5, 2], [7, 3], [9, 5]],
                 "teacher_replay": {2: 0.2, 3: 0.1, 5: 0.1},
             },
             "vae": {
@@ -169,47 +166,75 @@ def _make_step_batch():
     }
 
 
-def test_step_keeps_teacher_forcing_before_phase_start(tmp_path, monkeypatch):
+def test_step_resolves_k1_through_the_unified_curriculum(tmp_path, monkeypatch):
     cfg = _make_config(tmp_path)
-    cfg.self_forcing.enabled = True
-    module = LDFLightningModule(cfg).train()
-
-    def fail_if_sampled(*_args, **_kwargs):
-        pytest.fail("self-forcing sampling must not run before phase_start_step")
-
-    monkeypatch.setattr(
-        "utils.training.ldf.lightning_module.sample_rollout_steps",
-        fail_if_sampled,
-    )
-    losses = module._step(
-        _make_step_batch(),
-        is_training=True,
-        initial_history_tokens=0,
-    )
-    assert torch.isfinite(losses["total"])
-
-
-def test_step_starts_self_forcing_at_phase_boundary(tmp_path, monkeypatch):
-    cfg = _make_config(tmp_path)
-    cfg.self_forcing.enabled = True
-    cfg.self_forcing.phase_start_step = 0
     module = LDFLightningModule(cfg).train()
     calls = []
 
-    def record_sampling(progress, **_kwargs):
-        calls.append(progress)
+    def record_sampling(global_step, **_kwargs):
+        calls.append(global_step)
         return 1
 
     monkeypatch.setattr(
         "utils.training.ldf.lightning_module.sample_rollout_steps",
         record_sampling,
     )
-    module._step(
+    losses = module._step(
         _make_step_batch(),
         is_training=True,
         initial_history_tokens=0,
     )
-    assert calls == [0.0]
+    assert calls == [0]
+    assert torch.isfinite(losses["total"])
+
+
+def test_cold_start_replay_bypasses_the_unified_k_curriculum(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _make_config(tmp_path)
+    cfg.self_forcing.cold_start_replay = 0.1
+    module = LDFLightningModule(cfg).train()
+    batch = _make_step_batch()
+    batch["cold_start_replay"] = True
+
+    def fail_if_sampled(*_args, **_kwargs):
+        pytest.fail("cold-start replay must bypass the K curriculum")
+
+    monkeypatch.setattr(
+        "utils.training.ldf.lightning_module.sample_rollout_steps",
+        fail_if_sampled,
+    )
+    from utils.training.ldf import lightning_module as ldf_lightning
+
+    original = ldf_lightning.sample_window_plan
+    seen = {}
+
+    def record_plan(*args, **kwargs):
+        seen.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ldf_lightning, "sample_window_plan", record_plan)
+    original_rollout = ldf_lightning.run_self_forcing_rollout
+
+    def record_rollout(*args, **kwargs):
+        seen["cold_denoise_step"] = kwargs.get("cold_denoise_step")
+        return original_rollout(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ldf_lightning,
+        "run_self_forcing_rollout",
+        record_rollout,
+    )
+    losses = module._step(batch, is_training=True)
+
+    assert seen["rollout_steps"] == 1
+    assert seen["initial_history_tokens"] == 0
+    assert seen["allow_cold_start"] is True
+    assert torch.equal(seen["phase_offset"], torch.zeros(1))
+    assert seen["cold_denoise_step"].shape == (1,)
+    assert 0 <= int(seen["cold_denoise_step"][0]) < module.model.noise_steps
+    assert torch.isfinite(losses["total"])
 
 
 def test_curriculum_generator_is_global_step_deterministic_and_rank_independent():

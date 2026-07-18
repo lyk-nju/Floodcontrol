@@ -70,16 +70,16 @@ def _validate_training_config(cfg) -> None:
             "training.max_horizon_token must lie in "
             "[1, window.max_tokens - window.generation_tokens]"
         )
-    self_forcing = cfg.get("self_forcing") or {}
+    self_forcing = cfg.get("self_forcing")
+    if self_forcing is None:
+        raise ValueError("self_forcing curriculum configuration is required")
     validate_self_forcing_config(
         self_forcing,
         generation_tokens=generation_tokens,
         max_window_tokens=max_window_tokens,
         max_steps=int(cfg.trainer.max_steps),
     )
-    if bool(self_forcing.get("enabled", False)) and (
-        int(cfg.model.params.noise_steps) % generation_tokens
-    ):
+    if int(cfg.model.params.noise_steps) % generation_tokens:
         raise ValueError(
             "persistent self-forcing requires model.noise_steps divisible by "
             "training.window.generation_tokens"

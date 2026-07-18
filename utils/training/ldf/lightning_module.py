@@ -31,7 +31,6 @@ from utils.training.ldf.self_forcing import (
     run_self_forcing_rollout,
     sample_rollout_steps,
     sample_window_plan,
-    self_forcing_phase_progress,
 )
 from utils.training.ldf.text import TextEmbeddingLookup
 
@@ -252,36 +251,36 @@ class LDFLightningModule(BasicLightningModule):
             rollout_steps_override
         )
         self_forcing = self.cfg.get("self_forcing")
-        if (
+        cold_start_replay = bool(
+            is_training and batch.get("cold_start_replay", False)
+        )
+        if cold_start_replay:
+            if rollout_steps_override not in (None, 1):
+                raise ValueError("cold-start replay requires K=1")
+            rollout_steps = 1
+            initial_history_tokens = 0
+        elif (
             rollout_steps_override is None
             and is_training
             and self_forcing is not None
-            and bool(self_forcing.get("enabled", False))
         ):
-            phase_start_step = int(self_forcing.phase_start_step)
-            if int(self.global_step) >= phase_start_step:
-                progress = self_forcing_phase_progress(
-                    int(self.global_step),
-                    phase_start_step=phase_start_step,
-                    phase_steps=int(self_forcing.phase_steps),
-                )
-                schedule = [tuple(row) for row in self_forcing.k_schedule]
-                replay = {
-                    int(key): float(value)
-                    for key, value in dict(self_forcing.teacher_replay).items()
-                }
-                rollout_steps = sample_rollout_steps(
-                    progress,
-                    # K selects the objective and therefore the synchronized
-                    # metric/compute path.  It must be one global-batch choice,
-                    # not a rank-local augmentation draw.  Motion noise, H and
-                    # condition sampling continue to use the rank-local RNG.
-                    generator=_create_curriculum_generator(
-                        int(self.cfg.get("seed", 0)), int(self.global_step)
-                    ),
-                    schedule=schedule,
-                    teacher_replay=replay,
-                )
+            schedule = [tuple(row) for row in self_forcing.k_schedule]
+            replay = {
+                int(key): float(value)
+                for key, value in dict(self_forcing.teacher_replay).items()
+            }
+            rollout_steps = sample_rollout_steps(
+                int(self.global_step),
+                # K selects the objective and therefore the synchronized
+                # metric/compute path.  It must be one global-batch choice,
+                # not a rank-local augmentation draw.  Motion noise, H and
+                # condition sampling continue to use the rank-local RNG.
+                generator=_create_curriculum_generator(
+                    int(self.cfg.get("seed", 0)), int(self.global_step)
+                ),
+                schedule=schedule,
+                teacher_replay=replay,
+            )
 
         training_config = self.cfg.get("training") or {}
         window_config = training_config.get("window") or {}
@@ -293,6 +292,24 @@ class LDFLightningModule(BasicLightningModule):
             raise ValueError(
                 "training generation window must equal the model active chunk size"
             )
+        cold_denoise_step = None
+        cold_phase_offset = None
+        if cold_start_replay:
+            root_motion = batch["root_motion"]
+            cold_denoise_step = torch.randint(
+                0,
+                int(self.model.noise_steps),
+                (int(root_motion.shape[0]),),
+                device=root_motion.device,
+                generator=generator,
+            )
+            # The ordinary phase_offset describes only a steady-state commit.
+            # Cold replay owns its runtime denoise phase explicitly instead.
+            cold_phase_offset = torch.zeros(
+                root_motion.shape[0],
+                device=root_motion.device,
+                dtype=root_motion.dtype,
+            )
         validate_contract = bool(self.cfg.get("debug", False))
         plan = sample_window_plan(
             batch,
@@ -301,6 +318,15 @@ class LDFLightningModule(BasicLightningModule):
             latent_dim=self.model.latent_dim,
             generator=generator,
             initial_history_tokens=initial_history_tokens,
+            phase_offset=cold_phase_offset,
+            # Once the explicit replay contract is configured, ordinary
+            # batches must not obtain H=0 accidentally from uniform H sampling.
+            allow_cold_start=(
+                cold_start_replay
+                or initial_history_tokens is not None
+                or self_forcing is None
+                or "cold_start_replay" not in self_forcing
+            ),
         )
         if validate_contract:
             plan.validate()
@@ -362,6 +388,7 @@ class LDFLightningModule(BasicLightningModule):
                 "previous_root_valid_mask"
             ),
             condition_builder=condition_builder,
+            cold_denoise_step=cold_denoise_step,
         )
         if validate_contract:
             result.final_step.inputs.validate()
