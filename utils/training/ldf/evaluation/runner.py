@@ -56,6 +56,67 @@ def _scalar_metrics(summary: dict[str, Any], prefix: str) -> dict[str, float]:
     return output
 
 
+def _format_t2m_summary(
+    summary: dict[str, Any],
+    *,
+    mode: str,
+    step_tag: str,
+) -> str:
+    """Format the complete rank-zero T2M result for the training console."""
+
+    def metric(name: str) -> str | None:
+        value = summary.get(name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        number = float(value)
+        return f"{number:.4f}" if np.isfinite(number) else None
+
+    lines = [
+        f"[t2m][{mode}][{step_tag}] "
+        f"samples={int(summary.get('num_samples', 0))} "
+        f"cfg={summary.get('cfg_mode', 'unknown')}"
+    ]
+
+    fid = metric("FID")
+    if fid is not None:
+        lines.append(f"  FID={fid}")
+
+    matching = metric("Matching_score")
+    gt_matching = metric("gt_Matching_score")
+    if matching is not None or gt_matching is not None:
+        values = []
+        if matching is not None:
+            values.append(f"generated={matching}")
+        if gt_matching is not None:
+            values.append(f"ground_truth={gt_matching}")
+        lines.append(f"  MatchingScore: {', '.join(values)}")
+
+    r_precision = []
+    gt_r_precision = []
+    for top_k in range(1, 4):
+        value = metric(f"R_precision_top_{top_k}")
+        if value is not None:
+            r_precision.append(f"top{top_k}={value}")
+        gt_value = metric(f"gt_R_precision_top_{top_k}")
+        if gt_value is not None:
+            gt_r_precision.append(f"top{top_k}={gt_value}")
+    if r_precision:
+        lines.append(f"  R-Precision: {', '.join(r_precision)}")
+    if gt_r_precision:
+        lines.append(f"  GT R-Precision: {', '.join(gt_r_precision)}")
+
+    diversity = metric("Diversity")
+    gt_diversity = metric("gt_Diversity")
+    if diversity is not None or gt_diversity is not None:
+        values = []
+        if diversity is not None:
+            values.append(f"generated={diversity}")
+        if gt_diversity is not None:
+            values.append(f"ground_truth={gt_diversity}")
+        lines.append(f"  Diversity: {', '.join(values)}")
+    return "\n".join(lines)
+
+
 def _frame_count(sample: dict[str, object], maximum: int) -> int:
     frames = min(int(sample["root_motion"].shape[0]), int(maximum))
     frames -= frames % 4
@@ -552,8 +613,11 @@ class LDFEvaluationRunner:
                     step=step,
                 )
                 rank_zero_info(
-                    f"[t2m][{mode}][{step_tag}] "
-                    f"FID={summary.get('FID', float('nan')):.4f}"
+                    _format_t2m_summary(
+                        summary,
+                        mode=mode,
+                        step_tag=step_tag,
+                    )
                 )
             _distributed_barrier()
 

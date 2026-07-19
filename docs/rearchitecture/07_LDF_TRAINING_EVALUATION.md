@@ -35,6 +35,8 @@ HumanML3D生成结果通过唯一`root5/body265 -> HumanML263`converter进入已
 
 T2M评测不提供轨迹条件；dense XZ评测和T2M评测分别回答“控制是否准确”和“无轨迹提示时动作分布是否合理”，不能把二者混为同一指标。T2M显式使用`cfg_mode: nocfg`，即用训练过的joint文本条件执行单分支forward，不继承模型用于轨迹控制实验的全局`separated`模式。这样既避免无轨迹生成承担三分支开销，也不使用线性分支组合近似真实joint文本响应。dense XZ仍独立继承模型全局CFG配置，以便继续评估constraint guidance。
 
+每次T2M评测完成后，rank 0必须在训练控制台打印本轮样本数、生成模式、CFG模式，以及实际计算出的FID、Matching Score、R-Precision和Diversity；相同数值继续写入评测`summary.json`和Lightning/WandB日志。其他DDP rank不重复打印。
+
 ## 调度与配置
 
 正式配置入口：

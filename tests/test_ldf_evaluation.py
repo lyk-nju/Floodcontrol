@@ -30,6 +30,7 @@ from utils.training.ldf.evaluation.runner import (
     LDFEvaluationRunner,
     _all_gather_objects,
     _distributed_barrier,
+    _format_t2m_summary,
 )
 
 
@@ -134,6 +135,35 @@ def test_generation_evaluation_is_composed_as_an_entrypoint_callback():
         module,
     )
     assert calls == [module, module]
+
+
+def test_t2m_console_summary_reports_all_computed_metrics():
+    output = _format_t2m_summary(
+        {
+            "num_samples": 1450,
+            "cfg_mode": "nocfg",
+            "FID": 1.23456,
+            "Matching_score": 2.34567,
+            "gt_Matching_score": 1.98766,
+            "R_precision_top_1": 0.41,
+            "R_precision_top_2": 0.62,
+            "R_precision_top_3": 0.73,
+            "gt_R_precision_top_1": 0.51,
+            "gt_R_precision_top_2": 0.72,
+            "gt_R_precision_top_3": 0.83,
+            "Diversity": 8.76543,
+            "gt_Diversity": 9.01234,
+        },
+        mode="stream",
+        step_tag="step_010000",
+    )
+
+    assert "[t2m][stream][step_010000] samples=1450 cfg=nocfg" in output
+    assert "FID=1.2346" in output
+    assert "MatchingScore: generated=2.3457, ground_truth=1.9877" in output
+    assert "R-Precision: top1=0.4100, top2=0.6200, top3=0.7300" in output
+    assert "GT R-Precision: top1=0.5100, top2=0.7200, top3=0.8300" in output
+    assert "Diversity: generated=8.7654, ground_truth=9.0123" in output
 
 
 def test_generation_evaluation_shards_samples_without_loading_peer_motion():

@@ -4358,3 +4358,36 @@
 
 - 尚未用40k checkpoint执行固定sample/noise的旧/新runtime对照；下一步应先做无需训练的condition-gap实验，再决定是否从40k checkpoint微调5k–10k。
 - 本轮没有加入heading auxiliary，也没有改变root/body loss、statistics、VAE、checkpoint权重或CFG默认值。
+
+## 2026-07-19 · T2M完整指标控制台摘要
+
+改动类型：训练时评测输出 / DDP日志 / 回归测试
+
+实际改动内容：
+
+- T2M评测完成后由rank 0统一打印包含样本数、生成模式和CFG模式的多行结果摘要。
+- 摘要覆盖评测实际计算出的FID、生成/GT Matching Score、生成/GT Top-1/2/3 R-Precision以及生成/GT Diversity；某项未计算或非有限时不打印伪造数值。
+- 既有`summary.json`和Lightning/WandB标量记录保持不变，非rank-0进程不重复输出。
+- 增加格式化回归测试并在评测设计文档中冻结控制台输出要求。
+
+改动理由：
+
+- 原实现虽然会在控制台打印FID，但其余已经计算的T2M结果只能从JSON或WandB中查找，不便于训练过程中立即判断checkpoint质量。
+- 将展示逻辑与指标计算分离，可在不改变评测数值、随机种子或DDP聚合的情况下提供稳定可读的训练日志。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_ldf_evaluation.py -q`：13项通过。
+- 相关Python文件`py_compile`通过。
+- `git diff --check`在最终复查时通过。
+
+涉及文件：
+
+- `utils/training/ldf/evaluation/runner.py`
+- `tests/test_ldf_evaluation.py`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 本轮只调整已有指标的即时展示，不运行新的T2M评测，也不改变T2M采样数量、评测频率或指标定义。
