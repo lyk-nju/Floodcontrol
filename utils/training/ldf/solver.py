@@ -1,19 +1,35 @@
-"""Persistent solver-state rollout shared with the LDF runtime update rule."""
+"""Ideal, cold-start and persistent solver objectives for LDF training."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 
-from utils.conditions.ldf import HybridMotion, LDFCondition
-from utils.training.ldf.batch import (
+from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
+from utils.training.ldf.steps import (
     ConditionBuilder,
     LDFStepView,
     LDFTrainingStep,
+    build_cold_start_training_step,
     build_ldf_rollout_step,
+    build_ldf_training_step,
 )
 from utils.training.ldf.flow import mix_fixed_noise
+from utils.training.ldf.window import LDFWindowPlan
+
+
+@dataclass(frozen=True)
+class LDFSolverResult:
+    """One differentiable training endpoint and its detached rollout trace."""
+
+    final_step: LDFTrainingStep
+    prediction: LDFPrediction
+    clean_motion: HybridMotion
+    replacements: tuple[HybridMotion, ...]
+    is_rollout: bool = False
+    persistent_state: "PersistentRolloutState | None" = None
 
 
 @dataclass
@@ -95,22 +111,15 @@ def _commit_and_rebase(
 ) -> tuple[PersistentRolloutState, HybridMotion]:
     """Commit one predicted token, then shift the model coordinate origin."""
 
-    batch_index = torch.arange(next_motion.batch_size, device=next_beta.device)
-    root = next_motion.root_motion.clone()
-    committed_root = model._project_normalized_root(root[batch_index, token_index])
-    root[batch_index, token_index] = committed_root
-    next_motion = HybridMotion(root, next_motion.latent_motion)
-    committed = HybridMotion(
-        committed_root[:, None].detach(),
-        next_motion.latent_motion[batch_index, token_index][:, None].detach(),
+    rebased_motion, committed, translation = model.commit_step(
+        next_motion.clone(detach=True),
+        next_beta,
+        token_index,
     )
+    committed = committed.clone(detach=True)
 
     clean = _replace_token(state.clean_motion, token_index, committed)
-    physical = model.denormalize_root(committed.root_motion)
-    translation = physical[:, 0, -1, [0, 2]].detach()
-    rebased_motion = model.rebase_motion_state(
-        next_motion.clone(detach=True), next_beta, translation
-    )
+    translation = translation.detach()
     clean = model.rebase_motion_state(
         clean.clone(detach=True), torch.zeros_like(next_beta), translation
     )
@@ -230,10 +239,12 @@ def run_persistent_rollout(
                 dtype=clean_motion.root_motion.dtype,
             )
             training_step = build_ldf_rollout_step(
+                model=model,
                 noisy_motion=state.noisy_motion,
                 clean_motion=state.clean_motion,
                 noise=plan.noise,
                 beta=state.beta,
+                next_beta=next_beta,
                 source_start_token=plan.source_start_token,
                 span_token_count=plan.span_token_count,
                 history_end=history_end,
@@ -281,4 +292,90 @@ def run_persistent_rollout(
     return final_step, final_prediction, state, tuple(replacements)
 
 
-__all__ = ["PersistentRolloutState", "run_persistent_rollout"]
+def run_training_solver(
+    model: nn.Module,
+    clean_motion: HybridMotion,
+    plan: LDFWindowPlan,
+    *,
+    previous_root_frame: torch.Tensor | None,
+    previous_root_valid_mask: torch.Tensor | None,
+    condition_builder: ConditionBuilder,
+    cold_denoise_step: torch.Tensor | None = None,
+) -> LDFSolverResult:
+    """Run the canonical K=1, cold-start or persistent K>1 objective."""
+
+    plan.validate_structure()
+    clean_motion.validate()
+    if clean_motion.token_length != plan.span_tokens:
+        raise ValueError("clean motion does not match the rollout span")
+    if clean_motion.batch_size != plan.root_noise.shape[0]:
+        raise ValueError("clean motion does not match the rollout batch")
+
+    if cold_denoise_step is not None:
+        if plan.rollout_steps != 1 or not bool(plan.cold_start_mask.all()):
+            raise ValueError("cold denoise phases require a true-cold K=1 plan")
+        training_step = build_cold_start_training_step(
+            model=model,
+            clean_motion=clean_motion,
+            noise=plan.noise,
+            source_start_token=plan.source_start_token,
+            span_token_count=plan.span_token_count,
+            active_tokens=plan.active_tokens,
+            denoise_step_index=cold_denoise_step,
+            previous_root_frame=previous_root_frame,
+            previous_root_valid_mask=previous_root_valid_mask,
+            condition_builder=condition_builder,
+        )
+        return LDFSolverResult(
+            final_step=training_step,
+            prediction=model(training_step.inputs),
+            clean_motion=clean_motion,
+            replacements=(),
+        )
+
+    if plan.rollout_steps > 1:
+        final_step, prediction, state, replacements = run_persistent_rollout(
+            model,
+            clean_motion,
+            plan,
+            previous_root_frame=previous_root_frame,
+            previous_root_valid_mask=previous_root_valid_mask,
+            condition_builder=condition_builder,
+        )
+        return LDFSolverResult(
+            final_step=final_step,
+            prediction=prediction,
+            clean_motion=state.clean_motion,
+            replacements=replacements,
+            is_rollout=True,
+            persistent_state=state,
+        )
+
+    training_step = build_ldf_training_step(
+        model=model,
+        clean_motion=clean_motion,
+        noise=plan.noise,
+        source_start_token=plan.source_start_token,
+        span_token_count=plan.span_token_count,
+        initial_history_tokens=plan.initial_history_tokens,
+        active_tokens=plan.active_tokens,
+        phase_offset=plan.phase_offset,
+        step_index=0,
+        previous_root_frame=previous_root_frame,
+        previous_root_valid_mask=previous_root_valid_mask,
+        condition_builder=condition_builder,
+    )
+    return LDFSolverResult(
+        final_step=training_step,
+        prediction=model(training_step.inputs),
+        clean_motion=clean_motion,
+        replacements=(),
+    )
+
+
+__all__ = [
+    "LDFSolverResult",
+    "PersistentRolloutState",
+    "run_persistent_rollout",
+    "run_training_solver",
+]

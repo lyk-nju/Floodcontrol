@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from utils.conditions.ldf import LDFPrediction
-from utils.training.ldf.batch import LDFTrainingStep
+from utils.training.ldf.steps import LDFTrainingStep
 from utils.training.ldf.flow import endpoint_estimate
 
 

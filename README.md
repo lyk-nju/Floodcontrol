@@ -43,7 +43,7 @@ VAE checkpoint尚未训练完成时先运行`pre-vae`，训练完成后再运行
 完整输入、输出和恢复协议见
 [`02_DATA_PIPELINE.md`](docs/rearchitecture/02_DATA_PIPELINE.md)。
 
-测试覆盖typed condition、active/future XZ、Root/Body forward sensitivity、constraint CFG、逐token文本隔离、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`与`train_ldf.py`都会直接检查所需statistics、checkpoint和数据；正式LDF训练窗口固定为40 tokens/160 frames，canonical root statistics必须按这套窗口与逐样本anchor分布生成，不再使用额外的`training_ready`状态门闩。Web的四帧chunk runtime已经接入`InferenceSession`，模型加载在正式LDF checkpoint冻结前明确抛出`BLOCKED_ON_LDF_CHECKPOINT`。
+测试覆盖typed condition、active/future XZ、Root/Body forward sensitivity、constraint CFG、逐token文本隔离、四帧VAE contract、HumanML恢复、随机yaw一致性、因果性、offline/stream parity、三角Hybrid stream和snapshot恢复。`train_vae.py`与`train_ldf.py`都会直接检查所需statistics、checkpoint和数据；正式LDF训练窗口固定为50 tokens/200 frames，canonical root statistics按冻结的50-token、C=5、uniform-legal-history anchor协议生成一次，不随cold replay或K课程调整反复重算。Web的四帧chunk runtime已经接入`InferenceSession`，模型加载在正式LDF checkpoint冻结前明确抛出`BLOCKED_ON_LDF_CHECKPOINT`。
 
 LDF训练支持单卡和Lightning DDP。多卡时普通validation、dense-XZ轨迹/视频与完整HumanML T2M评测都会按sample分片；只有rank 0写全局summary和W&B。`configs/ldf.yaml`固定为远端8卡/resume配置，`configs/ldf_s5.yaml`单独保存本机S5配置；两者都显式拥有自己的路径，不依赖同一份`paths_default.yaml`切换服务器语义。
 

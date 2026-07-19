@@ -1,4 +1,4 @@
-"""Model-facing batch construction for per-sample LDF windows."""
+"""Model-facing step construction for per-sample LDF windows."""
 
 from __future__ import annotations
 
@@ -87,6 +87,7 @@ def anchor_physical_batch(
 
 def build_ldf_training_step(
     *,
+    model,
     clean_motion: HybridMotion,
     noise: HybridMotion,
     source_start_token: torch.Tensor,
@@ -144,7 +145,6 @@ def build_ldf_training_step(
     timeline = source_start[:, None] + positions
     valid = positions < span_count[:, None]
     rope = positions - active_start[:, None]
-    history_mask = valid & (positions < active_start[:, None])
     loss_mask = (
         valid
         & (positions >= active_start[:, None])
@@ -152,7 +152,6 @@ def build_ldf_training_step(
     )
     # Pure-noise frontier remains in persistent state for later rollout steps,
     # but only history plus the current active band enters non-causal attention.
-    generation_mask = loss_mask
     noisy_motion = mix_fixed_noise(clean_motion, noise, beta)
     view = LDFStepView(
         step_index=int(step_index),
@@ -167,18 +166,21 @@ def build_ldf_training_step(
     condition = condition_builder(view, clean_motion)
     if not isinstance(condition, LDFCondition):
         raise TypeError("condition_builder must return LDFCondition")
-    inputs = LDFInput(
-        noisy_motion=noisy_motion,
+    # The ideal bridge exposes the complete active band.  ``create_input``
+    # remains the sole owner of visibility; this synthetic next-beta view only
+    # marks active tokens as advancing and never exposes the pure-noise tail.
+    visibility_beta = torch.where(loss_mask, torch.zeros_like(beta), beta)
+    inputs = model.create_input(
+        noisy_motion,
         beta=beta,
-        history_mask=history_mask,
-        generation_mask=generation_mask,
+        next_beta=visibility_beta,
         timeline_position_ids=timeline,
-        rope_position_ids=rope,
+        commit_index=source_start + active_start,
+        token_valid_mask=valid,
+        condition=condition,
         previous_root_frame=previous_root_frame,
         previous_root_valid_mask=previous_root_valid_mask,
-        condition=condition,
     )
-    inputs.validate_structure()
     return LDFTrainingStep(
         inputs=inputs,
         target_velocity=flow_velocity_target(clean_motion, noise),
@@ -257,17 +259,18 @@ def build_cold_start_training_step(
     if not isinstance(condition, LDFCondition):
         raise TypeError("condition_builder must return LDFCondition")
     noisy_motion = mix_fixed_noise(clean_motion, noise, beta)
-    inputs = model._create_step_input(
+    valid = positions < span_count[:, None]
+    inputs = model.create_input(
         noisy_motion,
         beta=beta,
         next_beta=next_beta,
         timeline_position_ids=timeline,
         commit_index=0,
+        token_valid_mask=valid,
         condition=condition,
         previous_root_frame=previous_root_frame,
         previous_root_valid_mask=previous_root_valid_mask,
     )
-    valid = positions < span_count[:, None]
     loss_mask = inputs.generation_mask & valid
     inputs.validate_structure()
     return LDFTrainingStep(
@@ -282,10 +285,12 @@ def build_cold_start_training_step(
 
 def build_ldf_rollout_step(
     *,
+    model,
     noisy_motion: HybridMotion,
     clean_motion: HybridMotion,
     noise: HybridMotion,
     beta: torch.Tensor,
+    next_beta: torch.Tensor,
     source_start_token: torch.Tensor,
     span_token_count: torch.Tensor,
     history_end: torch.Tensor,
@@ -328,7 +333,6 @@ def build_ldf_rollout_step(
     timeline = source_start[:, None] + positions
     valid = positions < span_count[:, None]
     active_end = history_end + int(active_tokens)
-    history_mask = valid & (positions < history_end[:, None])
     loss_mask = (
         valid
         & (positions >= history_end[:, None])
@@ -345,18 +349,17 @@ def build_ldf_rollout_step(
         rope_position_ids=rope,
         beta=beta,
     )
-    inputs = LDFInput(
-        noisy_motion=noisy_motion,
+    inputs = model.create_input(
+        noisy_motion,
         beta=beta,
-        history_mask=history_mask,
-        generation_mask=loss_mask,
+        next_beta=next_beta,
         timeline_position_ids=timeline,
-        rope_position_ids=rope,
+        commit_index=source_start + history_end,
+        token_valid_mask=valid,
+        condition=condition,
         previous_root_frame=previous_root_frame,
         previous_root_valid_mask=previous_root_valid_mask,
-        condition=condition,
     )
-    inputs.validate_structure()
     return LDFTrainingStep(
         inputs=inputs,
         target_velocity=flow_velocity_target(clean_motion, noise),

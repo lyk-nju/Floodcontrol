@@ -42,3 +42,35 @@ def test_dynamic_targets_are_explicitly_validated():
         resolve_function("utils.token_frame.missing_function")
     with pytest.raises(TypeError, match="not callable"):
         resolve_function("utils.token_frame.FRAMES_PER_TOKEN")
+
+
+def test_config_base_is_relative_recursive_and_removed_from_result(tmp_path):
+    shared = tmp_path / "shared.yaml"
+    base = tmp_path / "base.yaml"
+    child = tmp_path / "experiments" / "child.yaml"
+    child.parent.mkdir()
+    shared.write_text("model:\n  hidden: 128\n  layers: 4\n", encoding="utf-8")
+    base.write_text(
+        "base_config: shared.yaml\nmodel:\n  layers: 6\nseed: 11\n",
+        encoding="utf-8",
+    )
+    child.write_text(
+        "base_config: ../base.yaml\nmodel:\n  hidden: 256\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(child, {"seed": "17"})
+    assert config.model.hidden == 256
+    assert config.model.layers == 6
+    assert config.seed == 17
+    assert "base_config" not in config.config
+
+
+def test_config_base_cycle_is_rejected(tmp_path):
+    first = tmp_path / "first.yaml"
+    second = tmp_path / "second.yaml"
+    first.write_text("base_config: second.yaml\n", encoding="utf-8")
+    second.write_text("base_config: first.yaml\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="base cycle"):
+        load_config(first)

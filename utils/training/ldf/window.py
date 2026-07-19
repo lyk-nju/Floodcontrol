@@ -1,4 +1,4 @@
-"""Detached fixed-parent-window self-forcing for LDF training."""
+"""Window geometry and rollout curriculum for LDF training."""
 
 from __future__ import annotations
 
@@ -7,17 +7,9 @@ import math
 from typing import Mapping
 
 import torch
-import torch.nn as nn
 
-from utils.conditions.ldf import HybridMotion, LDFPrediction
+from utils.conditions.ldf import HybridMotion
 from utils.token_frame import FRAMES_PER_TOKEN
-from utils.training.ldf.batch import (
-    ConditionBuilder,
-    LDFTrainingStep,
-    build_cold_start_training_step,
-    build_ldf_training_step,
-)
-from utils.training.ldf.flow import recover_clean_for_self_forcing
 
 
 DEFAULT_K_SCHEDULE = ((0, 1), (100_000, 2), (200_000, 5))
@@ -244,53 +236,6 @@ class LDFWindowPlan:
             raise ValueError("H=0 requires a parent at the true sequence start")
 
 
-@dataclass
-class SelfForcingState:
-    """Only the clean history substitutions are mutable across rollout steps."""
-
-    clean_motion: HybridMotion
-    completed_steps: int = 0
-
-    def validate(self, plan: LDFWindowPlan) -> None:
-        self.clean_motion.validate()
-        if self.clean_motion.token_length != plan.span_tokens:
-            raise ValueError("clean motion does not match the rollout span")
-        if self.clean_motion.batch_size != plan.root_noise.shape[0]:
-            raise ValueError("clean motion does not match the rollout batch")
-        if not 0 <= self.completed_steps <= plan.rollout_steps:
-            raise ValueError("completed_steps lies outside the rollout")
-
-    def replace_committed_token(
-        self,
-        *,
-        token_index: torch.Tensor,
-        root_motion: torch.Tensor,
-        latent_motion: torch.Tensor,
-    ) -> "SelfForcingState":
-        root = self.clean_motion.root_motion.clone()
-        latent = self.clean_motion.latent_motion.clone()
-        indices = token_index.to(device=root.device, dtype=torch.long).view(-1)
-        if tuple(indices.shape) != (root.shape[0],):
-            raise ValueError("token_index must be [B]")
-        batch_index = torch.arange(root.shape[0], device=root.device)
-        root[batch_index, indices] = root_motion.detach()
-        latent[batch_index, indices] = latent_motion.detach()
-        return SelfForcingState(
-            HybridMotion(root.detach(), latent.detach()),
-            completed_steps=self.completed_steps + 1,
-        )
-
-
-@dataclass(frozen=True)
-class SelfForcingResult:
-    final_step: LDFTrainingStep
-    prediction: LDFPrediction
-    state: SelfForcingState
-    replacements: tuple[HybridMotion, ...]
-    is_rollout: bool = False
-    solver_state: object | None = None
-
-
 def resolve_self_forcing_k(
     global_step: int,
     schedule=DEFAULT_K_SCHEDULE,
@@ -490,135 +435,11 @@ def sample_window_plan(
     return plan
 
 
-def run_self_forcing_rollout(
-    model: nn.Module,
-    state: SelfForcingState,
-    plan: LDFWindowPlan,
-    *,
-    previous_root_frame: torch.Tensor | None,
-    previous_root_valid_mask: torch.Tensor | None,
-    condition_builder: ConditionBuilder,
-    cold_denoise_step: torch.Tensor | None = None,
-) -> SelfForcingResult:
-    """Run K-1 detached replacements and one differentiable final forward."""
-
-    plan.validate_structure()
-    state.validate(plan)
-    if cold_denoise_step is not None:
-        if plan.rollout_steps != 1 or not bool(plan.cold_start_mask.all()):
-            raise ValueError("cold denoise phases require a true-cold K=1 plan")
-        training_step = build_cold_start_training_step(
-            model=model,
-            clean_motion=state.clean_motion,
-            noise=plan.noise,
-            source_start_token=plan.source_start_token,
-            span_token_count=plan.span_token_count,
-            active_tokens=plan.active_tokens,
-            denoise_step_index=cold_denoise_step,
-            previous_root_frame=previous_root_frame,
-            previous_root_valid_mask=previous_root_valid_mask,
-            condition_builder=condition_builder,
-        )
-        prediction = model(training_step.inputs)
-        return SelfForcingResult(
-            final_step=training_step,
-            prediction=prediction,
-            state=state,
-            replacements=(),
-        )
-    if plan.rollout_steps > 1:
-        from utils.training.ldf.rollout import run_persistent_rollout
-
-        final_step, prediction, solver_state, replacements = run_persistent_rollout(
-            model,
-            state.clean_motion,
-            plan,
-            previous_root_frame=previous_root_frame,
-            previous_root_valid_mask=previous_root_valid_mask,
-            condition_builder=condition_builder,
-        )
-        final_clean = solver_state.clean_motion
-        return SelfForcingResult(
-            final_step=final_step,
-            prediction=prediction,
-            state=SelfForcingState(
-                final_clean,
-                completed_steps=plan.rollout_steps,
-            ),
-            replacements=replacements,
-            is_rollout=True,
-            solver_state=solver_state,
-        )
-    replacements: list[HybridMotion] = []
-    final_step = None
-    final_prediction = None
-    current = state
-
-    for step_index in range(plan.rollout_steps):
-        training_step = build_ldf_training_step(
-            clean_motion=current.clean_motion,
-            noise=plan.noise,
-            source_start_token=plan.source_start_token,
-            span_token_count=plan.span_token_count,
-            initial_history_tokens=plan.initial_history_tokens,
-            active_tokens=plan.active_tokens,
-            phase_offset=plan.phase_offset,
-            step_index=step_index,
-            previous_root_frame=previous_root_frame,
-            previous_root_valid_mask=previous_root_valid_mask,
-            condition_builder=condition_builder,
-        )
-        if step_index == plan.rollout_steps - 1:
-            final_step = training_step
-            final_prediction = model(training_step.inputs)
-            break
-
-        with torch.no_grad():
-            prediction = model(training_step.inputs)
-        replace_index = plan.initial_history_tokens + step_index
-        batch_index = torch.arange(
-            plan.root_noise.shape[0], device=plan.root_noise.device
-        )
-        root_replacement = prediction.clean_root_motion[
-            batch_index, replace_index
-        ].detach()
-        body_replacement = recover_clean_for_self_forcing(
-            training_step.inputs.noisy_motion.latent_motion[
-                batch_index, replace_index
-            ],
-            training_step.inputs.beta[batch_index, replace_index],
-            prediction.velocity.latent_motion[batch_index, replace_index],
-        ).detach()
-        replacement = HybridMotion(
-            root_replacement[:, None],
-            body_replacement[:, None],
-        )
-        replacement.validate()
-        replacements.append(replacement)
-        current = current.replace_committed_token(
-            token_index=replace_index,
-            root_motion=root_replacement,
-            latent_motion=body_replacement,
-        )
-
-    if final_step is None or final_prediction is None:
-        raise RuntimeError("self-forcing rollout did not produce a final step")
-    return SelfForcingResult(
-        final_step=final_step,
-        prediction=final_prediction,
-        state=current,
-        replacements=tuple(replacements),
-    )
-
-
 __all__ = [
     "DEFAULT_K_SCHEDULE",
     "DEFAULT_TEACHER_REPLAY",
     "LDFWindowPlan",
-    "SelfForcingResult",
-    "SelfForcingState",
     "resolve_self_forcing_k",
-    "run_self_forcing_rollout",
     "sample_rollout_steps",
     "sample_window_plan",
 ]

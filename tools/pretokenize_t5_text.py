@@ -2,16 +2,16 @@
 Offline: run UMT5-XXL encoder on every unique caption listed by each
 ``cfg.data.text_meta_paths`` inventory (HumanML3D/BABEL-style texts/*.txt).
 
-调用方必须显式传入包含 ``model.params`` 与 ``data`` 的训练配置。新版four-frame
-训练配置尚未接线，因此本工具不再回退到已经删除的legacy ``configs/ldf.yaml``。
+调用方必须显式传入包含 ``model.params`` 与 ``data`` 的训练配置。正式LDF训练通过
+``data.text_embeddings_path``直接消费这里生成的token-aligned caption table。
 
 Saves a single .pt file: { "embeddings": { caption_str: FloatTensor[L, 4096] on CPU }, "text_dim": 4096, ... }
 
-Future training integration may pass these embeddings through ``LDFCondition``.
+训练与推理condition compiler会把这些embedding按token timeline写入``LDFCondition``。
 
 多卡（每 GPU 各加载一份 T5，分片编码，rank0 合并为一个 .pt）::
 
-    torchrun --standalone --nproc_per_node=4 tools/pretokenize_t5_text.py --config <future-training-config>
+    torchrun --standalone --nproc_per_node=4 tools/pretokenize_t5_text.py --config configs/ldf.yaml
 """
 
 from __future__ import annotations

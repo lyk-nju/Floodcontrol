@@ -51,7 +51,7 @@ def test_step_input_excludes_the_untouched_pure_noise_frontier():
     motion = HybridMotion(torch.zeros(1, 6, 4, 5), torch.zeros(1, 6, 3))
     positions = torch.arange(6)[None]
     condition = stream_condition()
-    inputs = model._create_step_input(
+    inputs = model.create_input(
         motion,
         beta=torch.ones(1, 6),
         next_beta=torch.tensor([[0.75, 1.0, 1.0, 1.0, 1.0, 1.0]]),
@@ -93,7 +93,7 @@ def test_denoise_step_matches_euler_update_and_preserves_ideal_bridge():
         )
 
     model.forward = types.MethodType(perfect_forward, model)
-    inputs = model._create_step_input(
+    inputs = model.create_input(
         current,
         beta=beta,
         next_beta=next_beta,
@@ -124,6 +124,38 @@ def test_denoise_step_matches_euler_update_and_preserves_ideal_bridge():
         rtol=1e-5,
     )
     assert prediction.velocity is target
+
+
+def test_commit_rebase_preserves_the_world_space_motion_state():
+    model = make_model()
+    root = torch.randn(2, 6, 4, 5)
+    latent = torch.randn(2, 6, 3)
+    beta = torch.rand(2, 6)
+    token_index = torch.tensor([1, 3])
+    motion = HybridMotion(root, latent)
+
+    rebased, committed, translation_xz = model.commit_step(
+        motion,
+        beta,
+        token_index,
+    )
+
+    normalized_translation = translation_xz / model.root_std[[0, 2]]
+    restored_world_xz = rebased.root_motion[..., [0, 2]] + (
+        (1.0 - beta)[..., None, None]
+        * normalized_translation[:, None, None, :]
+    )
+
+    assert torch.allclose(restored_world_xz, root[..., [0, 2]])
+    assert torch.equal(rebased.latent_motion, latent)
+    assert torch.allclose(
+        committed.root_motion[..., 3:5].norm(dim=-1),
+        torch.ones_like(committed.root_motion[..., 3]),
+    )
+    assert torch.allclose(
+        model.denormalize_root(committed.root_motion)[:, 0, -1, [0, 2]],
+        translation_xz,
+    )
 
 
 def test_stream_updates_both_fields_and_snapshot_restore_is_deterministic():

@@ -77,7 +77,8 @@ def test_pre_vae_pipeline_builds_and_resumes_all_non_t5_assets(tmp_path):
         (human / "root_stats.npz", {"root_mean", "root_std"}),
     ):
         with np.load(path, allow_pickle=False) as values:
-            assert set(values.files) == fields
+            assert fields <= set(values.files)
+            assert set(values.files) - fields <= {"metadata"}
             for name in fields:
                 assert np.isfinite(values[name]).all()
                 if name.endswith("std"):

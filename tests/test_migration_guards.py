@@ -1,8 +1,10 @@
 from pathlib import Path
 import inspect
+import json
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 from models.diffusion_forcing_wan import LDF
@@ -10,7 +12,7 @@ from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import make_vae
 from train_ldf import _validate_training_config, main as train_main
 from utils.initialize import instantiate_target, load_config
-from utils.training.ldf.self_forcing import resolve_self_forcing_k
+from utils.training.ldf.window import resolve_self_forcing_k
 from web_demo.runtime.model_loader import WEB_RUNTIME_BLOCKER, load_model_bundle
 
 
@@ -49,18 +51,18 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert "fps" not in cfg.vae.params
     assert "encoder_context_tokens" not in cfg.data
     assert cfg.data.min_frames == 20
-    assert cfg.data.max_frames == 160
+    assert cfg.data.max_frames == 200
     assert "cold_start_probability" not in cfg.data
     assert "length_bucket_frames" not in cfg.data
     assert cfg.training.text_dropout == pytest.approx(0.1)
     assert cfg.training.constraint_dropout == pytest.approx(0.1)
-    assert cfg.training.window.max_tokens == 40
+    assert cfg.training.window.max_tokens == 50
     assert cfg.training.window.generation_tokens == 5
     assert cfg.training.window.sampling == "random_generation_start"
-    assert cfg.training.max_horizon_token == 35
-    assert cfg.training.constraint_sampling.dense_probability == pytest.approx(0.5)
-    assert cfg.training.constraint_sampling.waypoint_probability == pytest.approx(0.25)
-    assert cfg.training.constraint_sampling.goal_probability == pytest.approx(0.25)
+    assert cfg.training.max_horizon_token == 45
+    assert cfg.training.constraint_sampling.dense_probability == pytest.approx(1.0)
+    assert cfg.training.constraint_sampling.waypoint_probability == pytest.approx(0.0)
+    assert cfg.training.constraint_sampling.goal_probability == pytest.approx(0.0)
     assert cfg.training.constraint_sampling.max_waypoint_count == 4
     assert cfg.data.text_embeddings_path.endswith(
         "HumanML3D_motion/t5_text_embeddings.pt"
@@ -74,7 +76,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.validation.generation.modes
     assert set(cfg.validation.generation.modes) <= {"stream", "rolling"}
     assert cfg.validation.generation.max_horizon_token == 10
-    assert cfg.validation.generation.rolling.window_tokens == 40
+    assert cfg.validation.generation.rolling.window_tokens == 50
     assert cfg.validation.dense_xz.enabled is True
     assert cfg.validation.dense_xz.probe == "dense_xz"
     assert cfg.data.test_probe_meta_paths.dense_xz[0].endswith(
@@ -88,21 +90,26 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.self_forcing.cold_start_replay == pytest.approx(0.1)
     assert list(cfg.self_forcing.k_schedule) == [
         [0, 1],
-        [200000, 2],
-        [290000, 3],
-        [350000, 5],
+        [100000, 2],
+        [200000, 3],
+        [300000, 5],
     ]
     assert dict(cfg.self_forcing.teacher_replay) == {2: 0.1, 3: 0.1, 5: 0.1}
     assert cfg.trainer.max_steps == 500000
     assert cfg.trainer.devices == 8
-    assert cfg.data.train_batch_size == 32
-    assert cfg.data.num_workers == 4
+    assert cfg.data.train_batch_size == 64
+    assert cfg.data.num_workers == 2
     assert cfg.dirs.raw_data.startswith("/data/home/shengqiuProf_user_yuankai/")
-    assert str(cfg.resume_ckpt).endswith("step_200000.ckpt")
-    assert cfg.test_ckpt == cfg.resume_ckpt
+    assert cfg.resume_ckpt is None
+    assert cfg.test_ckpt is None
     assert cfg.loss.rollout_weight == pytest.approx(1.0)
     assert cfg.loss.offpath_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_boundary_weight == pytest.approx(0.0)
+    assert cfg.loss.body_weight == pytest.approx(3.0)
+    assert cfg.model.params.cfg_mode == "joint"
+    assert cfg.root_statistics.window_tokens == 50
+    assert cfg.root_statistics.generation_tokens == 5
+    assert cfg.root_statistics.anchor_sampling == "uniform_legal_history"
     assert (
         cfg.lr_scheduler.target
         == "diffusers.optimization.get_cosine_schedule_with_warmup"
@@ -153,6 +160,9 @@ def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     assert cfg.training.window == human_cfg.training.window
     assert cfg.training.max_horizon_token == human_cfg.training.max_horizon_token
     assert cfg.training.constraint_sampling == human_cfg.training.constraint_sampling
+    assert cfg.model.params == human_cfg.model.params
+    assert cfg.loss == human_cfg.loss
+    assert cfg.optimizer == human_cfg.optimizer
     assert cfg.lr_scheduler == human_cfg.lr_scheduler
 
 
@@ -161,12 +171,12 @@ def test_remote_self_forcing_recipe_uses_resume_stable_absolute_boundaries():
     schedule = cfg.self_forcing.k_schedule
 
     assert resolve_self_forcing_k(0, schedule) == 1
-    assert resolve_self_forcing_k(199_999, schedule) == 1
-    assert resolve_self_forcing_k(200_000, schedule) == 2
-    assert resolve_self_forcing_k(289_999, schedule) == 2
-    assert resolve_self_forcing_k(290_000, schedule) == 3
-    assert resolve_self_forcing_k(349_999, schedule) == 3
-    assert resolve_self_forcing_k(350_000, schedule) == 5
+    assert resolve_self_forcing_k(99_999, schedule) == 1
+    assert resolve_self_forcing_k(100_000, schedule) == 2
+    assert resolve_self_forcing_k(199_999, schedule) == 2
+    assert resolve_self_forcing_k(200_000, schedule) == 3
+    assert resolve_self_forcing_k(299_999, schedule) == 3
+    assert resolve_self_forcing_k(300_000, schedule) == 5
     assert resolve_self_forcing_k(499_999, schedule) == 5
 
 
@@ -258,6 +268,20 @@ def test_motion_processing_has_one_canonical_runtime_module():
         )
 
 
+def test_ldf_training_has_one_canonical_solver_and_condition_stack():
+    for relative_path in (
+        "utils/training/ldf/batch.py",
+        "utils/training/ldf/self_forcing.py",
+        "utils/training/ldf/rollout.py",
+        "tools/compute_z_stats.py",
+    ):
+        assert not (ROOT / relative_path).exists()
+
+    import utils.conditions.ldf as ldf_contract
+
+    assert not hasattr(ldf_contract, "create_window_condition")
+
+
 def test_offline_artifact_builder_has_distinct_name():
     assert not (ROOT / "utils" / "motion_artifact.py").exists()
     assert (ROOT / "tools" / "build_motion_artifact.py").is_file()
@@ -295,9 +319,9 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     _validate_training_config(cfg)
     assert cfg.training.constraint_dropout == pytest.approx(0.1)
-    assert cfg.training.window.max_tokens == 40
+    assert cfg.training.window.max_tokens == 50
     assert cfg.training.window.generation_tokens == 5
-    assert cfg.training.max_horizon_token == 35
+    assert cfg.training.max_horizon_token == 45
 
     # Scheduled dense-XZ/video/T2M evaluation is sharded by the training
     # callback and therefore remains legal for a multi-device DDP run.
@@ -310,6 +334,31 @@ def test_training_entry_rejects_missing_xz_lookahead():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.max_horizon_token = 0
     with pytest.raises(RuntimeError, match="LDF_XZ_CONSTRAINT_REQUIRED"):
+        _validate_training_config(cfg)
+
+
+def test_training_entry_requires_proven_root_statistics_contract(tmp_path):
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
+    root_stats = tmp_path / "root_stats.npz"
+    np.savez(root_stats, root_mean=np.zeros(5), root_std=np.ones(5))
+    cfg.config.data.root_stats_path = str(root_stats)
+    with pytest.raises(RuntimeError, match="ROOT_STATISTICS_REBUILD_REQUIRED"):
+        _validate_training_config(cfg)
+
+    metadata = {
+        "window_tokens": 40,
+        "generation_tokens": 5,
+        "anchor_sampling": "uniform_legal_history",
+        "random_yaw": True,
+        "windows_per_sample": 1,
+    }
+    np.savez(
+        root_stats,
+        root_mean=np.zeros(5),
+        root_std=np.ones(5),
+        metadata=np.asarray(json.dumps(metadata)),
+    )
+    with pytest.raises(RuntimeError, match="sampling contract"):
         _validate_training_config(cfg)
 
 

@@ -5,8 +5,9 @@ import torch
 import torch.nn as nn
 
 from models.diffusion_forcing_wan import LDF
-from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
-from utils.training.ldf.batch import (
+from utils.conditions.ldf import HybridMotion, LDFCondition, LDFInput, LDFPrediction
+from utils.training.ldf.steps import (
+    LDFStepView,
     build_cold_start_training_step,
     build_ldf_rollout_step,
     build_ldf_training_step,
@@ -21,9 +22,8 @@ from utils.training.ldf.flow import (
     recover_clean_for_full_gradient_auxiliary,
     recover_clean_for_self_forcing,
 )
-from utils.training.ldf.self_forcing import (
-    SelfForcingState,
-    run_self_forcing_rollout,
+from utils.training.ldf.solver import run_training_solver
+from utils.training.ldf.window import (
     resolve_self_forcing_k,
     sample_rollout_steps,
     sample_window_plan,
@@ -232,6 +232,7 @@ def test_training_steps_reuse_absolute_noise_and_keep_fixed_span_masks():
     body_noise = torch.arange(30, dtype=torch.float32).reshape(1, 10, 3)
     noise = HybridMotion(root_noise, body_noise)
     kwargs = dict(
+        model=RecordingModel(),
         clean_motion=clean,
         noise=noise,
         source_start_token=torch.tensor([4]),
@@ -315,7 +316,7 @@ def test_cold_ideal_phase_matches_runtime_beta_visibility_and_state(denoise_step
         timeline_position_ids=positions,
         diffusion_time=(denoise_step + 1) / 10.0,
     )
-    runtime_inputs = model._create_step_input(
+    runtime_inputs = model.create_input(
         HybridMotion(
             beta[..., None, None] * noise.root_motion,
             beta[..., None] * noise.latent_motion,
@@ -386,7 +387,7 @@ def test_cold_dynamic_future_starts_at_each_microstep_visible_end():
             view=view,
             text_context=[torch.zeros(1, 1) for _ in range(10)],
             text_null_context=[torch.zeros(1, 1)],
-            max_horizon_token=3,
+            future_horizon_tokens=torch.tensor([3]),
         )
 
     visible_counts = []
@@ -439,6 +440,7 @@ def test_mixed_batch_uses_each_samples_own_history_and_real_span_length():
         torch.ones_like(clean.latent_motion),
     )
     step = build_ldf_training_step(
+        model=RecordingModel(),
         clean_motion=clean,
         noise=noise,
         source_start_token=torch.tensor([10, 20]),
@@ -522,6 +524,12 @@ class RecordingModel(nn.Module):
         )
         return HybridMotion(root, motion.latent_motion.clone())
 
+    def create_input(self, *args, **kwargs):
+        return LDF.create_input(self, *args, **kwargs)
+
+    def commit_step(self, *args, **kwargs):
+        return LDF.commit_step(self, *args, **kwargs)
+
     def forward(self, inputs):
         self.calls.append(
             (torch.is_grad_enabled(), self.training, inputs.generation_mask.sum().item())
@@ -556,17 +564,17 @@ class RecordingModel(nn.Module):
 def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
     monkeypatch,
 ):
-    import utils.training.ldf.rollout as rollout_module
+    import utils.training.ldf.solver as solver_module
 
     mix_calls = 0
-    original_mix = rollout_module.mix_fixed_noise
+    original_mix = solver_module.mix_fixed_noise
 
     def counted_mix(*args, **kwargs):
         nonlocal mix_calls
         mix_calls += 1
         return original_mix(*args, **kwargs)
 
-    monkeypatch.setattr(rollout_module, "mix_fixed_noise", counted_mix)
+    monkeypatch.setattr(solver_module, "mix_fixed_noise", counted_mix)
     batch = physical_batch()
     plan = sample_window_plan(
         batch,
@@ -581,7 +589,6 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
         torch.zeros(2, 10, 4, 5),
         torch.zeros(2, 10, 3),
     )
-    state = SelfForcingState(clean)
     model = RecordingModel().train()
     views = []
 
@@ -589,9 +596,9 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
         views.append(view)
         return empty_condition(2)(view)
 
-    result = run_self_forcing_rollout(
+    result = run_training_solver(
         model,
-        state,
+        clean,
         plan,
         previous_root_frame=torch.zeros(2, 5),
         previous_root_valid_mask=torch.ones(2, dtype=torch.bool),
@@ -621,20 +628,20 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
     assert len(result.replacements) == 3
     assert all(not item.root_motion.requires_grad for item in result.replacements)
     assert all(item.root_motion.grad_fn is None for item in result.replacements)
-    assert not result.state.clean_motion.root_motion.requires_grad
+    assert not result.clean_motion.root_motion.requires_grad
     # Root history is expressed in the new per-commit coordinate origin, while
     # body latent history is translation invariant.
-    assert not result.state.clean_motion.root_motion[:, :2].equal(
+    assert not result.clean_motion.root_motion[:, :2].equal(
         clean.root_motion[:, :2]
     )
-    assert result.state.clean_motion.latent_motion[:, :2].equal(
+    assert result.clean_motion.latent_motion[:, :2].equal(
         clean.latent_motion[:, :2]
     )
-    assert result.solver_state.completed_commits == 3
-    assert not result.state.clean_motion.root_motion[:, 2:4].equal(
+    assert result.persistent_state is not None
+    assert result.persistent_state.completed_commits == 3
+    assert not result.clean_motion.root_motion[:, 2:4].equal(
         clean.root_motion[:, 2:4]
     )
-    assert result.state.completed_steps == 3
 
     from utils.training.ldf.losses import compute_offpath_loss
 
@@ -674,10 +681,12 @@ def test_offpath_loss_is_finite_near_zero_beta_and_boundary_loss_backpropagates(
     )
     beta = torch.tensor([[0.0, 1.0e-8]])
     step = build_ldf_rollout_step(
+        model=RecordingModel(),
         noisy_motion=current,
         clean_motion=clean,
         noise=noise,
         beta=beta,
+        next_beta=beta,
         source_start_token=torch.zeros(1, dtype=torch.long),
         span_token_count=torch.tensor([2]),
         history_end=torch.tensor([1]),
@@ -726,7 +735,8 @@ def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
         token_valid_mask=valid,
         initial_active_start=torch.tensor([2]),
         initial_active_end=torch.tensor([7]),
-        max_horizon_token=2,
+        future_horizon_tokens=torch.tensor([2]),
+        rollout_steps=2,
         dense_probability=1.0,
         waypoint_probability=0.0,
         goal_probability=0.0,
@@ -738,7 +748,7 @@ def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
         constraint_mask=constraint_mask,
         text_context=text,
         text_null_context=null,
-        max_horizon_token=2,
+        future_horizon_tokens=torch.tensor([2]),
     )
 
     def builder(view, clean_motion):
@@ -765,9 +775,9 @@ def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
         phase_offset=torch.zeros(1),
         generator=torch.Generator().manual_seed(13),
     )
-    run_self_forcing_rollout(
+    run_training_solver(
         RecordingModel(),
-        SelfForcingState(clean),
+        clean,
         plan,
         previous_root_frame=torch.zeros(1, 5),
         previous_root_valid_mask=torch.ones(1, dtype=torch.bool),
@@ -783,8 +793,70 @@ def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
         [7, 8, 9, 10, 11, 12]
     ]
     assert conditions[1].future_timeline_position_ids.tolist() == [
-        [8, 9, 10, 11, 12]
+        [8, 9, 10, 11, 12, 13]
     ]
+
+
+def test_k5_dense_plan_preserves_full_ten_token_future_at_every_commit():
+    tokens = 20
+    active_tokens = 5
+    rollout_steps = 5
+    horizon = torch.tensor([10])
+    root = torch.zeros(1, tokens, 4, 5)
+    latent = torch.zeros(1, tokens, 3)
+    valid = torch.ones(1, tokens, dtype=torch.bool)
+    constraint_mask = sample_xz_constraint_mask(
+        token_valid_mask=valid,
+        initial_active_start=torch.tensor([1]),
+        initial_active_end=torch.tensor([6]),
+        future_horizon_tokens=horizon,
+        rollout_steps=rollout_steps,
+        dense_probability=1.0,
+        waypoint_probability=0.0,
+        goal_probability=0.0,
+        max_waypoint_count=4,
+    )
+    assert constraint_mask[:, 1:20, :, 0].all()
+
+    for commit_offset in range(rollout_steps):
+        active_start = 1 + commit_offset
+        active_end = active_start + active_tokens
+        positions = torch.arange(tokens)[None]
+        view = LDFStepView(
+            step_index=commit_offset,
+            history_end=torch.tensor([active_start]),
+            active_start=torch.tensor([active_start]),
+            active_end=torch.tensor([active_end]),
+            frontier_start=torch.tensor([active_end]),
+            timeline_position_ids=positions,
+            rope_position_ids=positions - active_start,
+            beta=torch.zeros(1, tokens),
+        )
+        condition = create_xz_condition(
+            clean_root_motion=root,
+            token_valid_mask=valid,
+            constraint_mask=constraint_mask,
+            view=view,
+            text_context=[torch.zeros(1, 4) for _ in range(tokens)],
+            text_null_context=[torch.zeros(1, 4)],
+            future_horizon_tokens=horizon,
+        )
+        history_mask = positions < active_start
+        generation_mask = (positions >= active_start) & (positions < active_end)
+        inputs = LDFInput(
+            noisy_motion=HybridMotion(root, latent),
+            beta=torch.zeros(1, tokens),
+            history_mask=history_mask,
+            generation_mask=generation_mask,
+            timeline_position_ids=positions,
+            rope_position_ids=positions - active_start,
+            previous_root_frame=None,
+            previous_root_valid_mask=None,
+            condition=condition,
+        )
+
+        assert int(condition.future_valid_mask.sum().item()) == 14
+        assert int(inputs.future_attention_mask().sum().item()) == 10
 
 
 def test_one_persistent_future_goal_becomes_active_during_self_forcing():
@@ -804,7 +876,7 @@ def test_one_persistent_future_goal_becomes_active_during_self_forcing():
             view=view,
             text_context=[torch.zeros(1, 4) for _ in range(10)],
             text_null_context=[torch.zeros(1, 4)],
-            max_horizon_token=2,
+            future_horizon_tokens=torch.tensor([2]),
         )
         conditions.append(condition)
         return condition
@@ -824,9 +896,9 @@ def test_one_persistent_future_goal_becomes_active_during_self_forcing():
         phase_offset=torch.zeros(1),
         generator=torch.Generator().manual_seed(13),
     )
-    run_self_forcing_rollout(
+    run_training_solver(
         RecordingModel(),
-        SelfForcingState(HybridMotion(root, torch.zeros(1, 10, 3))),
+        HybridMotion(root, torch.zeros(1, 10, 3)),
         plan,
         previous_root_frame=torch.zeros(1, 5),
         previous_root_valid_mask=torch.ones(1, dtype=torch.bool),
@@ -883,7 +955,7 @@ def test_teacher_replay_draw_uses_the_generators_device(monkeypatch):
         return torch.tensor(0.5)
 
     generator = DeviceOnlyGenerator()
-    monkeypatch.setattr("utils.training.ldf.self_forcing.torch.rand", fake_rand)
+    monkeypatch.setattr("utils.training.ldf.window.torch.rand", fake_rand)
     assert sample_rollout_steps(
         100_000,
         generator=generator,
@@ -897,12 +969,12 @@ def test_teacher_replay_draw_uses_the_generators_device(monkeypatch):
 
 
 def test_self_forcing_curriculum_uses_absolute_global_step_boundaries():
-    schedule = ((0, 1), (200_000, 2), (290_000, 3), (350_000, 5))
+    schedule = ((0, 1), (100_000, 2), (200_000, 3), (300_000, 5))
     assert resolve_self_forcing_k(0, schedule) == 1
-    assert resolve_self_forcing_k(199_999, schedule) == 1
-    assert resolve_self_forcing_k(200_000, schedule) == 2
-    assert resolve_self_forcing_k(289_999, schedule) == 2
-    assert resolve_self_forcing_k(290_000, schedule) == 3
-    assert resolve_self_forcing_k(349_999, schedule) == 3
-    assert resolve_self_forcing_k(350_000, schedule) == 5
+    assert resolve_self_forcing_k(99_999, schedule) == 1
+    assert resolve_self_forcing_k(100_000, schedule) == 2
+    assert resolve_self_forcing_k(199_999, schedule) == 2
+    assert resolve_self_forcing_k(200_000, schedule) == 3
+    assert resolve_self_forcing_k(299_999, schedule) == 3
+    assert resolve_self_forcing_k(300_000, schedule) == 5
     assert resolve_self_forcing_k(900_000, schedule) == 5

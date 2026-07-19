@@ -253,7 +253,7 @@ LDFCondition
 - observation projector 在模型内部产生当前可见motion的observation features与constraint-only future候选tokens；
 - future timeline IDs使用absolute坐标；候选superset可覆盖尚未可见的active位置，但实际attention视图严格位于当前visible-motion末端之后。Root Stage根据`rope_origin`派生future RoPE IDs，future token数量不得改变motion、beta或Body Stage长度；
 - `previous_root_frame/previous_root_valid_mask`由`LDFInput`成对携带，只供backward local-root codec使用，不伪装成noisy generation token或CFG条件；全batch cold start时两者均为`None`，随机crop混合batch则使用physical `[B,5]`与逐样本bool `[B]`；
-- condition dropout 与 CFG 分支由 `utils/conditions/ldf.py` 的 `create_window_condition/create_ldf_condition/create_cfg_condition` 纯函数创建，不增加公共 wrapper dataclass；
+- condition dropout 与候选值由训练/runtime各自产生，随后统一经`utils/conditions/ldf.py`的typed `create_ldf_condition()`编译；CFG分支只由`create_cfg_condition()`创建，不增加公共wrapper dataclass；
 - 不存在 `controlnet_condition`、`root_refiner_plan` 或 post-decode feedback 输入。
 
 ### 4. Observation compilation

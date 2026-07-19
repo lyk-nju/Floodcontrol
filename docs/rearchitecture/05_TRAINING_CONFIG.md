@@ -24,15 +24,15 @@
 ```yaml
 data:
   min_frames: 20
-  max_frames: 160
+  max_frames: 200
 
 model.params:
   chunk_size: 5
 
 self_forcing:
   cold_start_replay: 0.1
-  k_schedule: [[0, 1], [100000, 2], [200000, 5]]
-  teacher_replay: {2: 0.0, 5: 0.0}
+  k_schedule: [[0, 1], [100000, 2], [200000, 3], [300000, 5]]
+  teacher_replay: {2: 0.1, 3: 0.1, 5: 0.1}
 
 text_encoder:
   text_len: 128
@@ -41,14 +41,14 @@ training:
   text_dropout: 0.1
   constraint_dropout: 0.1
   window:
-    max_tokens: 40
+    max_tokens: 50
     generation_tokens: 5
     sampling: random_generation_start
-  max_horizon_token: 35
+  max_horizon_token: 45
   constraint_sampling:
-    dense_probability: 0.5
-    waypoint_probability: 0.25
-    goal_probability: 0.25
+    dense_probability: 1.0
+    waypoint_probability: 0.0
+    goal_probability: 0.0
     max_waypoint_count: 4
 
 lr_scheduler:
@@ -66,7 +66,7 @@ validation:
     video_samples: 4
     max_horizon_token: 10
     rolling:
-      window_tokens: 40
+      window_tokens: 50
   dense_xz:
     enabled: true
     probe: dense_xz
@@ -76,15 +76,15 @@ validation:
     steps: 10000
 ```
 
-`max_frames=160`与`window.max_tokens=40`共同定义每个sample最多8秒的parent窗口；短动作保留自然长度，长动作随机裁40 tokens，batch仅右padding。`chunk_size`与`window.generation_tokens`必须同为5。每个sample独立采样generation start，由此得到`H_i`和`F_i`，唯一预算是`H_i+5+F_i<=40`；不再存在独立history上限。`H=0`严格表示true cold start，只允许parent从真实序列第0 token开始，并要求VAE context为0、previous-root无效；中间parent的合法范围从`H=1`开始。`max_horizon_token=35`是future XZ的最大时间范围，实际可见范围为`min(35,F_i)`，并不表示每次都提供35个观测。`self_forcing`块是全部训练唯一的K课程入口：普通训练显式写成K=1，不再由`enabled`或phase字段切出另一条入口。`cold_start_replay=0.1`在K选择前独立应用于整个训练过程，使用K=1 ideal target并覆盖首次commit全部runtime denoise阶段与动态1–5 token visibility；它不执行前置no-grad solver rollout。K>1阶段会从同一预算预留`K-1`个rollout token，并自动过滤短于`5+K-1` tokens的训练sample。约束按50% dense trajectory、25% 1–4个frame-level waypoints（每个waypoint是一帧XZ观测）、25%单一future goal采样；constraint dropout与text dropout独立覆盖四种CFG条件组合。
+`max_frames=200`与`window.max_tokens=50`共同定义每个sample最多10秒的parent窗口；短动作保留自然长度，长动作随机裁50 tokens，batch仅右padding。`chunk_size`与`window.generation_tokens`必须同为5。每个sample独立采样generation start，由此得到`H_i`和`F_i`，唯一预算是`H_i+5+F_i<=50`；不再存在独立history上限。`H=0`严格表示true cold start，只允许parent从真实序列第0 token开始，并要求VAE context为0、previous-root无效；中间parent的合法范围从`H=1`开始。`max_horizon_token=45`是future XZ采样上限，而不是固定长度：每个sample从0到扣除`K-1` rollout余量后的真实可用上限均匀采样，并在整次rollout内保持不变；因此K=1的完整cold窗口覆盖0～45，而靠近末端或K更大的窗口自动使用更小上限。`self_forcing`块是全部训练唯一的K课程入口：普通训练显式写成K=1，不再由`enabled`或phase字段切出另一条入口。`cold_start_replay=0.1`在K选择前独立应用于整个训练过程，使用K=1 ideal target并覆盖首次commit全部runtime denoise阶段与动态1–5 token visibility；它不执行前置no-grad solver rollout。K>1阶段会从同一预算预留`K-1`个rollout token，并自动过滤短于`5+K-1` tokens的训练sample。正式baseline使用dense XZ采样；constraint dropout与text dropout保持独立，从而覆盖joint/text/constraint/history四种条件组合。
 
-正式validation的rolling buffer同样固定为40 tokens，使训练parent与训练期部署模拟使用同一容量。独立Web/runtime实验若覆盖其他buffer长度，必须在专用配置和报告中明确标记，不能反向改变40-token训练合同。
+正式validation的rolling buffer同样固定为50 tokens，使训练parent与训练期部署模拟使用同一容量。独立Web/runtime实验若覆盖其他buffer长度，必须在专用配置和报告中明确标记，不能反向改变50-token训练合同。
 
-`k_schedule`的每一行是`[start_global_step,K]`：首行必须为`[0,1]`，step和K必须严格递增，所有stage必须落在`trainer.max_steps`内，`teacher_replay`只为K>1配置。启动入口会拒绝遗留`enabled/phase_start_step/phase_steps`字段，并校验最大K窗口预算。远端`ldf.yaml`使用`[0,1]→[200000,2]→[290000,3]→[350000,5]`；本机`ldf_s5.yaml`与`ldf_multi.yaml`使用`[0,1]→[100000,2]→[200000,5]`。课程只依赖checkpoint恢复的absolute `global_step`，不因修改`trainer.max_steps`倒退或加速。
+`k_schedule`的每一行是`[start_global_step,K]`：首行必须为`[0,1]`，step和K必须严格递增，所有stage必须落在`trainer.max_steps`内，`teacher_replay`只为K>1配置。启动入口会拒绝遗留`enabled/phase_start_step/phase_steps`字段，并校验最大K窗口预算。所有正式配置继承同一`[0,1]→[100000,2]→[200000,3]→[300000,5]`课程；它只依赖checkpoint恢复的absolute `global_step`，不因设备、数据集或路径覆盖而变化。
 
 WandB的key/entity仍由共享环境配置提供，但实验级project由各训练配置所有：`vae*.yaml`显式使用`VAE_Flood`，`ldf*.yaml`显式使用`Floodcontrol`，避免共享路径配置改变某一类实验的冻结recipe。
 
-`configs/ldf.yaml`是远端HumanML3D 8卡resume配置，显式拥有远端dirs、200k LDF checkpoint、远端VAE与500k终止步数；`configs/ldf_s5.yaml`是本机S5单卡HumanML配置；`configs/ldf_multi.yaml`是本机HumanML3D+BABEL配置，并与S5 HumanML配置共享canonical root statistics、VAE physical/latent statistics和模型合同。普通loss validation、dense-XZ/video和完整T2M均可走同一DDP作业。LDF使用EMA并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`。resume同时校验路径、数值statistics与文本内容身份。
+`configs/ldf_base.yaml`是模型、50-token窗口、K课程、loss、optimizer与评测语义的唯一来源；`configs/ldf.yaml`只覆盖远端路径、8卡、batch与worker，`configs/ldf_s5.yaml`只覆盖本机路径、单卡资源和本地评测开关，`configs/ldf_multi.yaml`只覆盖HumanML3D+BABEL数据源与联合文本表。普通loss validation、dense-XZ/video和完整T2M均可走同一DDP作业。LDF使用EMA并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`。resume比较内容身份、数值statistics、模型结构和训练合同，不比较绝对路径，因此同一资产复制到另一服务器仍可恢复。
 
 训练DataLoader内部固定使用20-frame（1秒）长度bucket减少batch右侧padding。这是20 FPS项目合同下的加载实现细节，不改变crop或窗口语义，因此不暴露为正式YAML实验参数。DDP时sampler先构造`per_device_batch_size * world_size`的全局同长度batch，再为每个rank切分自己的per-device batch；不足一个全局batch的bucket会确定性重复少量样本，使所有rank拥有完全相同的step数。validation使用无重复的strided rank shard。由于这两条sampler都由项目显式拥有，Trainer固定`use_distributed_sampler: false`，禁止Lightning再次注入一层DistributedSampler。
 
@@ -98,7 +98,7 @@ canonical root statistics只通过HumanML配置与正式span sampler生成一次
 python -m tools.compute_ldf_root_stats --config configs/ldf_s5.yaml
 ```
 
-工具默认写入HumanML配置的`data.root_stats_path`，复用40-token自然parent窗口、逐样本均匀H、固定5-token active band和相同anchor分布。`ldf_multi.yaml`直接引用同一文件，不再根据BABEL mixture重算或切换归一化尺度。`train_ldf.py`除检查所有外部文件外，还校验40-token总预算、active chunk一致性、XZ horizon上限和两种dropout。若现有`root_stats.npz`是在旧50-token配置下生成，开始新的正式训练前需要按当前配置重新计算。
+工具默认写入HumanML配置的`data.root_stats_path`，读取独立`root_statistics`块中的50-token、C=5、uniform-legal-history anchor与uniform-yaw协议。它不读取cold replay或K schedule，因此这些策略调整不触发重算。`ldf_multi.yaml`直接引用同一文件，不再根据BABEL mixture重算或切换归一化尺度。`train_ldf.py`除检查所有外部文件外，还校验50-token总预算、active chunk一致性、XZ horizon上限、课程和两种dropout。无法确认来源的旧root stats只需按冻结协议重新生成一次。
 
 普通loss validation每1,000 steps运行。teacher-continuation固定覆盖early/middle/late H；self-forcing validation始终使用统一课程`k_schedule`中的最大K，不再维护第二套validation history/K参数。dense XZ每5,000 steps读取`data.test_probe_meta_paths.dense_xz`指定的小型split；远端配置启用T2M，本机S5配置默认关闭。T2M通过`validation.t2m.cfg_mode: nocfg`固定使用joint文本条件的单分支forward，不继承轨迹实验的全局separated CFG；dense XZ仍使用模型全局CFG设置。生成评测支持固定buffer `stream`与真实窗口滚动`rolling`并只使用EMA模型；当前实验配置只启用`stream`，需要同周期比较时可将modes改为`[stream, rolling]`。评测语义、指标和输出目录见[`07_LDF_TRAINING_EVALUATION.md`](07_LDF_TRAINING_EVALUATION.md)。
 

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
-import warnings
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from utils.conditions.ldf import HybridMotion
 from utils.initialize import instantiate_target
@@ -19,16 +20,16 @@ from utils.token_frame import (
 )
 from utils.training.lightning_module import BasicLightningModule
 from utils.training.vae.checkpoint import load_vae_checkpoint
-from utils.training.ldf.batch import anchor_physical_batch
+from utils.training.ldf.steps import anchor_physical_batch
 from utils.training.ldf.conditioning import (
     create_xz_condition,
     sample_constraint_keep_mask,
+    sample_future_horizon_tokens,
     sample_xz_constraint_mask,
 )
 from utils.training.ldf.losses import compute_offpath_loss, compute_velocity_loss
-from utils.training.ldf.self_forcing import (
-    SelfForcingState,
-    run_self_forcing_rollout,
+from utils.training.ldf.solver import run_training_solver
+from utils.training.ldf.window import (
     sample_rollout_steps,
     sample_window_plan,
 )
@@ -75,6 +76,22 @@ def _load_root_statistics(path: str | Path) -> tuple[torch.Tensor, torch.Tensor]
                 raise ValueError("root_std must be positive")
             values.append(value)
     return values[0], values[1]
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).expanduser().open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _plain_config(value):
+    if value is None:
+        return None
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
 
 
 class LDFLightningModule(BasicLightningModule):
@@ -138,6 +155,7 @@ class LDFLightningModule(BasicLightningModule):
             self.model.local_root_std.cpu(), self.vae.local_root_std.cpu()
         ):
             raise RuntimeError("LDF and VAE local-root statistics do not match")
+        self._vae_checkpoint_content_id = _file_sha256(cfg.vae.checkpoint_path)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -350,6 +368,15 @@ class LDFLightningModule(BasicLightningModule):
             apply_dropout=is_training,
         )
         max_horizon_token = int(training_config.get("max_horizon_token", 0))
+        future_horizon_tokens = sample_future_horizon_tokens(
+            token_valid_mask=token_valid,
+            initial_active_end=(
+                plan.initial_history_tokens + plan.active_tokens
+            ),
+            rollout_steps=plan.rollout_steps,
+            max_horizon_token=max_horizon_token,
+            generator=generator,
+        )
         sampling = training_config.get("constraint_sampling") or {}
         constraint_mask = sample_xz_constraint_mask(
             token_valid_mask=token_valid,
@@ -357,7 +384,8 @@ class LDFLightningModule(BasicLightningModule):
             initial_active_end=(
                 plan.initial_history_tokens + plan.active_tokens
             ),
-            max_horizon_token=max_horizon_token,
+            future_horizon_tokens=future_horizon_tokens,
+            rollout_steps=plan.rollout_steps,
             dense_probability=float(sampling.get("dense_probability", 0.5)),
             waypoint_probability=float(
                 sampling.get("waypoint_probability", 0.25)
@@ -376,12 +404,12 @@ class LDFLightningModule(BasicLightningModule):
                 view=view,
                 text_context=contexts,
                 text_null_context=null_contexts,
-                max_horizon_token=max_horizon_token,
+                future_horizon_tokens=future_horizon_tokens,
             )
 
-        result = run_self_forcing_rollout(
+        result = run_training_solver(
             self.model,
-            SelfForcingState(clean_motion),
+            clean_motion,
             plan,
             previous_root_frame=anchored_batch.get("previous_root_frame"),
             previous_root_valid_mask=anchored_batch.get(
@@ -415,22 +443,28 @@ class LDFLightningModule(BasicLightningModule):
         )
 
     def _training_contract(self) -> dict[str, object]:
-        paths = {
-            "vae_checkpoint_path": self.cfg.vae.checkpoint_path,
-            "motion_stats_path": self.cfg.vae.params.motion_stats_path,
-            "latent_stats_path": self.cfg.vae.params.latent_stats_path,
-            "root_stats_path": self.cfg.data.root_stats_path,
-            "text_embeddings_path": self.cfg.data.text_embeddings_path,
-        }
         return {
-            "paths": {
-                name: str(Path(str(path)).expanduser().resolve())
-                for name, path in paths.items()
-            },
+            "vae_checkpoint_content_id": self._vae_checkpoint_content_id,
             "text_embedding_content_id": self.text_embeddings.content_id,
+            "ldf_statistics": {
+                name: getattr(self.model, name).detach().cpu().clone()
+                for name in _LDF_STATISTIC_NAMES
+            },
             "vae_statistics": {
                 name: getattr(self.vae, name).detach().cpu().clone()
                 for name in _VAE_STATISTIC_NAMES
+            },
+            "model": {
+                "target": str(self.cfg.model.target),
+                "params": _plain_config(self.cfg.model.params),
+            },
+            "training": {
+                "window": _plain_config(self.cfg.training.window),
+                "max_horizon_token": int(self.cfg.training.max_horizon_token),
+                "self_forcing": _plain_config(self.cfg.self_forcing),
+                "root_statistics": _plain_config(
+                    self.cfg.get("root_statistics")
+                ),
             },
         }
 
@@ -450,26 +484,31 @@ class LDFLightningModule(BasicLightningModule):
 
         saved_contract = checkpoint.get("ldf_training_contract")
         current_contract = self._training_contract()
-        if saved_contract is None:
-            warnings.warn(
-                "legacy LDF checkpoint has no training contract; only model statistics "
-                "were validated",
-                stacklevel=2,
+        if not isinstance(saved_contract, dict):
+            raise RuntimeError(
+                "LDF resume checkpoint has no frozen training contract; "
+                "old checkpoints cannot be resumed by this training entrypoint"
             )
-        else:
-            if saved_contract.get("paths") != current_contract["paths"]:
-                raise RuntimeError("LDF resume VAE/statistics/text paths do not match")
-            if saved_contract.get("text_embedding_content_id") != current_contract[
-                "text_embedding_content_id"
-            ]:
-                raise RuntimeError("LDF resume text embedding content does not match")
-            saved_statistics = saved_contract.get("vae_statistics", {})
-            for name, current in current_contract["vae_statistics"].items():
+        for identity_name in (
+            "vae_checkpoint_content_id",
+            "text_embedding_content_id",
+        ):
+            if saved_contract.get(identity_name) != current_contract[identity_name]:
+                label = identity_name.removesuffix("_content_id").replace("_", " ")
+                raise RuntimeError(f"LDF resume {label} content does not match")
+        for group_name in ("ldf_statistics", "vae_statistics"):
+            saved_statistics = saved_contract.get(group_name, {})
+            for name, current in current_contract[group_name].items():
                 saved = saved_statistics.get(name)
-                if not torch.is_tensor(saved) or not torch.equal(
-                    saved.cpu(), current
-                ):
-                    raise RuntimeError(f"LDF resume VAE statistics mismatch for {name}")
+                if not torch.is_tensor(saved) or not torch.equal(saved.cpu(), current):
+                    label = "LDF" if group_name == "ldf_statistics" else "VAE"
+                    raise RuntimeError(
+                        f"LDF resume {label} statistics mismatch for {name}"
+                    )
+        if saved_contract.get("model") != current_contract["model"]:
+            raise RuntimeError("LDF resume model structure contract does not match")
+        if saved_contract.get("training") != current_contract["training"]:
+            raise RuntimeError("LDF resume 50-token training contract does not match")
         super().on_load_checkpoint(checkpoint)
         if not torch.equal(
             self.model.local_root_mean.cpu(), self.vae.local_root_mean.cpu()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+
 import numpy as np
 import pytest
 import torch
@@ -8,11 +10,12 @@ from omegaconf import OmegaConf
 from datasets.humanml3d import HumanML3DDataset
 from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import write_statistics
-from utils.conditions.ldf import LDFCondition
-from utils.training.ldf.batch import LDFStepView, anchor_physical_batch
+from utils.conditions.ldf import HybridMotion, LDFCondition, LDFInput
+from utils.training.ldf.steps import LDFStepView, anchor_physical_batch
 from utils.training.ldf.conditioning import (
     create_xz_condition,
     sample_constraint_keep_mask,
+    sample_future_horizon_tokens,
     sample_xz_constraint_mask,
 )
 from utils.training.ldf.losses import compute_velocity_loss
@@ -21,11 +24,8 @@ from utils.training.ldf.lightning_module import (
     LDFLightningModule,
     _create_curriculum_generator,
 )
-from utils.training.ldf.self_forcing import (
-    SelfForcingState,
-    run_self_forcing_rollout,
-    sample_window_plan,
-)
+from utils.training.ldf.solver import run_training_solver
+from utils.training.ldf.window import sample_window_plan
 from utils.training.ldf.text import create_text_embedding_content_id
 
 
@@ -215,7 +215,7 @@ def test_cold_start_replay_bypasses_the_unified_k_curriculum(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(ldf_lightning, "sample_window_plan", record_plan)
-    original_rollout = ldf_lightning.run_self_forcing_rollout
+    original_rollout = ldf_lightning.run_training_solver
 
     def record_rollout(*args, **kwargs):
         seen["cold_denoise_step"] = kwargs.get("cold_denoise_step")
@@ -223,7 +223,7 @@ def test_cold_start_replay_bypasses_the_unified_k_curriculum(
 
     monkeypatch.setattr(
         ldf_lightning,
-        "run_self_forcing_rollout",
+        "run_training_solver",
         record_rollout,
     )
     losses = module._step(batch, is_training=True)
@@ -334,7 +334,8 @@ def test_xz_condition_exposes_only_active_xz_and_post_active_lookahead():
         token_valid_mask=token_valid,
         initial_active_start=torch.tensor([2, 2]),
         initial_active_end=torch.tensor([5, 5]),
-        max_horizon_token=2,
+        future_horizon_tokens=torch.tensor([2, 2]),
+        rollout_steps=1,
         dense_probability=1.0,
         waypoint_probability=0.0,
         goal_probability=0.0,
@@ -348,7 +349,7 @@ def test_xz_condition_exposes_only_active_xz_and_post_active_lookahead():
         view=view,
         text_context=text,
         text_null_context=null,
-        max_horizon_token=2,
+        future_horizon_tokens=torch.tensor([2, 2]),
     )
 
     mask = condition.root_condition_mask
@@ -380,7 +381,8 @@ def test_xz_sampling_supports_dense_waypoints_and_single_future_goal():
         token_valid_mask=valid,
         initial_active_start=torch.tensor([2]),
         initial_active_end=torch.tensor([5]),
-        max_horizon_token=2,
+        future_horizon_tokens=torch.tensor([2]),
+        rollout_steps=1,
         max_waypoint_count=4,
     )
     dense = sample_xz_constraint_mask(
@@ -423,12 +425,105 @@ def test_xz_sampling_supports_dense_waypoints_and_single_future_goal():
         assert not mask[..., 3:].any()
 
 
+def test_future_horizon_sampling_is_uniform_per_sample_and_reserves_rollout():
+    valid = torch.arange(50)[None] < torch.tensor([[50], [30], [12], [9]])
+    active_end = torch.tensor([5, 20, 8, 5])
+    rollout_steps = 5
+    maximum = 45
+    seed = 123
+
+    expected_upper = torch.tensor([41, 6, 0, 0])
+    expected_draws = torch.rand(4, generator=torch.Generator().manual_seed(seed))
+    expected = torch.floor(
+        expected_draws * (expected_upper + 1).to(expected_draws.dtype)
+    ).to(torch.long)
+    sampled = sample_future_horizon_tokens(
+        token_valid_mask=valid,
+        initial_active_end=active_end,
+        rollout_steps=rollout_steps,
+        max_horizon_token=maximum,
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    assert sampled.tolist() == expected.tolist()
+    assert bool((sampled >= 0).all())
+    assert bool((sampled <= expected_upper).all())
+
+    cold = sample_future_horizon_tokens(
+        token_valid_mask=torch.ones(1, 50, dtype=torch.bool),
+        initial_active_end=torch.tensor([5]),
+        rollout_steps=1,
+        max_horizon_token=45,
+        generator=torch.Generator().manual_seed(27),
+    )
+    assert cold.tolist() == [45]
+
+
+def test_xz_condition_supports_mixed_zero_and_nonzero_horizons():
+    root = torch.zeros(2, 8, 4, 5)
+    valid = torch.ones(2, 8, dtype=torch.bool)
+    horizon = torch.tensor([0, 2])
+    constraint_mask = sample_xz_constraint_mask(
+        token_valid_mask=valid,
+        initial_active_start=torch.tensor([2, 2]),
+        initial_active_end=torch.tensor([5, 5]),
+        future_horizon_tokens=horizon,
+        rollout_steps=1,
+        dense_probability=1.0,
+        waypoint_probability=0.0,
+        goal_probability=0.0,
+        max_waypoint_count=4,
+    )
+    view = LDFStepView(
+        step_index=0,
+        history_end=torch.tensor([2, 2]),
+        active_start=torch.tensor([2, 2]),
+        active_end=torch.tensor([5, 5]),
+        frontier_start=torch.tensor([5, 5]),
+        timeline_position_ids=torch.arange(8)[None].expand(2, -1),
+        rope_position_ids=torch.arange(-2, 6)[None].expand(2, -1),
+        beta=torch.zeros(2, 8),
+    )
+    condition = create_xz_condition(
+        clean_root_motion=root,
+        token_valid_mask=valid,
+        constraint_mask=constraint_mask,
+        view=view,
+        text_context=[torch.zeros(1, 8) for _ in range(16)],
+        text_null_context=[torch.zeros(1, 8) for _ in range(2)],
+        future_horizon_tokens=horizon,
+    )
+
+    condition.validate(batch_size=2, token_length=8, latent_dim=3)
+    assert condition.future_horizon_tokens.tolist() == [0, 2]
+    assert not condition.future_valid_mask[0].any()
+    assert condition.future_valid_mask[1].all()
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(
+            torch.zeros(2, 8, 4, 5), torch.zeros(2, 8, 3)
+        ),
+        beta=torch.zeros(2, 8),
+        history_mask=torch.arange(8)[None].expand(2, -1) < 2,
+        generation_mask=(torch.arange(8)[None].expand(2, -1) >= 2)
+        & (torch.arange(8)[None].expand(2, -1) < 5),
+        timeline_position_ids=torch.arange(8)[None].expand(2, -1),
+        rope_position_ids=torch.arange(-2, 6)[None].expand(2, -1),
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=condition,
+    )
+    selected = inputs.future_attention_mask()
+    assert not selected[0].any()
+    assert int(selected[1].sum().item()) == 2
+
+
 def test_goal_sampling_without_future_falls_back_to_one_active_waypoint():
     goal = sample_xz_constraint_mask(
         token_valid_mask=torch.ones(1, 5, dtype=torch.bool),
         initial_active_start=torch.tensor([2]),
         initial_active_end=torch.tensor([5]),
-        max_horizon_token=2,
+        future_horizon_tokens=torch.tensor([0]),
+        rollout_steps=1,
         dense_probability=0.0,
         waypoint_probability=0.0,
         goal_probability=1.0,
@@ -464,7 +559,7 @@ def test_sparse_future_constraints_are_packed_by_absolute_position():
         view=view,
         text_context=[torch.zeros(1, 8) for _ in range(16)],
         text_null_context=[torch.zeros(1, 8) for _ in range(2)],
-        max_horizon_token=3,
+        future_horizon_tokens=torch.tensor([3, 3]),
     )
     assert condition.future_timeline_position_ids.tolist() == [[15, 17], [16, 0]]
     assert condition.future_valid_mask.tolist() == [[True, True], [True, False]]
@@ -537,8 +632,10 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
     assert condition.root_condition_mask[:, 0, :, 0].all()
     assert condition.root_condition_mask[:, 0, :, 2].all()
     assert not condition.root_condition_mask[:, 0, :, 1].any()
-    assert condition.future_valid_mask.tolist() == [[True]]
-    assert condition.future_timeline_position_ids.tolist() == [[1]]
+    # Per-sample horizon sampling includes zero. This deterministic batch draws
+    # zero, so visible active XZ remains while no future query is constructed.
+    assert condition.future_valid_mask is None
+    assert condition.future_timeline_position_ids is None
     losses["total"].backward()
     assert any(parameter.grad is not None for parameter in module.model.parameters())
     assert not any(parameter.grad is not None for parameter in module.vae.parameters())
@@ -579,11 +676,12 @@ def test_validation_plan_and_noise_are_repeatable_with_fixed_generator(tmp_path)
 
 
 def test_ldf_resume_rejects_statistics_before_overwriting_model(tmp_path):
-    module = LDFLightningModule(_make_config(tmp_path / "source"))
+    cfg = _make_config(tmp_path / "source")
+    module = LDFLightningModule(cfg)
     checkpoint = {}
     module.on_save_checkpoint(checkpoint)
 
-    resumed = LDFLightningModule(_make_config(tmp_path / "source"))
+    resumed = LDFLightningModule(cfg)
     resumed.on_load_checkpoint(checkpoint)
     original = resumed.model.root_mean.clone()
 
@@ -596,12 +694,13 @@ def test_ldf_resume_rejects_statistics_before_overwriting_model(tmp_path):
 
 
 def test_ldf_resume_rejects_changed_vae_statistics_contract(tmp_path):
-    module = LDFLightningModule(_make_config(tmp_path))
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
     checkpoint = {}
     module.on_save_checkpoint(checkpoint)
     checkpoint["ldf_training_contract"]["vae_statistics"]["latent_mean"] += 1
 
-    resumed = LDFLightningModule(_make_config(tmp_path))
+    resumed = LDFLightningModule(cfg)
     with pytest.raises(RuntimeError, match="VAE statistics mismatch for latent_mean"):
         resumed.on_load_checkpoint(checkpoint)
 
@@ -623,6 +722,42 @@ def test_ldf_resume_rejects_changed_text_embedding_at_the_same_path(tmp_path):
     resumed = LDFLightningModule(cfg)
     with pytest.raises(RuntimeError, match="text embedding content"):
         resumed.on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_rejects_checkpoint_without_frozen_contract(tmp_path):
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+    checkpoint.pop("ldf_training_contract")
+
+    with pytest.raises(RuntimeError, match="no frozen training contract"):
+        LDFLightningModule(cfg).on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_accepts_identical_assets_at_different_paths(tmp_path):
+    source_cfg = _make_config(tmp_path / "source")
+    source = LDFLightningModule(source_cfg)
+    checkpoint = {}
+    source.on_save_checkpoint(checkpoint)
+
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    target_cfg = OmegaConf.create(OmegaConf.to_container(source_cfg, resolve=True))
+    copies = {
+        "vae.checkpoint_path": "vae.ckpt",
+        "vae.params.motion_stats_path": "motion_stats.npz",
+        "vae.params.latent_stats_path": "latent_stats.npz",
+        "data.root_stats_path": "root_stats.npz",
+        "data.text_embeddings_path": "text_embeddings.pt",
+    }
+    for key, filename in copies.items():
+        source_path = OmegaConf.select(target_cfg, key)
+        target_path = target_root / filename
+        shutil.copyfile(source_path, target_path)
+        OmegaConf.update(target_cfg, key, str(target_path))
+
+    LDFLightningModule(target_cfg).on_load_checkpoint(checkpoint)
 
 
 def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
@@ -679,9 +814,9 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
             text_null_context=[null],
         )
 
-    result = run_self_forcing_rollout(
+    result = run_training_solver(
         module.model,
-        SelfForcingState(clean_motion),
+        clean_motion,
         plan,
         previous_root_frame=anchored["previous_root_frame"],
         previous_root_valid_mask=anchored["previous_root_valid_mask"],

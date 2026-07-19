@@ -242,6 +242,27 @@ def _validate_statistics(
     }
 
 
+def _validate_root_statistics(path: Path, cfg) -> dict[str, object]:
+    details = _validate_statistics(path, ROOT_STATISTIC_SHAPES)
+    with np.load(path, allow_pickle=False) as values:
+        if "metadata" not in values:
+            raise ValueError("root statistics have no frozen sampling metadata")
+        metadata = json.loads(str(np.asarray(values["metadata"]).item()))
+    expected = {
+        "window_tokens": int(cfg.root_statistics.window_tokens),
+        "generation_tokens": int(cfg.root_statistics.generation_tokens),
+        "anchor_sampling": str(cfg.root_statistics.anchor_sampling),
+        "random_yaw": bool(cfg.root_statistics.random_yaw),
+        "windows_per_sample": int(cfg.root_statistics.windows_per_sample),
+    }
+    if metadata != expected:
+        raise ValueError(
+            f"root statistics contract mismatch: saved={metadata}, expected={expected}"
+        )
+    details["sampling"] = metadata
+    return details
+
+
 def _validate_t5(path: Path, config: str, paths: AssetPaths) -> dict[str, object]:
     cfg = load_config(config, _overrides(paths))
     table = TextEmbeddingLookup(
@@ -402,23 +423,23 @@ def _prepare_statistics(args, paths: AssetPaths, report: PreparationReport) -> N
         "--min-frames",
         str(cfg.data.min_frames),
         "--max-frames",
-        str(cfg.data.max_frames),
+        str(int(cfg.root_statistics.window_tokens) * 4),
         "--windows-per-sample",
-        str(args.root_windows_per_sample),
+        str(cfg.root_statistics.windows_per_sample),
         "--active-tokens",
-        str(cfg.model.params.chunk_size),
+        str(cfg.root_statistics.generation_tokens),
         "--seed",
         str(args.root_seed),
     ]
     _stage(
         report,
         "ldf_root_statistics",
-        validate=lambda: _validate_statistics(paths.root_stats, ROOT_STATISTIC_SHAPES),
+        validate=lambda: _validate_root_statistics(paths.root_stats, cfg),
         action=lambda: _run_atomic(
             root_command,
             output=paths.root_stats,
             pending=pending,
-            validate=lambda value: _validate_statistics(value, ROOT_STATISTIC_SHAPES),
+            validate=lambda value: _validate_root_statistics(value, cfg),
         ),
         force=args.force,
     )
@@ -601,6 +622,7 @@ def _verify(
     *,
     latent_stats: Path | None,
 ) -> dict[str, object]:
+    cfg = load_config(args.ldf_config, _overrides(paths))
     details: dict[str, object] = {
         "humanml": _validate_dataset(paths.humanml, ("train", "val", "test")),
         "babel": _validate_dataset(paths.babel, ("train", "val")),
@@ -610,7 +632,7 @@ def _verify(
         "multi_motion_stats": _validate_statistics(
             paths.multi_stats, MOTION_STATISTIC_SHAPES
         ),
-        "root_stats": _validate_statistics(paths.root_stats, ROOT_STATISTIC_SHAPES),
+        "root_stats": _validate_root_statistics(paths.root_stats, cfg),
     }
     if not args.skip_t5:
         details["humanml_t5"] = _validate_t5(paths.humanml_t5, args.ldf_config, paths)
@@ -676,7 +698,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--min-frames", type=int, default=20)
-    parser.add_argument("--root-windows-per-sample", type=int, default=1)
     parser.add_argument("--root-seed", type=int, default=1234)
     parser.add_argument("--t5-devices", default="0")
     parser.add_argument("--t5-batch-size", type=int, default=4)
@@ -695,7 +716,6 @@ def main(argv: list[str] | None = None) -> None:
     for name in (
         "workers",
         "min_frames",
-        "root_windows_per_sample",
         "t5_batch_size",
         "latent_batch_size",
     ):

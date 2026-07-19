@@ -44,18 +44,18 @@ L_latent_body_flow_v
 
 ## 已实现的scaled-ARDY窗口训练内核
 
-- 每个sample保留自己的自然parent长度`N_i=min(sample_tokens,40)`；长动作随机裁一个40-token/160-frame父窗口，短动作不人为缩短。batch只在右侧padding，因此真实长度由`span_token_count[B]`表达。
-- active band固定为`C=chunk_size=5`。普通batch的每个sample独立均匀采样`H_i∈[1,N_i-C]`，并令`F_i=N_i-H_i-C`；只有显式cold-start ideal replay使用`H_i=0`。唯一预算为`H_i+C+F_i<=40`，不再分别截断history与future。K-step self-forcing时额外保留`R=K-1`，采样上界变为`N_i-C-R`。
+- 每个sample保留自己的自然parent长度`N_i=min(sample_tokens,50)`；长动作随机裁一个50-token/200-frame父窗口，短动作不人为缩短。batch只在右侧padding，因此真实长度由`span_token_count[B]`表达。
+- active band固定为`C=chunk_size=5`。普通batch的每个sample独立均匀采样`H_i∈[1,N_i-C]`，并令`F_i=N_i-H_i-C`；只有显式cold-start ideal replay使用`H_i=0`。唯一预算为`H_i+C+F_i<=50`，不再分别截断history与future。K-step self-forcing时额外保留`R=K-1`，采样上界变为`N_i-C-R`。
 - 第`i`步使用`history=[0,H+i)`、`active=[H+i,H+i+5)`、`frontier=[H+i+5,S)`。persistent noisy state仍保存完整S和固定frontier noise，但Transformer只接收`history+active`有效前缀；尚未开始更新的pure-noise frontier不进入self-attention。它与span外future-root condition token仍是两类对象。
 - K=1 ideal baseline只采样一次per-sample continuous phase和absolute-token root/body Gaussian noise，并用`x_beta=(1-beta)x0+beta*epsilon`及`v*=x0-epsilon`训练当前active band；该路径保持原有输入、随机分布和MSE不变。
 - K>1表示实际rollout并commit的token数，不表示denoise step数。persistent rollout从runtime commit boundary开始，只在起点调用一次`mix_fixed_noise()`，此后root与latent noisy state都通过共享`LDF.denoise_step()`的Euler更新持续演化，不再为下一commit重建理想`x_beta`。
 - 每个commit只编译一次text/XZ condition；事务内全部denoise steps共享同一condition。前K-1个commit以及最终commit除最后一次denoise step外全部在`torch.no_grad()`中运行，只有最后一次denoise step保留梯度。
 - 每次训练commit后把预测token detach为history，并以其最后一帧physical XZ执行与runtime相同的`(1-beta)`root state rebase；clean GT root、generated history、previous-root boundary和future XZ condition一起换到新model origin，latent与fixed Gaussian source保持不变。
 - persistent rollout要求至少一个真实history token，因为cold-start首个commit从全噪声状态开始，需要完整`noise_steps`次更新，而稳态commit只需要`noise_steps/chunk_size`次更新。显式cold-start ideal replay单独覆盖真实序列起点，不要求稳态history；统一课程会按最大K把训练Dataset过滤到至少`C+K`个token，保证普通`H>=1`窗口仍有足够frontier完成K次commit。
-- `self_forcing`是K=1 baseline与K>1 persistent rollout的统一课程入口，不存在独立enable或phase开关；`k_schedule`直接写成`[absolute_global_step,K]`并强制从`[0,1]`开始。远端500k resume配置在0/200k/290k/350k分别进入K=1/2/3/5，等价保留旧200k起点、300k phase和0/0.3/0.5阈值，但后续修改`max_steps`不会重标定课程；本机S5的300k配置在0/100k/200k进入K=1/2/5。`cold_start_replay=0.1`在选择当前K之前独立采样，因此从第0步到训练结束，每个阶段都有10% global batch被强制改为真实序列起点的`H=0,K=1` ideal训练；其余batch遵循当前K及其teacher replay。每个cold样本均匀采样`denoise_step∈{0,...,noise_steps-1}`，通过runtime同一个`triangular_beta()`得到当前与下一beta，并复用runtime visibility公式；在正式`noise_steps=10,chunk_size=5`下，可见motion token按`1,1,2,2,3,3,4,4,5,5`扩展。noisy state仍一次性按理想bridge构造，target仍为`x0-epsilon`，因此每个cold batch只有一次forward而不是10步solver rollout。完整off-path cold solver replay保留为后续消融。
+- `self_forcing`是K=1 baseline与K>1 persistent rollout的统一课程入口，不存在独立enable或phase开关；`k_schedule`直接写成`[absolute_global_step,K]`并固定在0/100k/200k/300k进入K=1/2/3/5。`cold_start_replay=0.1`在选择当前K之前独立采样，因此从第0步到训练结束，每个阶段都有10% global batch被强制改为真实序列起点的`H=0,K=1` ideal训练；其余batch遵循当前K及其teacher replay。每个cold样本均匀采样`denoise_step∈{0,...,noise_steps-1}`，通过runtime同一个`triangular_beta()`得到当前与下一beta，并复用runtime visibility公式；在正式`noise_steps=10,chunk_size=5`下，可见motion token按`1,1,2,2,3,3,4,4,5,5`扩展。noisy state仍一次性按理想bridge构造，target仍为`x0-epsilon`，因此每个cold batch只有一次forward而不是10步solver rollout。完整off-path cold solver replay保留为后续消融。
 - K、teacher-replay与是否进入cold-start replay都是global-batch决策：K使用只依赖`seed/global_step`的CPU RNG；cold replay使用batch sampler提供的跨rank一致seed。具体cold denoise step与root/body noise、H、yaw和constraint一样使用rank-local RNG，因为它们不改变计算图或collective顺序。Ideal与rollout路径始终返回相同且顺序固定的loss metric键，未启用的指标显式记零，避免不同rank的标量日志collective与梯度bucket错位。
 
-训练实现分为`flow.py`的flow/endpoint代数、`batch.py`的ideal与arbitrary-state输入合同、`self_forcing.py`的K curriculum/window plan、`rollout.py`的persistent denoise/commit/rebase循环，以及`losses.py`的ideal flow-v与off-path endpoint reduction。训练与runtime共同调用`LDF.denoise_step()`，因此root/body beta、`delta_beta`和Euler更新只有一个实现；buffer rolling仍只属于runtime。数据内容合同由CPU collator在构造时保证；GPU热路径只保留shape/dtype检查，完整plan/input内容校验仅按debug周期抽查，不能在每个denoise step重复同步。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ；冻结UMT5只在训练前运行一次并生成caption-to-embedding table，训练热路径按prompt字符串lookup token-aligned context，不在LDF GPU上加载11GB文本编码器。LDF checkpoint只保存LDF/EMA，但附带VAE/statistics/text路径与VAE统计用于resume前校验。
+训练实现分为`flow.py`的flow/endpoint代数、`steps.py`的ideal/cold/arbitrary-state输入合同、`window.py`的K curriculum/window plan、`solver.py`的K=1/cold/persistent denoise-commit-rebase流程，以及`losses.py`的ideal flow-v与off-path endpoint reduction。训练与runtime共同调用`LDF.create_input()/denoise_step()/commit_step()`，因此visibility、root/body beta、Euler更新、heading投影和rebase只有一个实现；buffer rolling仍只属于runtime。数据内容合同由CPU collator在构造时保证；GPU热路径只保留shape/dtype检查，完整plan/input内容校验仅在debug与测试执行。`LDFLightningModule`通过冻结EMA VAE的`tokenize_window()`在线得到deterministic normalized μ；冻结UMT5只在训练前运行一次并生成caption-to-embedding table，训练热路径按prompt字符串lookup token-aligned context，不在LDF GPU上加载11GB文本编码器。LDF checkpoint只保存LDF/EMA，并比较VAE checkpoint内容、text table内容、root/local/latent statistics、模型结构和50-token训练合同，不比较绝对路径。
 
 K>1最终denoise step不继续使用只对ideal bridge成立的`x0-epsilon`target，而是在实际solver state上恢复：
 
@@ -75,18 +75,18 @@ Validation整轮只在开始时把EMA shadow换入模型一次，所有loss prob
 每个rollout先从translation-anchored、random-yaw增强后的clean normalized root采样一次absolute XZ约束计划；teacher/self-forcing所有step复用这份计划，再按当前active窗口将其编译为两类只读条件。约束只包含XZ，不暴露root y或heading。
 
 ```text
-dense trajectory（50%）:
+dense trajectory（正式baseline为100%）:
     从首个active token开始标记动态future范围内的所有真实帧XZ
 
-sparse waypoints（25%）:
+sparse waypoints（当前正式baseline关闭，保留为消融）:
     在active + future lookahead内随机标记1–4个独立帧XZ
 
-future goal（25%）:
+future goal（当前正式baseline关闭，保留为消融）:
     active约束为空，只标记一个严格位于首个active band之后的未来帧XZ
     样本没有真实future frame时退化为一个active waypoint
 ```
 
-稀疏性在`[B,T,4,5]`的frame维采样，不会因选择一个token而自动暴露该token全部四帧。每个commit从`active_start+1`到`active_end+max_horizon_token`编译一次按absolute timeline position压紧的候选superset；每个denoise microstep再以`history_mask | generation_mask`的真实可见末端为边界，保留其后最多`max_horizon_token`范围内的候选。这样cold start中尚未可见的active XZ会先作为future条件，成为motion query后立即从future attention视图移除，同一absolute token不会扮演两种query。goal随self-forcing窗口前移会自然从future候选变为active内约束，不会重新采样。lookahead只使用当前sample/span内真实有效token；短span末尾自然缩短，不用零值冒充未来轨迹。future value在进入projection前按feature mask清零，因此未观测的root y与heading不能泄露给Root Stage。Body Stage不读取raw active/future XZ，只读取Root Stage组合后的唯一clean root派生的local root和heading condition。
+稀疏性在`[B,T,4,5]`的frame维采样，不会因选择一个token而自动暴露该token全部四帧。`max_horizon_token`只是训练上限；每个sample独立从`[0,min(max_horizon_token,真实可用future)]`均匀采样一个`future_horizon_tokens[B]`，并在整次K-step rollout内冻结。真实可用future在采样前扣除`K-1`个rollout位置，因此后续commit不会把10-token lookahead逐步缩成6。absolute约束计划额外覆盖`K-1`次active后移；每个commit再从`active_start+1`到`active_end+sampled_horizon`编译按absolute timeline position压紧的候选superset。每个denoise microstep以`history_mask | generation_mask`的真实可见末端为边界，只保留其后至多该sample所采horizon范围内的候选。这样cold start中尚未可见的active XZ会先作为future条件，成为motion query后立即从future attention视图移除，同一absolute token不会扮演两种query。horizon为0只关闭not-yet-visible future读取，当前可见motion上的XZ仍然存在；constraint dropout才会同时删除current/future XZ。goal随self-forcing窗口前移会自然从future候选变为active内约束，不会重新采样。lookahead只使用当前sample/span内真实有效token，不用零值冒充未来轨迹。future value在进入projection前按feature mask清零，因此未观测的root y与heading不能泄露给Root Stage。Body Stage不读取raw active/future XZ，只读取Root Stage组合后的唯一clean root派生的local root和heading condition。
 
 训练以sample为单位分别采样text keep/drop与constraint keep/drop，两个Bernoulli变量相互独立，并在同一个self-forcing rollout的所有step复用同一constraint决定。这使单分支训练自然覆盖history-only、text-only、constraint-only和joint四种分布；推理时`create_cfg_condition()`再显式构造对应分支并进行separated CFG。当前正式配置为：
 
@@ -95,14 +95,14 @@ training:
   text_dropout: 0.1
   constraint_dropout: 0.1
   window:
-    max_tokens: 40
+    max_tokens: 50
     generation_tokens: 5
     sampling: random_generation_start
-  max_horizon_token: 35
+  max_horizon_token: 45
   constraint_sampling:
-    dense_probability: 0.5
-    waypoint_probability: 0.25
-    goal_probability: 0.25
+    dense_probability: 1.0
+    waypoint_probability: 0.0
+    goal_probability: 0.0
     max_waypoint_count: 4
 ```
 

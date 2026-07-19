@@ -8,8 +8,6 @@ Root/Body transformers.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
-
 import torch
 
 from utils.motion_process import LOCAL_ROOT_DIM, ROOT_DIM
@@ -17,8 +15,6 @@ from utils.token_frame import (
     FRAMES_PER_TOKEN,
     frame_count_to_token_count,
     require_aligned_frame_count,
-    token_count_to_frame_count,
-    token_index_to_frame_start,
 )
 
 
@@ -233,121 +229,29 @@ class LDFCondition:
             token_length=token_length,
             latent_dim=latent_dim,
         )
-        if not isinstance(self.text_context, list) or not isinstance(
-            self.text_null_context, list
-        ):
-            raise TypeError("text_context and text_null_context must be lists")
-        text_features = self.text_context + self.text_null_context
-        text_dim = None
         finite_checked: set[int] = set()
-        for index, value in enumerate(text_features):
-            if not torch.is_tensor(value) or value.ndim != 2:
-                raise ValueError(
-                    f"text context {index} must be a rank-2 tensor [L,C]"
-                )
-            if not value.is_floating_point():
-                raise ValueError("text contexts must contain floating-point values")
+        for value in self.text_context + self.text_null_context:
             identity = id(value)
             if identity not in finite_checked:
                 if not bool(torch.isfinite(value).all()):
                     raise ValueError("text contexts must contain finite values")
                 finite_checked.add(identity)
-            if value.shape[0] <= 0 or value.shape[1] <= 0:
-                raise ValueError("text contexts must have positive sequence and feature sizes")
-            if text_dim is None:
-                text_dim = int(value.shape[1])
-            elif value.shape[1] != text_dim:
-                raise ValueError("all text contexts must share one feature dimension")
-        if batch_size is not None:
-            if token_length is None:
-                raise ValueError(
-                    "token_length is required when validating conditional text"
-                )
-            expected_text_length = batch_size * token_length
-            if len(self.text_context) != expected_text_length:
-                raise ValueError(
-                    "text_context must contain one tensor per motion token: "
-                    f"expected B*T={expected_text_length}, got {len(self.text_context)}"
-                )
-            if len(self.text_null_context) != batch_size:
-                raise ValueError("text_null_context must contain one tensor per sample")
 
-        _check_pair(
-            "root_condition", self.root_condition_value, self.root_condition_mask
-        )
-        _check_pair(
-            "body_condition", self.body_condition_value, self.body_condition_mask
-        )
-        _check_pair(
-            "future_root_condition",
-            self.future_root_condition_value,
-            self.future_root_condition_mask,
-        )
+        for name, value in (
+            ("root_condition_value", self.root_condition_value),
+            ("body_condition_value", self.body_condition_value),
+            ("future_root_condition_value", self.future_root_condition_value),
+        ):
+            if value is not None and not bool(torch.isfinite(value).all()):
+                raise ValueError(f"{name} must contain finite values")
 
         if self.root_condition_value is not None:
-            _require_tensor("root_condition_value", self.root_condition_value, 4)
-            if tuple(self.root_condition_value.shape[2:]) != (
-                FRAMES_PER_TOKEN,
-                ROOT_DIM,
-            ):
-                raise ValueError("root_condition_value must be [B,T,4,5]")
-            if token_length is not None and self.root_condition_value.shape[1] != token_length:
-                raise ValueError("root_condition token length does not match LDF input")
             heading_mask = self.root_condition_mask[..., 3:5]
             if bool((heading_mask[..., 0] != heading_mask[..., 1]).any()):
                 raise ValueError("heading cos/sin constraints must always be masked together")
-
-        if self.body_condition_value is not None:
-            _require_tensor("body_condition_value", self.body_condition_value, 3)
-            if token_length is not None and self.body_condition_value.shape[1] != token_length:
-                raise ValueError("body_condition token length does not match LDF input")
-            if latent_dim is not None and self.body_condition_value.shape[-1] != latent_dim:
-                raise ValueError("body_condition feature dimension does not match latent_motion")
-
-        future_fields = (
-            self.future_root_condition_value,
-            self.future_root_condition_mask,
-            self.future_timeline_position_ids,
-            self.future_valid_mask,
-            self.future_horizon_tokens,
-        )
-        if any(value is not None for value in future_fields) and not all(
-            value is not None for value in future_fields
-        ):
-            raise ValueError("all future root fields must be supplied together")
         if self.future_root_condition_value is not None:
-            _require_tensor(
-                "future_root_condition_value", self.future_root_condition_value, 4
-            )
-            _require_tensor(
-                "future_timeline_position_ids",
-                self.future_timeline_position_ids,
-                2,
-            )
-            _require_tensor("future_valid_mask", self.future_valid_mask, 2)
-            _require_tensor(
-                "future_horizon_tokens", self.future_horizon_tokens, 1
-            )
-            if tuple(self.future_root_condition_value.shape[2:]) != (
-                FRAMES_PER_TOKEN,
-                ROOT_DIM,
-            ):
-                raise ValueError("future_root_condition_value must be [B,N,4,5]")
-            prefix = tuple(self.future_root_condition_value.shape[:2])
-            if tuple(self.future_timeline_position_ids.shape) != prefix or tuple(
-                self.future_valid_mask.shape
-            ) != prefix:
-                raise ValueError("future root fields must share [B,N]")
-            if tuple(self.future_horizon_tokens.shape) != (prefix[0],):
-                raise ValueError("future_horizon_tokens must be [B]")
-            if self.future_timeline_position_ids.dtype != torch.long:
-                raise TypeError("future_timeline_position_ids must be int64")
-            if self.future_valid_mask.dtype != torch.bool:
-                raise TypeError("future_valid_mask must be bool")
-            if self.future_horizon_tokens.dtype != torch.long:
-                raise TypeError("future_horizon_tokens must be int64")
-            if bool((self.future_horizon_tokens <= 0).any()):
-                raise ValueError("future_horizon_tokens must be positive")
+            if bool((self.future_horizon_tokens < 0).any()):
+                raise ValueError("future_horizon_tokens must be non-negative")
             if not _is_prefix_mask(self.future_valid_mask):
                 raise ValueError("future_valid_mask must be prefix-valid for packed attention")
             mask_valid = self.future_root_condition_mask.flatten(2).any(dim=-1)
@@ -431,22 +335,14 @@ class LDFInput:
 
     def validate(self) -> None:
         self.validate_structure()
-        self.noisy_motion.validate()
         batch, tokens = self.noisy_motion.root_motion.shape[:2]
-        for name, value, dtype in (
-            ("beta", self.beta, None),
-            ("history_mask", self.history_mask, torch.bool),
-            ("generation_mask", self.generation_mask, torch.bool),
-            ("timeline_position_ids", self.timeline_position_ids, torch.long),
-            ("rope_position_ids", self.rope_position_ids, torch.long),
+        for name, value in (
+            ("root_motion", self.noisy_motion.root_motion),
+            ("latent_motion", self.noisy_motion.latent_motion),
+            ("beta", self.beta),
         ):
-            _require_tensor(name, value, 2)
-            if tuple(value.shape) != (batch, tokens):
-                raise ValueError(f"{name} must be [B,T]")
-            if dtype is not None and value.dtype != dtype:
-                raise TypeError(f"{name} must have dtype {dtype}")
-        if not self.beta.is_floating_point():
-            raise TypeError("beta must be floating point")
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(f"{name} must contain finite values")
         if bool(((self.beta < 0) | (self.beta > 1)).any()):
             raise ValueError("beta must lie in [0,1]")
         if bool((self.history_mask & self.generation_mask).any()):
@@ -477,23 +373,9 @@ class LDFInput:
             ).squeeze(1)
             if bool((first_generation_rope[has_generation] != 0).any()):
                 raise ValueError("the first generation token must have RoPE position 0")
-        if (self.previous_root_frame is None) != (
-            self.previous_root_valid_mask is None
-        ):
-            raise ValueError(
-                "previous_root_frame and previous_root_valid_mask must both be set or both be None"
-            )
         if self.previous_root_frame is not None:
-            _require_tensor("previous_root_frame", self.previous_root_frame, 2)
-            if tuple(self.previous_root_frame.shape) != (batch, ROOT_DIM):
-                raise ValueError("previous_root_frame must be [B,5]")
-            _require_tensor(
-                "previous_root_valid_mask", self.previous_root_valid_mask, 1
-            )
-            if tuple(self.previous_root_valid_mask.shape) != (batch,):
-                raise ValueError("previous_root_valid_mask must be [B]")
-            if self.previous_root_valid_mask.dtype != torch.bool:
-                raise TypeError("previous_root_valid_mask must be bool")
+            if not bool(torch.isfinite(self.previous_root_frame).all()):
+                raise ValueError("previous_root_frame must contain finite values")
         self.condition.validate(
             batch_size=batch,
             token_length=tokens,
@@ -611,95 +493,6 @@ def unnormalize_features(
     return values * std.to(values) + mean.to(values)
 
 
-def _slice_and_pad(
-    value: torch.Tensor | None,
-    start: int,
-    length: int,
-) -> torch.Tensor | None:
-    if value is None:
-        return None
-    sliced = value[:, start : start + length]
-    missing = length - sliced.shape[1]
-    if missing > 0:
-        sliced = torch.cat(
-            [sliced, sliced.new_zeros(sliced.shape[0], missing, *sliced.shape[2:])],
-            dim=1,
-        )
-    return sliced
-
-
-def create_window_condition(
-    *,
-    text_context: list[torch.Tensor],
-    text_null_context: list[torch.Tensor],
-    window_origin: int,
-    window_tokens: int,
-    future_tokens: int = 0,
-    root_condition_value: torch.Tensor | None = None,
-    root_condition_mask: torch.Tensor | None = None,
-    body_condition_value: torch.Tensor | None = None,
-    body_condition_mask: torch.Tensor | None = None,
-) -> dict[str, Any]:
-    """Slice dense absolute condition timelines to one active token window."""
-    if window_origin < 0 or window_tokens <= 0 or future_tokens < 0:
-        raise ValueError("invalid window bounds")
-    _check_pair("root_condition", root_condition_value, root_condition_mask)
-    _check_pair("body_condition", body_condition_value, body_condition_mask)
-    frame_start = token_index_to_frame_start(window_origin)
-    frame_count = token_count_to_frame_count(window_tokens)
-    future_start = frame_start + frame_count
-    future_count = token_count_to_frame_count(future_tokens)
-    batch_size = len(text_null_context)
-    if batch_size <= 0:
-        raise ValueError("text_null_context must contain one tensor per sample")
-    if len(text_context) % batch_size:
-        raise ValueError("token text timeline length must be divisible by batch size")
-    absolute_tokens = len(text_context) // batch_size
-    if absolute_tokens <= 0:
-        raise ValueError("token text timeline cannot be empty")
-    window_text: list[torch.Tensor] = []
-    for batch_index in range(batch_size):
-        row = text_context[
-            batch_index * absolute_tokens : (batch_index + 1) * absolute_tokens
-        ]
-        selected = list(row[window_origin : window_origin + window_tokens])
-        selected.extend(
-            [text_null_context[batch_index]] * (window_tokens - len(selected))
-        )
-        window_text.extend(selected)
-    return {
-        "text_context": window_text,
-        "text_null_context": list(text_null_context),
-        "root_condition_value": _slice_and_pad(
-            root_condition_value, frame_start, frame_count
-        ),
-        "root_condition_mask": _slice_and_pad(
-            root_condition_mask, frame_start, frame_count
-        ),
-        "body_condition_value": _slice_and_pad(
-            body_condition_value, window_origin, window_tokens
-        ),
-        "body_condition_mask": _slice_and_pad(
-            body_condition_mask, window_origin, window_tokens
-        ),
-        "future_root_condition_value": _slice_and_pad(
-            root_condition_value, future_start, future_count
-        ),
-        "future_root_condition_mask": _slice_and_pad(
-            root_condition_mask, future_start, future_count
-        ),
-        "future_timeline_position_ids": torch.arange(
-            window_origin + window_tokens,
-            window_origin + window_tokens + future_tokens,
-            device=(root_condition_value.device if root_condition_value is not None else None),
-            dtype=torch.long,
-        ),
-        "future_horizon_tokens": torch.full(
-            (batch_size,), future_tokens, dtype=torch.long
-        ),
-    }
-
-
 def _root_to_tokens(value: torch.Tensor | None) -> torch.Tensor | None:
     if value is None:
         return None
@@ -712,14 +505,48 @@ def _root_to_tokens(value: torch.Tensor | None) -> torch.Tensor | None:
     return value.reshape(value.shape[0], tokens, FRAMES_PER_TOKEN, ROOT_DIM)
 
 
-def create_ldf_condition(window_condition: Mapping[str, Any]) -> LDFCondition:
-    """Compile a window mapping into the strict model-facing condition."""
-    root_value = _root_to_tokens(window_condition.get("root_condition_value"))
-    root_mask = _root_to_tokens(window_condition.get("root_condition_mask"))
-    future_value = _root_to_tokens(
-        window_condition.get("future_root_condition_value")
+def create_ldf_condition(
+    *,
+    text_context: list[torch.Tensor],
+    text_null_context: list[torch.Tensor],
+    root_condition_value: torch.Tensor | None = None,
+    root_condition_mask: torch.Tensor | None = None,
+    body_condition_value: torch.Tensor | None = None,
+    body_condition_mask: torch.Tensor | None = None,
+    future_root_condition_value: torch.Tensor | None = None,
+    future_root_condition_mask: torch.Tensor | None = None,
+    future_timeline_position_ids: torch.Tensor | None = None,
+    future_horizon_tokens: torch.Tensor | int | None = None,
+) -> LDFCondition:
+    """Compile source-specific candidates into the sole model-facing condition.
+
+    Training supplies sampled tensors and runtime supplies route/observation
+    tensors, but both cross the same shape conversion and future packing
+    boundary here.  Dynamic Future is intentionally not inferred from a fixed
+    window end; callers provide an absolute candidate superset and
+    :class:`LDFInput` decides which candidates remain beyond visible motion.
+    """
+
+    _check_pair("root_condition", root_condition_value, root_condition_mask)
+    _check_pair("body_condition", body_condition_value, body_condition_mask)
+    _check_pair(
+        "future_root_condition",
+        future_root_condition_value,
+        future_root_condition_mask,
     )
-    future_mask = _root_to_tokens(window_condition.get("future_root_condition_mask"))
+    batch_size = len(text_null_context)
+    if batch_size <= 0:
+        raise ValueError("text_null_context must contain one tensor per sample")
+    if len(text_context) == 0 or len(text_context) % batch_size:
+        raise ValueError("text_context must contain a non-empty B*T timeline")
+    token_length = len(text_context) // batch_size
+
+    root_value = _root_to_tokens(root_condition_value)
+    root_mask = _root_to_tokens(root_condition_mask)
+    future_value = _root_to_tokens(future_root_condition_value)
+    future_mask = _root_to_tokens(future_root_condition_mask)
+    raw_future_positions = future_timeline_position_ids
+    raw_future_horizon = future_horizon_tokens
     if future_value is not None and future_value.shape[1] == 0:
         future_value = None
         future_mask = None
@@ -727,38 +554,60 @@ def create_ldf_condition(window_condition: Mapping[str, Any]) -> LDFCondition:
     future_timeline_position_ids = None
     if future_value is not None:
         future_valid = future_mask.flatten(2).any(dim=-1)
-        # Pack valid future tokens to the left, keeping value/mask/position aligned.
-        raw_pos = window_condition.get("future_timeline_position_ids")
-        if raw_pos is None:
-            raw_pos = torch.arange(
-                future_value.shape[1], device=future_value.device, dtype=torch.long
+        packed_tokens = int(future_valid.sum(dim=1).max().item())
+        if packed_tokens == 0:
+            future_value = future_mask = future_valid = None
+        else:
+            # Pack valid future tokens to a compact prefix while preserving
+            # value/mask/absolute-position alignment.
+            raw_pos = raw_future_positions
+            if raw_pos is None:
+                raise ValueError(
+                    "future_timeline_position_ids is required with future root conditions"
+                )
+            raw_pos = torch.as_tensor(
+                raw_pos,
+                device=future_value.device,
+                dtype=torch.long,
             )
-        if raw_pos.ndim == 1:
-            raw_pos = raw_pos[None].expand(future_value.shape[0], -1)
-        packed_value = torch.zeros_like(future_value)
-        packed_mask = torch.zeros_like(future_mask)
-        packed_pos = torch.zeros_like(raw_pos, dtype=torch.long)
-        packed_valid = torch.zeros_like(future_valid)
-        for batch_idx in range(future_value.shape[0]):
-            indices = torch.nonzero(future_valid[batch_idx], as_tuple=False).flatten()
-            count = int(indices.numel())
-            if count:
-                packed_value[batch_idx, :count] = future_value[batch_idx, indices]
-                packed_mask[batch_idx, :count] = future_mask[batch_idx, indices]
-                packed_pos[batch_idx, :count] = raw_pos[batch_idx, indices]
-                packed_valid[batch_idx, :count] = True
-        future_value, future_mask = packed_value, packed_mask
-        future_timeline_position_ids, future_valid = packed_pos, packed_valid
+            if raw_pos.ndim == 1:
+                raw_pos = raw_pos[None].expand(future_value.shape[0], -1)
+            if tuple(raw_pos.shape) != tuple(future_value.shape[:2]):
+                raise ValueError(
+                    "future_timeline_position_ids must match future root [B,N]"
+                )
+            packed_value = future_value.new_zeros(
+                future_value.shape[0], packed_tokens, *future_value.shape[2:]
+            )
+            packed_mask = torch.zeros_like(packed_value, dtype=torch.bool)
+            packed_pos = raw_pos.new_zeros(raw_pos.shape[0], packed_tokens)
+            packed_valid = torch.zeros(
+                raw_pos.shape[0],
+                packed_tokens,
+                device=future_value.device,
+                dtype=torch.bool,
+            )
+            for batch_idx in range(future_value.shape[0]):
+                indices = torch.nonzero(
+                    future_valid[batch_idx], as_tuple=False
+                ).flatten()
+                count = int(indices.numel())
+                if count:
+                    packed_value[batch_idx, :count] = future_value[batch_idx, indices]
+                    packed_mask[batch_idx, :count] = future_mask[batch_idx, indices]
+                    packed_pos[batch_idx, :count] = raw_pos[batch_idx, indices]
+                    packed_valid[batch_idx, :count] = True
+            future_value, future_mask = packed_value, packed_mask
+            future_timeline_position_ids, future_valid = packed_pos, packed_valid
 
     future_horizon_tokens = None
     if future_value is not None:
-        raw_horizon = window_condition.get("future_horizon_tokens")
-        if raw_horizon is None:
+        if raw_future_horizon is None:
             raise ValueError(
                 "future_horizon_tokens is required with future root conditions"
             )
         future_horizon_tokens = torch.as_tensor(
-            raw_horizon,
+            raw_future_horizon,
             device=future_value.device,
             dtype=torch.long,
         )
@@ -770,19 +619,24 @@ def create_ldf_condition(window_condition: Mapping[str, Any]) -> LDFCondition:
             future_horizon_tokens = future_horizon_tokens.reshape(-1)
 
     condition = LDFCondition(
-        text_context=list(window_condition.get("text_context", [])),
-        text_null_context=list(window_condition.get("text_null_context", [])),
+        text_context=list(text_context),
+        text_null_context=list(text_null_context),
         root_condition_value=root_value,
         root_condition_mask=root_mask,
-        body_condition_value=window_condition.get("body_condition_value"),
-        body_condition_mask=window_condition.get("body_condition_mask"),
+        body_condition_value=body_condition_value,
+        body_condition_mask=body_condition_mask,
         future_root_condition_value=future_value,
         future_root_condition_mask=future_mask,
         future_timeline_position_ids=future_timeline_position_ids,
         future_valid_mask=future_valid,
         future_horizon_tokens=future_horizon_tokens,
     )
-    condition.validate()
+    latent_dim = None if body_condition_value is None else body_condition_value.shape[-1]
+    condition.validate(
+        batch_size=batch_size,
+        token_length=token_length,
+        latent_dim=latent_dim,
+    )
     return condition
 
 
@@ -846,7 +700,6 @@ __all__ = [
     "LDFStreamState",
     "create_cfg_condition",
     "create_ldf_condition",
-    "create_window_condition",
     "expand_null_timeline",
     "normalize_features",
     "unnormalize_features",

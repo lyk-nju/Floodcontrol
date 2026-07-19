@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from pathlib import Path
 
@@ -119,28 +120,47 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--min-frames", type=int)
     parser.add_argument("--max-frames", type=int)
-    parser.add_argument("--windows-per-sample", type=int, default=1)
+    parser.add_argument("--windows-per-sample", type=int)
     parser.add_argument("--active-tokens", type=int)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--random-yaw",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
     )
     args = parser.parse_args()
     if args.config:
         cfg = load_config(args.config)
         dataset = create_dataset(cfg, "train")
+        statistics = cfg.get("root_statistics")
+        if statistics is None:
+            raise ValueError("root_statistics configuration is required")
+        if str(statistics.anchor_sampling) != "uniform_legal_history":
+            raise ValueError(
+                "root statistics only support uniform_legal_history anchors"
+            )
         min_frames = int(
             cfg.data.min_frames if args.min_frames is None else args.min_frames
         )
         max_frames = int(
-            cfg.data.max_frames if args.max_frames is None else args.max_frames
+            int(statistics.window_tokens) * FRAMES_PER_TOKEN
+            if args.max_frames is None
+            else args.max_frames
         )
         active_tokens = int(
-            cfg.model.params.chunk_size
+            statistics.generation_tokens
             if args.active_tokens is None
             else args.active_tokens
+        )
+        windows_per_sample = int(
+            statistics.windows_per_sample
+            if args.windows_per_sample is None
+            else args.windows_per_sample
+        )
+        random_yaw = bool(
+            statistics.random_yaw
+            if args.random_yaw is None
+            else args.random_yaw
         )
         output_path = args.output or str(cfg.data.root_stats_path)
     else:
@@ -158,19 +178,35 @@ def main() -> None:
         min_frames = 20 if args.min_frames is None else args.min_frames
         max_frames = 200 if args.max_frames is None else args.max_frames
         active_tokens = 5 if args.active_tokens is None else args.active_tokens
+        windows_per_sample = (
+            1 if args.windows_per_sample is None else args.windows_per_sample
+        )
+        random_yaw = True if args.random_yaw is None else args.random_yaw
         output_path = args.output
     root_mean, root_std = compute_root_statistics(
         dataset,
         min_frames=min_frames,
         max_frames=max_frames,
-        windows_per_sample=args.windows_per_sample,
-        random_yaw=args.random_yaw,
+        windows_per_sample=windows_per_sample,
+        random_yaw=random_yaw,
         active_tokens=active_tokens,
         seed=args.seed,
     )
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(output, root_mean=root_mean.numpy(), root_std=root_std.numpy())
+    metadata = {
+        "window_tokens": max_frames // FRAMES_PER_TOKEN,
+        "generation_tokens": active_tokens,
+        "anchor_sampling": "uniform_legal_history",
+        "random_yaw": random_yaw,
+        "windows_per_sample": windows_per_sample,
+    }
+    np.savez(
+        output,
+        root_mean=root_mean.numpy(),
+        root_std=root_std.numpy(),
+        metadata=np.asarray(json.dumps(metadata, sort_keys=True)),
+    )
     print(f"wrote LDF root statistics to {output}")
 
 

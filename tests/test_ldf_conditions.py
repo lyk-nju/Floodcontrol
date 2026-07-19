@@ -9,7 +9,6 @@ from utils.conditions.ldf import (
     LDFInput,
     create_cfg_condition,
     create_ldf_condition,
-    create_window_condition,
     expand_null_timeline,
 )
 from utils.motion_process import recover_local_root
@@ -59,22 +58,24 @@ def test_heading_mask_must_be_paired():
 
 
 def test_window_compile_packs_sparse_future_tokens_and_cfg_is_read_only():
-    text, null = _text()
-    root = torch.zeros(1, 24, 5)
-    mask = torch.zeros_like(root, dtype=torch.bool)
-    mask[:, 20:24, :3] = True
-    window = create_window_condition(
+    text, null = _text(tokens=4)
+    active_root = torch.zeros(1, 16, 5)
+    active_mask = torch.zeros_like(active_root, dtype=torch.bool)
+    future_root = torch.zeros(1, 8, 5)
+    future_mask = torch.zeros_like(future_root, dtype=torch.bool)
+    future_mask[:, :4, :3] = True
+    condition = create_ldf_condition(
         text_context=text,
         text_null_context=null,
-        window_origin=0,
-        window_tokens=4,
-        future_tokens=2,
-        root_condition_value=root,
-        root_condition_mask=mask,
+        root_condition_value=active_root,
+        root_condition_mask=active_mask,
+        future_root_condition_value=future_root,
+        future_root_condition_mask=future_mask,
+        future_timeline_position_ids=torch.tensor([4, 5]),
+        future_horizon_tokens=2,
     )
-    condition = create_ldf_condition(window)
     assert condition.root_condition_value.shape == (1, 4, 4, 5)
-    assert condition.future_valid_mask.tolist() == [[True, False]]
+    assert condition.future_valid_mask.tolist() == [[True]]
     original = condition.future_valid_mask.clone()
     branches = create_cfg_condition(condition, token_length=4)
     assert torch.equal(condition.future_valid_mask, original)
@@ -84,21 +85,23 @@ def test_window_compile_packs_sparse_future_tokens_and_cfg_is_read_only():
 
 def test_timeline_and_rope_positions_remain_distinct_after_window_roll():
     text, null = _text(tokens=4)
-    root = torch.zeros(1, 40, 5)
+    root = torch.zeros(1, 16, 5)
     mask = torch.zeros_like(root, dtype=torch.bool)
+    future_root = torch.zeros(1, 8, 5)
+    future_mask = torch.zeros_like(future_root, dtype=torch.bool)
     # window_origin=3 and window_tokens=4 place future tokens at absolute 7 and 8.
-    mask[:, 28:32, :3] = True
-    window = create_window_condition(
+    future_mask[:, :4, :3] = True
+    condition = create_ldf_condition(
         text_context=text,
         text_null_context=null,
-        window_origin=3,
-        window_tokens=4,
-        future_tokens=2,
         root_condition_value=root,
         root_condition_mask=mask,
+        future_root_condition_value=future_root,
+        future_root_condition_mask=future_mask,
+        future_timeline_position_ids=torch.tensor([7, 8]),
+        future_horizon_tokens=2,
     )
-    condition = create_ldf_condition(window)
-    assert condition.future_timeline_position_ids.tolist() == [[7, 0]]
+    assert condition.future_timeline_position_ids.tolist() == [[7]]
 
     inputs = LDFInput(
         noisy_motion=HybridMotion(
@@ -117,7 +120,7 @@ def test_timeline_and_rope_positions_remain_distinct_after_window_roll():
     assert inputs.rope_origin.tolist() == [[4]]
     assert inputs.timeline_to_rope(
         condition.future_timeline_position_ids
-    ).tolist() == [[3, -4]]
+    ).tolist() == [[3]]
 
 
 def test_future_candidate_overlap_is_removed_from_attention_view():

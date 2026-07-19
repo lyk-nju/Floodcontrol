@@ -896,28 +896,65 @@ class LDF(nn.Module):
         )
         return HybridMotion(root, motion.latent_motion.clone())
 
-    def _create_step_input(
+    def create_input(
         self,
         motion: HybridMotion,
         *,
         beta: torch.Tensor,
         next_beta: torch.Tensor | None,
         timeline_position_ids: torch.Tensor,
-        commit_index: int,
+        commit_index: int | torch.Tensor,
+        token_valid_mask: torch.Tensor | None = None,
         condition: LDFCondition,
         previous_root_frame: torch.Tensor | None,
         previous_root_valid_mask: torch.Tensor | None,
     ) -> LDFInput:
-        history = timeline_position_ids < int(commit_index)
+        """Create the only model-facing view of one solver microstep."""
+
+        motion.validate()
+        batch, tokens = motion.root_motion.shape[:2]
+        if tuple(beta.shape) != (batch, tokens):
+            raise ValueError("beta must match motion [B,T]")
+        if tuple(timeline_position_ids.shape) != (batch, tokens):
+            raise ValueError("timeline_position_ids must match motion [B,T]")
+        if timeline_position_ids.dtype != torch.long:
+            raise TypeError("timeline_position_ids must be int64")
+        if token_valid_mask is None:
+            token_valid = torch.ones(
+                batch,
+                tokens,
+                device=motion.root_motion.device,
+                dtype=torch.bool,
+            )
+        else:
+            token_valid = torch.as_tensor(
+                token_valid_mask,
+                device=motion.root_motion.device,
+            )
+            if tuple(token_valid.shape) != (batch, tokens):
+                raise ValueError("token_valid_mask must match motion [B,T]")
+            if token_valid.dtype != torch.bool:
+                raise TypeError("token_valid_mask must be bool")
+        commit = torch.as_tensor(
+            commit_index,
+            device=timeline_position_ids.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if commit.numel() == 1:
+            commit = commit.expand(batch)
+        if tuple(commit.shape) != (batch,):
+            raise ValueError("commit_index must be scalar or int64 [B]")
+
+        history = token_valid & (timeline_position_ids < commit[:, None])
         visible = beta < 1.0 - 1e-7
         if next_beta is not None:
             if tuple(next_beta.shape) != tuple(beta.shape):
                 raise ValueError("next_beta must match beta [B,T]")
             visible |= next_beta < beta - 1e-7
-        generation = (~history) & visible
+        generation = token_valid & (~history) & visible
         beta = torch.where(history, torch.zeros_like(beta), beta)
-        rope_position_ids = timeline_position_ids - int(commit_index)
-        return LDFInput(
+        rope_position_ids = timeline_position_ids - commit[:, None]
+        inputs = LDFInput(
             noisy_motion=motion,
             beta=beta,
             history_mask=history,
@@ -928,6 +965,54 @@ class LDF(nn.Module):
             previous_root_valid_mask=previous_root_valid_mask,
             condition=condition,
         )
+        inputs.validate_structure()
+        return inputs
+
+    def commit_step(
+        self,
+        motion: HybridMotion,
+        beta: torch.Tensor,
+        token_index: int | torch.Tensor,
+    ) -> tuple[HybridMotion, HybridMotion, torch.Tensor]:
+        """Project, extract and rebase one committed hybrid token.
+
+        ``token_index`` is local to ``motion``.  The returned translation is a
+        physical model-space XZ offset which the caller adds to its world
+        origin and applies to any separate clean/boundary state it owns.
+        """
+
+        motion.validate()
+        batch, tokens = motion.root_motion.shape[:2]
+        if tuple(beta.shape) != (batch, tokens):
+            raise ValueError("beta must match motion [B,T]")
+        indices = torch.as_tensor(
+            token_index,
+            device=motion.root_motion.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if indices.numel() == 1:
+            indices = indices.expand(batch)
+        if tuple(indices.shape) != (batch,):
+            raise ValueError("token_index must be scalar or int64 [B]")
+        if bool(((indices < 0) | (indices >= tokens)).any()):
+            raise ValueError("token_index lies outside the motion window")
+
+        batch_index = torch.arange(batch, device=motion.root_motion.device)
+        root = motion.root_motion.clone()
+        latent = motion.latent_motion.clone()
+        committed_root = self._project_normalized_root(root[batch_index, indices])
+        root[batch_index, indices] = committed_root
+        committed = HybridMotion(
+            committed_root[:, None],
+            latent[batch_index, indices][:, None].clone(),
+        )
+        translation_xz = self.denormalize_root(committed.root_motion)[
+            :, 0, -1, [0, 2]
+        ]
+        rebased = self.rebase_motion_state(
+            HybridMotion(root, latent), beta, translation_xz
+        )
+        return rebased, committed, translation_xz
 
     @torch.no_grad()
     def generate(
@@ -967,12 +1052,13 @@ class LDF(nn.Module):
                 timeline_position_ids=timeline_positions,
                 diffusion_time=next_time,
             )
-            inputs = self._create_step_input(
+            inputs = self.create_input(
                 motion,
                 beta=beta,
                 next_beta=next_beta,
                 timeline_position_ids=timeline_positions,
                 commit_index=int((beta <= 1e-7).sum(dim=1).min().item()),
+                token_valid_mask=None,
                 condition=condition,
                 previous_root_frame=None,
                 previous_root_valid_mask=None,
@@ -1187,12 +1273,13 @@ class LDF(nn.Module):
                 timeline_position_ids=timeline_positions,
                 diffusion_time=next_time,
             )
-            inputs = self._create_step_input(
+            inputs = self.create_input(
                 motion,
                 beta=beta,
                 next_beta=next_beta,
                 timeline_position_ids=timeline_positions,
                 commit_index=state.commit_index,
+                token_valid_mask=None,
                 condition=condition,
                 previous_root_frame=state.previous_root_frame,
                 previous_root_valid_mask=(
@@ -1213,29 +1300,25 @@ class LDF(nn.Module):
                 cfg_scale_joint=cfg_scale_joint,
             )
 
-        new_commit = state.commit_index + 1
         local_start = state.commit_index - state.window_origin
-        local_end = local_start + 1
-        if local_end > length:
+        if local_start < 0 or local_start >= length:
             raise RuntimeError("stream buffer exhausted before rolling")
-        projected_root = motion.root_motion.clone()
-        projected_root[:, local_start:local_end] = self._project_normalized_root(
-            projected_root[:, local_start:local_end]
+        motion, committed, translation_xz = self.commit_step(
+            motion,
+            next_beta,
+            local_start,
         )
-        motion = HybridMotion(projected_root, motion.latent_motion)
-        committed = HybridMotion(
-            motion.root_motion[:, local_start:local_end].clone(),
-            motion.latent_motion[:, local_start:local_end].clone(),
-        )
+        previous = state.previous_root_frame
+        if previous is not None:
+            previous = previous.clone()
+            previous[..., [0, 2]] -= translation_xz.to(previous)
         new_state = replace(
             state,
             noisy_motion=motion,
             current_step=end_step,
-            commit_index=new_commit,
+            commit_index=state.commit_index + 1,
+            previous_root_frame=previous,
         )
-        committed_physical = self.denormalize_root(committed.root_motion)
-        translation_xz = committed_physical[:, 0, -1, [0, 2]]
-        new_state = self.rebase_stream_state(new_state, translation_xz)
         return (
             self._roll_window(new_state) if bool(roll_window) else new_state
         ), committed

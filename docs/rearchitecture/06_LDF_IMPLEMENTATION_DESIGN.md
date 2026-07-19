@@ -47,19 +47,21 @@ utils/
 │   └── ldf.py
 └── training/ldf/
     ├── data.py
-    ├── flow.py
-    ├── batch.py
+    ├── window.py
     ├── conditioning.py
+    ├── steps.py
+    ├── solver.py
+    ├── flow.py
     ├── losses.py
-    ├── self_forcing.py
     ├── lightning_module.py
+    ├── text.py
     └── evaluation/            # optional heavy runner; not imported by core
 
 eval/
 └── ldf_training.py            # entrypoint composition callback
 ```
 
-training目录不增加模型参数：`data.py`只产出physical span，`flow.py`保存固定噪声代数，`batch.py`构造完整S的`LDFInput/loss_mask`，`conditioning.py`从GT root span编译当前active XZ、future XZ和sample级constraint dropout，`losses.py`只负责prediction/target/mask reduction，`self_forcing.py`维护immutable plan与只替换clean history的mutable state。`utils.training`、`utils.training.ldf`和`utils.training.vae`只提供lazy public export，导入任意低层kernel不会顺带加载Lightning或完整生成评测。`LDFLightningModule`只负责loss probe；metrics、video和正式stream runtime仅由`train_ldf.py`按配置装配`eval/ldf_training.py` callback后才加载。
+training目录不增加模型参数：`data.py`只产出physical parent span与VAE context；`window.py`拥有H/C/F、K课程、cold与anchor；`conditioning.py`采样constraint dropout、horizon与dense/waypoint/goal candidates；`steps.py`构造ideal/cold/rollout model-facing step；`solver.py`推进K=1/cold/K>1事务；`flow.py`只保存flow代数；`losses.py`只负责prediction/target/mask reduction。包初始化器不再维护lazy export表，调用方直接导入职责模块，因此低层kernel不会顺带加载Lightning或完整生成评测。`LDFLightningModule`只负责prepare→solve→loss→log；metrics、video和正式stream runtime由evaluation callback按配置装配。
 
 ### `models/diffusion_forcing_wan.py`
 
@@ -85,8 +87,7 @@ CFG 分支 forward 与结果组合
 ```text
 HybridMotion / LDFInput / LDFCondition / LDFPrediction / LDFStreamState
 shape、dtype、device、mask 和时间所有权校验
-create_window_condition：absolute timeline -> active-window 条件裁剪
-create_ldf_condition：frame -> 4-frame token 对齐，编译 current/future constraint tensors
+create_ldf_condition：typed frame/token输入 -> 4-frame token对齐，编译并压缩current/future constraint tensors
 create_cfg_condition：生成 text-only / constraint-only / history-only CFG conditions
 训练 condition dropout 与推理空条件的一致语义
 ```
@@ -194,7 +195,7 @@ class LDFCondition:
     future_horizon_tokens: torch.Tensor | None
 ```
 
-第一版只为 future root trajectory 建立正式协议：`future_root_condition_value/future_root_condition_mask` 按四帧 root patch 表达，推荐形状为 `[B,N_future,4,5]`；`future_timeline_position_ids[B,N_future]` 使用absolute timeline坐标，候选superset可以覆盖尚未可见的active位置。`future_valid_mask[B,N_future]`只表示prefix-packed候选与padding，`future_horizon_tokens[B]`冻结本commit的最大absolute lookahead。Root Stage根据每个microstep的真实visible-motion末端生成临时attention mask，排除已经成为motion query的候选、执行lookahead限制，并保证motion加future query不超过模型window；随后使用当前`rope_origin`派生generation-centered future RoPE位置。
+第一版只为 future root trajectory 建立正式协议：`future_root_condition_value/future_root_condition_mask` 按四帧 root patch 表达，推荐形状为 `[B,N_future,4,5]`；`future_timeline_position_ids[B,N_future]` 使用absolute timeline坐标，候选superset可以覆盖尚未可见的active位置。`future_valid_mask[B,N_future]`只表示prefix-packed候选与padding，`future_horizon_tokens[B]`保存逐样本采样且在完整K-step rollout内冻结的absolute lookahead，允许为0。Root Stage根据每个microstep的真实visible-motion末端生成临时attention mask，排除已经成为motion query的候选、执行lookahead限制，并保证motion加future query不超过模型window；随后使用当前`rope_origin`派生generation-centered future RoPE位置。训练constraint plan的候选末端包含`K-1`个额外token，以保证active band后移后仍能获得所采样的完整horizon。
 
 训练侧的XZ计划允许frame-level稀疏mask。只有实际含至少一个选中frame的future token才进入上述packed字段，token内部仍保留`[4,5]`mask，不能把一个waypoint扩大成四帧dense约束。absolute计划在一次self-forcing rollout内保持固定；窗口移动只改变同一选中frame属于current还是future，不重新采样约束。
 
@@ -212,13 +213,10 @@ ARDY 与 Kimodo 的 `observed_motion + motion_mask` 和 separated CFG 提供了c
 
 ### Condition 创建函数
 
-三个函数都是 `utils/conditions/ldf.py` 中无可学习参数、不得修改 persistent state 的纯数据函数：
+两个函数都是 `utils/conditions/ldf.py` 中无可学习参数、不得修改 persistent state 的纯数据函数：
 
 ```text
-absolute condition timeline
-        |
-        v
-create_window_condition()
+source-specific candidates
         |
         v
 create_ldf_condition()
@@ -230,8 +228,7 @@ create_cfg_condition()
 Root/Body LDF forward
 ```
 
-- `create_window_condition(...)`：根据 active-window 起点、长度和 lookahead 范围，选择 in-window 与 future constraints，丢弃过期项，并把时间索引转换为当前窗口坐标。返回值可以是模块内部 mapping，不增加公共 `WindowCondition` dataclass。
-- `create_ldf_condition(...) -> LDFCondition`：完成 frame-to-token/phase 对齐、normalization contract 检查、dense root/body constraint tensors、future root packing、padding和所有 shape/mask 断言。
+- `create_ldf_condition(...) -> LDFCondition`：使用typed keyword输入完成frame-to-token对齐、dense root/body tensors、absolute future candidate packing、padding和所有shape/mask断言。训练传入GT+sampled mask，runtime传入route/observation编译结果；二者没有中间mapping协议。
 - `create_cfg_condition(...)`：从同一个 `LDFCondition` 创建 text-only、constraint-only、history-only 或 joint conditions。History、`previous_root_frame` 和 noisy state在所有 branches 中相同；text 与 current/future constraints按 branch置空。
 
 `create_cfg_condition` 只创建条件，不组合模型输出；CFG 数学组合仍由 `LDF` 内部独立的 prediction composer 负责。
@@ -451,13 +448,13 @@ apply_rope_with_position_ids(q_or_k, rope_position_ids)
 
 模型将 `[visible history/generation prefix | dynamically selected future constraints]` 作为普通有效 token 序列送入 non-causal Transformer。pure-noise且本步尚未更新的motion frontier保留在persistent state中，但不会被假装成有效attention token；future候选condition在一个commit内保持只读，Root Stage用逐microstep临时mask从非前缀候选尾部抽取并紧接当前可见motion前缀打包，不受固定window尾部padding影响。future token 的输出被忽略，不被 scheduler 更新或 commit；不再需要 trajectory-query/latent-key 的专用非对称 mask。
 
-`create_window_condition()`从`window_origin + window_tokens`开始生成absolute future timeline IDs，不能在rolling后重新从`window_tokens`起算。future horizon不得反向扩大`HybridMotion`、`beta`、history/generation mask或Body Stage长度。
+future candidate必须携带absolute timeline IDs。训练与runtime均先生成覆盖整个commit的候选superset，随后由`LDFInput.future_attention_mask()`根据当前实际visible-motion末端逐microstep过滤；不存在固定从active/window末端开始的第二套future语义。future horizon不得反向扩大`HybridMotion`、`beta`、history/generation mask或Body Stage长度。
 
 token-aligned text context 与 text embedding dedup 属于在线文本能力，不是 FlexTraj。`text_context`按sample-major的`B*T`排列，每个motion query只cross-attend自己的T5 sequence；future-root query不读取文本。相同prompt的T5输出和projection输入按tensor identity复用，避免HumanML重复caption造成重复编码。
 
 条件文本不再接受`B`长度的静态caption捷径。HumanML必须显式把同一个tensor引用重复到每个token，BABEL必须提供真实切换后的timeline；`text_null_context`则严格保持`B`。CFG在构造history/constraint分支时显式把每个sample的null引用展开为`B*T`，因此不会因为误传`B`而把BABEL静默退化成整段共享caption。文本准备先按tensor identity建立raw prompt bank和token prompt IDs，再根据当前有效motion query筛选实际使用的prompt；只有这些prompt的有效T5 token会被打包成`[Nk,text_dim]`并送入text projection。每个Transformer block将motion query打包成`[Nq,H,Dh]`、将文本投影打包成`[Nk,H,Dh]`，直接调用FlashAttention varlen并scatter回原token位置，不再物化`[B,T,L,D]`或`[G,max_group_length,D]`。该执行优化不改变逐token文本语义；future-root query的direct text mask始终为false。
 
-Transformer热路径只调用`validate_structure()`检查rank、shape、dtype、device和字段配对；`validate()`继续保留finite、mask内容、prefix、beta范围、position顺序与heading配对等完整语义检查。`LDFWindowPlan`采用相同分层：CPU collator负责构造四帧对齐、连续prefix、真实span/context和cold-start边界，普通随机H只从这些可信边界采样；只有validation/test显式传入history override时立即检查override。正式训练`debug: false`时不执行完整GPU内容校验；`debug: true`时在rollout前检查H/active/frontier/phase/cold-start和最终input合同。`flow.py`、`batch.py`、loss和Transformer forward不再逐层重复读取相同CUDA内容。XZ可变长度采样按prefix长度直接构造token range，不再逐sample执行`nonzero()`；active bounds、valid counts和mode draws按batch集中搬到CPU。
+Transformer热路径只调用`validate_structure()`检查rank、shape、dtype、device和字段配对；`validate()`继续保留finite、mask内容、prefix、beta范围、position顺序与heading配对等完整语义检查。`LDFWindowPlan`采用相同分层：CPU collator负责构造四帧对齐、连续prefix、真实span/context和cold-start边界，普通随机H只从这些可信边界采样；只有validation/test显式传入history override时立即检查override。正式训练`debug: false`时不执行完整GPU内容校验；`debug: true`时在rollout前检查H/active/frontier/phase/cold-start和最终input合同。`flow.py`、`steps.py`、loss和Transformer forward不再逐层重复读取相同CUDA内容。XZ可变长度采样按prefix长度直接构造token range；active bounds、valid counts和mode draws按batch集中搬到CPU。
 
 该分层不追求形式上的“零同步”。Root/Body batch-max visible裁剪、future-root动态packing和waypoint个数仍需要少量动态长度读取；文本dropout也仍需把sample级选择映射到Python prompt timeline。prompt query分组在进入blocks前只编译一次并由所有层复用，不在每层重复排序；varlen kernel使用`B×Q`和`text_len`作为静态安全上限，不再为prompt group读取GPU最大长度。
 
@@ -465,7 +462,7 @@ Transformer热路径只调用`validate_structure()`检查rank、shape、dtype、
 
 ### 阶段 A：结构与单分支核心
 
-1. 在 `utils/conditions/ldf.py` 落地 dataclass、校验，以及 `create_window_condition/create_ldf_condition/create_cfg_condition`。
+1. 在 `utils/conditions/ldf.py` 落地dataclass、分层校验，以及typed `create_ldf_condition/create_cfg_condition`。
 2. 在 `diffusion_forcing_wan.py` 实现 RootTransformer、BodyTransformer 和无 CFG 的单分支 forward。
 3. 使用随机 `latent_motion` 完成 shape、v/x0 恒等式、heading、只读 masked input view 和 stage detach 测试，不等待最终 VAE。
 

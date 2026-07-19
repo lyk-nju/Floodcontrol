@@ -38,11 +38,11 @@ HumanML3D root deltas + RIC positions + IK local rotations
 
 `HumanML3DDataset`与`BABELDataset`分别解析自己的split和`caption#tokens#start#end`文本，且不互相继承；统一返回完整未裁剪sample：`dataset/name/root_motion/body_motion/body_feature_valid_mask/text_data`。处理后的dataset root自包含split、`all.txt`、`artifacts/`和`texts/`；`all.txt`严格等于所有正式处理后split的唯一ID并集，只定义数据集级文本库存，不参与train/val/test采样。需要文本的任务使用相对目录`text_path: texts`，纯VAE训练可显式设置`text_path: null`，避免读取未消费的caption。motion NPZ只保存三组tensor，文本保持独立TXT，不把字符串复制进每个NPZ。公开source identity固定为`HumanML3D`和`BABEL`，不从数据目录名推导，因此目录移动或重命名不会改变batch metadata。`MultiDataset`只实例化并concat子Dataset，不拥有collate。
 
-任务相关处理下沉到training data层：`utils/training/vae/data.py`负责VAE crop、translation rebase、同步yaw、previous-root和padding；LDF的`MinimumFrameDataset`只排除不足一个5-token active band的样本。`LDFSpanCollator`为每个sample保留自然长度并最多裁40 tokens/160 frames：短动作不缩短，长动作随机裁一个8秒parent；batch只在右侧padding并输出`span_token_count[B]`。它同时携带真实VAE左context、previous root、source坐标和token prompt timeline，但不决定H/active/frontier，也不做translation anchor、noise或self-forcing。Lightning plan随后在每个sample内独立采样H；只有`source_start_token=0`的真实序列前缀允许`H=0`，中间parent必须`H>=1`。HumanML3D从覆盖parent的caption备选中选择一条并重复到每个token；BABEL任意frame半开区间按四帧token最大重叠编译。训练crop、caption和yaw由sampler提供的epoch/sample seed决定；resume时恢复bucket epoch与已消费batch游标。
+任务相关处理下沉到training data层：`utils/training/vae/data.py`负责VAE crop、translation rebase、同步yaw、previous-root和padding；LDF的`MinimumFrameDataset`只排除不足一个5-token active band的样本。`LDFSpanCollator`为每个sample保留自然长度并最多裁50 tokens/200 frames：短动作不缩短，长动作随机裁一个10秒parent；batch只在右侧padding并输出`span_token_count[B]`。它同时携带真实VAE左context、previous root、source坐标和token prompt timeline，但不决定H/active/frontier，也不做translation anchor、noise或self-forcing。Lightning plan随后在每个sample内独立采样H；只有`source_start_token=0`的真实序列前缀允许`H=0`，中间parent必须`H>=1`。HumanML3D从覆盖parent的caption备选中选择一条并重复到每个token；BABEL任意frame半开区间按四帧token最大重叠编译。训练crop、caption和yaw由sampler提供的epoch/sample seed决定；resume时恢复bucket epoch与已消费batch游标。
 
 statistics和VAE reconstruction evaluation直接消费Dataset full sample，不读取artifact manifest。physical statistics仍用四个quarter-turn quadrature点匹配均匀yaw的一阶和逐维二阶矩；latent statistics改用显式seed的普通随机生成器，不再用sample hash决定yaw。
 
-`tools/compute_ldf_root_stats.py`复用同一scaled-ARDY分布：自然parent最多40 tokens/160 frames；真实序列前缀均匀采样`H∈[0,N-5]`，中间parent均匀采样`H∈[1,N-5]`。`H>0`取第`4H-1`帧作为anchor，合法`H=0`取序列第0帧。产物仍只保存`root_mean/root_std [5]`。HumanML-only与HumanML+BABEL训练统一复用这份HumanML canonical root statistics。
+`tools/compute_ldf_root_stats.py`使用独立冻结的统计协议：自然parent最多50 tokens/200 frames，固定C=5，均匀采样所有合法history anchor，并执行uniform yaw；它不读取cold replay概率或K schedule。`H>0`取第`4H-1`帧作为anchor，合法`H=0`取序列第0帧。产物仍只保存`root_mean/root_std [5]`。HumanML-only与HumanML+BABEL训练统一复用这份HumanML canonical root statistics。
 
 当前可执行数据构建入口使用模块形式，避免依赖隐式`PYTHONPATH`：
 
@@ -140,7 +140,7 @@ python -m tools.compute_ldf_root_stats \
   --train-meta-paths ${RAW_DATA}/HumanML3D_motion/train.txt \
   --output ${RAW_DATA}/HumanML3D_motion/root_stats.npz \
   --min-frames 20 \
-  --max-frames 160 \
+  --max-frames 200 \
   --windows-per-sample 1 \
   --active-tokens 5 \
   --seed 1234
@@ -181,7 +181,7 @@ VAETrainingBatch
   frame/feature masks and batch padding
 
 LDFSpanBatch
-  per-sample natural parent window capped at 40 tokens / 160 frames + right padding
+  per-sample natural parent window capped at 50 tokens / 200 frames + right padding
   span_token_count [B] + independent source crop index
   all available real left context within the encoder receptive field
   true-cold/continuation boundary + previous root validity

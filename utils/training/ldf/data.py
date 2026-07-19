@@ -21,7 +21,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 from utils.initialize import instantiate_target
 from utils.motion_process import BODY_DIM, ROOT_DIM, rotate_motion_yaw, rotate_root_yaw
 from utils.token_frame import FRAMES_PER_TOKEN
-from utils.training.ldf.self_forcing import validate_self_forcing_config
+from utils.training.ldf.window import validate_self_forcing_config
 
 
 _SEED_MASK = (1 << 64) - 1

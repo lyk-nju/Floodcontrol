@@ -296,21 +296,19 @@ class InferenceConditionCompiler:
                 future_positions = None
 
         condition = create_ldf_condition(
-            {
-                "text_context": text_context,
-                "text_null_context": text_null_context,
-                "root_condition_value": root_value,
-                "root_condition_mask": root_mask,
-                "future_root_condition_value": future_value,
-                "future_root_condition_mask": future_mask,
-                "future_timeline_position_ids": future_positions,
-                "future_horizon_tokens": torch.full(
-                    (state.noisy_motion.batch_size,),
-                    self.max_horizon_token,
-                    device=device,
-                    dtype=torch.long,
-                ),
-            }
+            text_context=text_context,
+            text_null_context=text_null_context,
+            root_condition_value=root_value,
+            root_condition_mask=root_mask,
+            future_root_condition_value=future_value,
+            future_root_condition_mask=future_mask,
+            future_timeline_position_ids=future_positions,
+            future_horizon_tokens=torch.full(
+                (state.noisy_motion.batch_size,),
+                self.max_horizon_token,
+                device=device,
+                dtype=torch.long,
+            ),
         )
         compiled = CompiledCondition(
             window_origin=state.window_origin,

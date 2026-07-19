@@ -4391,3 +4391,255 @@
 后续事项：
 
 - 本轮只调整已有指标的即时展示，不运行新的T2M评测，也不改变T2M采样数量、评测频率或指标定义。
+
+## 2026-07-19 · 逐样本随机Future Horizon与K-step计划覆盖
+
+改动类型：LDF训练条件采样 / persistent rollout合同 / 配置语义 / 回归测试
+
+实际改动内容：
+
+- 将`training.max_horizon_token`从固定训练lookahead改为逐样本随机上限。每个sample在`[0,min(configured_max,真实可用future)]`内均匀采样整数horizon，并在完整K-step rollout内保持固定。
+- 真实可用future在采样前扣除`K-1`次后续commit所需位置；完整50-token、C=5、K=1 cold样本因此覆盖0～45，短样本、late continuation和更大K自然使用更小上限。
+- `sample_xz_constraint_mask()`现在显式接收`future_horizon_tokens[B]`与`rollout_steps`，absolute constraint plan的末端额外覆盖`K-1`个token，避免horizon=10在K=5中逐步退化为6。
+- `create_xz_condition()`改为消费逐样本horizon；同一batch允许混合0与非0值。horizon 0不创建future attention候选，但仍保留当前可见motion上的XZ；constraint dropout继续表示current/future XZ全部移除。
+- `LDFCondition`允许非负horizon，Root Stage既有动态visible-boundary过滤、query容量限制及future projection静态DDP零梯度依赖保持不变。
+- 远端、本机与HumanML+BABEL配置增加注释，明确`max_horizon_token`是随机采样上限而非固定长度；同步更新训练方法、配置和实现设计文档。
+
+改动理由：
+
+- Dynamic Future此前只让future起点随当前可见motion末端移动，训练horizon本身仍固定为45/35，和正式10-token runtime视野存在明显attention长度与条件分布差异。
+- persistent plan此前只覆盖初始active末端后的lookahead；active band在K>1中后移后，短horizon会每commit少一个有效future token。扩大计划而保持每步动态过滤，可以修复该缺口且不泄漏额外条件。
+- 把0纳入horizon分布能覆盖没有提前轨迹视野、但仍可读取当前XZ的情况；它与独立constraint dropout承担不同训练语义。
+
+验证：
+
+- LDF training/self-forcing/condition/forward核心测试：79项通过。
+- inference/evaluation/migration等扩展定向测试：143项通过、2项失败；失败均为当前远端`ldf.yaml`已改成200帧/50-token和100k/200k/300k课程，而既有migration guard仍锁定旧160帧及200k/290k/350k配置，和本次horizon实现无关。
+- 其余仓库测试文件分组运行：144项通过。两组覆盖完整`tests/`文件集合，合计287项通过、2项上述既有配置守卫失败。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/conditioning.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/__init__.py`
+- `utils/conditions/ldf.py`
+- `configs/ldf.yaml`
+- `configs/ldf_s5.yaml`
+- `configs/ldf_multi.yaml`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_self_forcing.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/rearchitecture/06_LDF_IMPLEMENTATION_DESIGN.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 需要单独决定远端canonical从头训练配置采用当前200帧/50-token、100k/200k/300k课程，还是恢复旧160帧/40-token、200k/290k/350k合同，再同步两项migration guard；本轮不擅自替用户选择。
+- 尚未运行真实checkpoint的固定sample/noise前后对照；新horizon分布需要通过cold初始朝向、dense XZ ADE/FDE与长期goal实验验证实际收益。
+
+## 2026-07-19 · 冻结50-token LDF基础配置与Root统计协议
+
+改动类型：配置架构 / 训练合同 / 统计工具 / 回归测试
+
+实际改动内容：
+
+- 配置加载器增加相对路径、递归解析且带循环检测的单一`base_config`机制；resolved config不保留继承控制字段。
+- 新增`configs/ldf_base.yaml`作为唯一训练语义来源，冻结200帧/50-token、C=5、逐样本0～45 future horizon、K=1/2/3/5、全程10% cold replay、joint模型CFG及T2M nocfg。
+- 将远端、本机和HumanML+BABEL配置缩减为环境、数据源、设备、batch、worker和评测开关覆盖；三者不再复制窗口、loss、optimizer、curriculum或模型CFG。
+- 增加独立`root_statistics`配置；root统计工具从该固定协议读取50-token窗口、C=5、uniform legal-history anchor、uniform yaw和每样本窗口数，不依赖cold概率或K schedule。
+- 训练入口校验root statistics协议与正式窗口、chunk和yaw配置一致。
+
+改动理由：
+
+- 此前远端、本机和Multi配置同时维护40/50-token、不同K schedule、不同loss/optimizer和不同CFG，导致文档与migration tests漂移。
+- Root normalization应采用稳定、显式的统计采样协议，而不是随self-forcing curriculum的小改动反复生成。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_initialize.py tests/test_migration_guards.py -q`：`45 passed`。
+- 配置加载smoke确认base/remote/local/multi均解析为200帧、50-token、K=1/2/3/5与joint CFG，且resolved config无`base_config`字段。
+
+涉及文件：
+
+- `utils/initialize.py`
+- `configs/ldf_base.yaml`
+- `configs/ldf.yaml`
+- `configs/ldf_s5.yaml`
+- `configs/ldf_multi.yaml`
+- `train_ldf.py`
+- `tools/compute_ldf_root_stats.py`
+- `tests/test_initialize.py`
+- `tests/test_migration_guards.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 继续迁移训练/runtime共享solver原语；全仓测试与静态检查在完成全部架构收口后统一执行。
+
+## 2026-07-19 · 统一LDF训练与Runtime求解原语
+
+改动类型：模型公共接口 / 流式事务 / persistent rollout / 回归测试
+
+实际改动内容：
+
+- 将私有step-input构造提升为`LDF.create_input()`，统一支持scalar或逐样本commit index、可选token-valid mask、history/generation可见性、generation-centered RoPE及Dynamic Future输入边界。
+- 新增`LDF.commit_step()`，统一执行逐样本root heading投影、Hybrid token提取、physical XZ translation恢复和按`1-beta`的solver-state rebase。
+- Offline generation、stream runtime、cold replay、ideal bridge和persistent K-step rollout全部切换到公共`create_input()`；runtime和training commit均切换到`commit_step()`。
+- Persistent rollout不再调用LDF私有root projection；训练仍单独维护GT clean state与previous-root boundary，但复用完全相同的commit translation。
+
+改动理由：
+
+- 此前训练和runtime只共享Euler更新，input visibility、root projection、commit和rebase各自实现，容易在cold、anchor或rolling修改时再次产生两套状态分布。
+- 共享计算原语而不强行合并训练/runtime状态类，可以消除数学重复，同时保留逐样本H与在线单一commit进度的自然差异。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_ldf_stream.py tests/test_ldf_self_forcing.py -q`：`34 passed`。
+- 搜索确认`utils/training/ldf`不再调用LDF私有模型方法。
+
+涉及文件：
+
+- `models/diffusion_forcing_wan.py`
+- `utils/training/ldf/batch.py`
+- `utils/training/ldf/rollout.py`
+- `utils/training/ldf/self_forcing.py`
+- `tests/test_ldf_stream.py`
+- `tests/test_ldf_self_forcing.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 下一阶段将迁移`batch/self_forcing/rollout`到最终`steps/window/solver`职责结构，并补完整事务parity覆盖。
+
+## 2026-07-19 · 收口LDF训练包与Typed Condition编译
+
+改动类型：训练职责拆分 / 条件接口 / 物理清理 / 回归测试
+
+实际改动内容：
+
+- 将旧`batch.py`、`self_forcing.py`和`rollout.py`分别迁移为`steps.py`、`window.py`和`solver.py`；`solver.py`统一处理K=1、cold replay与K>1 persistent rollout。
+- 删除训练包大型lazy export表，所有调用方直接从职责模块导入，低层flow/window导入不再隐式加载Lightning、evaluation或runtime。
+- 将`create_ldf_condition()`改为typed keyword接口；active root/body转换、future candidate压缩、absolute position/mask/horizon对齐和model-facing校验由一个入口完成。
+- 训练XZ compiler与runtime route/observation compiler均切换到同一个condition入口；删除固定post-window future语义的`create_window_condition()`及导出。
+- Dynamic Future保持为“absolute candidate superset + `LDFInput.future_attention_mask()`”，不再存在按固定active-end切分的第二套helper。
+
+改动理由：
+
+- 旧训练文件同时承担窗口课程、step构造和solver状态推进，导致K=1/cold/K>1边界重复且命名无法反映所有权。
+- mapping式condition中间态允许调用方自行决定packing和默认position，容易让训练与runtime在future语义上再次分叉。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_ldf_self_forcing.py tests/test_ldf_training.py tests/test_migration_guards.py -q`：`89 passed`。
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests/test_ldf_conditions.py tests/test_ldf_training.py tests/test_ldf_self_forcing.py tests/test_inference.py -q`：`71 passed`。
+- 搜索确认生产代码无`utils.training.ldf.batch/self_forcing/rollout`与`create_window_condition`活跃引用。
+
+涉及文件：
+
+- `utils/training/ldf/steps.py`
+- `utils/training/ldf/window.py`
+- `utils/training/ldf/solver.py`
+- `utils/training/ldf/conditioning.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/__init__.py`
+- `utils/conditions/ldf.py`
+- `utils/inference/condition.py`
+- `tests/test_ldf_conditions.py`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+
+后续事项：
+
+- 下一阶段收紧validation与checkpoint内容身份合同，并删除过时latent-cache入口和旧合同文档。
+
+## 2026-07-19 · 冻结Checkpoint内容合同并完成旧LDF路径物理清理
+
+改动类型：resume安全 / 校验分层 / statistics血缘 / 旧入口删除
+
+实际改动内容：
+
+- LDF checkpoint不再保存或比较VAE/statistics/text绝对路径；改为比较VAE checkpoint SHA256、text table content ID、LDF root/local statistics、VAE body/local/latent statistics、模型结构参数及50-token训练合同。
+- 缺少新训练合同的旧LDF checkpoint直接拒绝resume，不再走legacy warning；统计量仍在父类覆盖模型state之前逐项比较。
+- `LDFCondition.validate_structure()/validate()`与`LDFInput.validate_structure()/validate()`完成职责分层：正常forward只做shape/dtype/device，完整路径增加finite、prefix、beta、position、heading与future mask语义，不重复结构判断。
+- root statistics文件新增冻结采样metadata；训练入口验证50-token、C=5、uniform-legal-history、uniform yaw和windows-per-sample。资产准备脚本不再复用无metadata或合同不匹配的旧文件。
+- 按冻结协议重新生成本机HumanML `root_stats.npz`；23,240个train样本完成统计。
+- 物理删除`tools/compute_z_stats.py`，并增加migration guard确认旧training模块、旧condition helper和逐样本latent-cache入口均不存在。
+- README、数据/训练/模型文档统一为50 tokens/200 frames、0～45 horizon与0/100k/200k/300k的K=1/2/3/5课程。
+
+改动理由：
+
+- 绝对路径比较会错误拒绝内容完全相同的跨服务器恢复；只比较路径又无法发现同路径资产被替换。
+- Root normalization的数值本身无法证明其anchor/window采样分布，必须把稳定统计协议写入文件，同时与会变化的cold/K策略解耦。
+- 旧模块和旧文档继续存在会让后续维护者误以为有第二套solver、future或latent-cache合同。
+
+验证：
+
+- LDF condition/training/solver/inference定向回归：`73 passed`。
+- 配置、migration与root-contract回归：`45 passed`。
+- 资产准备与root statistics测试通过；重新生成文件包含`root_mean/root_std/metadata`，metadata与正式配置完全一致。
+- 新增测试确认同内容资产位于不同绝对路径时允许resume，缺少合同、内容变化、统计变化和模型/训练合同变化均fail-fast。
+
+涉及文件：
+
+- `utils/training/ldf/lightning_module.py`
+- `utils/conditions/ldf.py`
+- `train_ldf.py`
+- `tools/compute_ldf_root_stats.py`
+- `tools/prepare_training_assets.py`
+- `tools/compute_z_stats.py`（删除）
+- `tests/test_ldf_training.py`
+- `tests/test_migration_guards.py`
+- `tests/test_prepare_training_assets.py`
+- `README.md`
+- `docs/rearchitecture/01_MODEL_ARCHITECTURE_AND_IO.md`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/rearchitecture/06_LDF_IMPLEMENTATION_DESIGN.md`
+
+后续事项：
+
+- 运行全仓测试、静态编译、diff检查与DDP静态图回归；若发现遗漏，只在唯一职责模块修正，不恢复兼容入口。
+
+## 2026-07-19 · LDF架构收口最终验收
+
+改动类型：最终回归 / 不变量测试 / 文档收口
+
+实际改动内容：
+
+- 增加commit/rebase世界坐标不变量测试，显式验证按`1-beta`平移model-space solver state后能够无损恢复原world-space XZ，且latent不受rebase影响、committed heading保持单位圆。
+- 资产准备脚本生成root statistics时直接读取冻结的`root_statistics.window_tokens/generation_tokens`，不再间接依赖训练data/model字段；训练入口仍要求两者一致。
+- 清理架构文档中最后残留的40-token、160-frame、35-horizon和旧K schedule示例，统一为200 frames、50 tokens、C=5、0～45 horizon及K=1/2/3/5。
+- 最终搜索确认生产训练代码不调用LDF私有stream方法，旧`batch/self_forcing/rollout`模块、`create_window_condition()`和`compute_z_stats.py`均无活跃引用。
+
+改动理由：
+
+- 求解器重构的最终验收不能只检查局部tensor shape，还必须锁定commit事务不会改变世界坐标中的动作。
+- Root statistics已成为独立冻结协议，其生成命令应直接由该协议驱动，避免未来资源配置调整意外改变统计采样语义。
+- 代码只有一条正式调用链后，文档也必须只保留同一套可执行合同。
+
+验证：
+
+- `/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：`296 passed in 65.21s`。
+- 全仓Python文件逐一执行`py_compile`：通过。
+- `git diff --check`：通过。
+- 两进程DDP rank-local future/static-graph测试包含在全仓回归中并通过。
+- root statistics metadata已按50-token冻结协议在本机重新生成并通过训练入口校验。
+
+涉及文件：
+
+- `tools/prepare_training_assets.py`
+- `train_ldf.py`
+- `tests/test_ldf_stream.py`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 远端服务器首次使用冻结合同前需运行`python -m tools.compute_ldf_root_stats --config configs/ldf.yaml`生成带metadata的root statistics；之后cold replay概率或K课程的小改动不要求重算。
+- 本轮没有启动正式训练，也没有恢复Web；下一步是从冻结后的50-token合同启动新LDF训练并观察cold朝向、dense-XZ ADE/FDE、T2M FID和K课程稳定性。

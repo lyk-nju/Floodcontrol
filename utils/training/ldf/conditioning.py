@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import torch
 
-from utils.conditions.ldf import LDFCondition
+from utils.conditions.ldf import LDFCondition, create_ldf_condition
 from utils.motion_process import ROOT_DIM
 from utils.token_frame import FRAMES_PER_TOKEN
-from utils.training.ldf.batch import LDFStepView
+from utils.training.ldf.steps import LDFStepView
 
 
 _XZ_FEATURES = (0, 2)
@@ -34,6 +34,56 @@ def sample_constraint_keep_mask(
     if probability == 1.0:
         return torch.zeros(batch_size, device=device, dtype=torch.bool)
     return torch.rand(batch_size, device=device, generator=generator) >= probability
+
+
+def sample_future_horizon_tokens(
+    *,
+    token_valid_mask: torch.Tensor,
+    initial_active_end: torch.Tensor,
+    rollout_steps: int,
+    max_horizon_token: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample one persistent per-sample future lookahead in ``[0, max]``.
+
+    The sampled horizon must remain fully available after the final rollout
+    commit, so shorter samples and larger K values reduce the per-sample upper
+    bound.  A zero horizon means that no not-yet-visible XZ token is exposed;
+    it is distinct from constraint dropout, which also removes visible XZ.
+    """
+
+    if (
+        not torch.is_tensor(token_valid_mask)
+        or token_valid_mask.ndim != 2
+        or token_valid_mask.dtype != torch.bool
+    ):
+        raise ValueError("token_valid_mask must be bool [B,T]")
+    batch = token_valid_mask.shape[0]
+    active_end = torch.as_tensor(
+        initial_active_end,
+        device=token_valid_mask.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    rollout_steps = int(rollout_steps)
+    maximum = int(max_horizon_token)
+    if tuple(active_end.shape) != (batch,):
+        raise ValueError("initial_active_end must be [B]")
+    if rollout_steps <= 0:
+        raise ValueError("rollout_steps must be positive")
+    if maximum < 0:
+        raise ValueError("max_horizon_token must be non-negative")
+
+    valid_counts = token_valid_mask.sum(dim=1, dtype=torch.long)
+    available = valid_counts - active_end - (rollout_steps - 1)
+    if bool((available < 0).any()):
+        raise ValueError("active window leaves insufficient rollout frontier")
+    upper = torch.minimum(available, torch.full_like(available, maximum))
+    draws = torch.rand(
+        batch,
+        device=token_valid_mask.device,
+        generator=generator,
+    )
+    return torch.floor(draws * (upper + 1).to(draws.dtype)).to(torch.long)
 
 
 def _validate_sampling_probabilities(
@@ -70,7 +120,8 @@ def sample_xz_constraint_mask(
     token_valid_mask: torch.Tensor,
     initial_active_start: torch.Tensor,
     initial_active_end: torch.Tensor,
-    max_horizon_token: int,
+    future_horizon_tokens: torch.Tensor,
+    rollout_steps: int,
     dense_probability: float,
     waypoint_probability: float,
     goal_probability: float,
@@ -104,13 +155,24 @@ def sample_xz_constraint_mask(
         device=token_valid_mask.device,
         dtype=torch.long,
     ).reshape(-1)
-    lookahead = int(max_horizon_token)
+    horizon = torch.as_tensor(
+        future_horizon_tokens,
+        device=token_valid_mask.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    rollout_steps = int(rollout_steps)
     max_waypoint_count = int(max_waypoint_count)
-    if tuple(active_start.shape) != (batch,) or tuple(active_end.shape) != (batch,):
-        raise ValueError("initial active bounds must be [B]")
+    if (
+        tuple(active_start.shape) != (batch,)
+        or tuple(active_end.shape) != (batch,)
+        or tuple(horizon.shape) != (batch,)
+    ):
+        raise ValueError("initial active bounds and future horizon must be [B]")
     valid_counts = token_valid_mask.sum(dim=1, dtype=torch.long)
-    if lookahead < 0:
-        raise ValueError("max_horizon_token must be non-negative")
+    if bool((horizon < 0).any()):
+        raise ValueError("future_horizon_tokens must be non-negative")
+    if rollout_steps <= 0:
+        raise ValueError("rollout_steps must be positive")
     if max_waypoint_count <= 0:
         raise ValueError("max_waypoint_count must be positive")
     dense, waypoint, _goal = _validate_sampling_probabilities(
@@ -133,14 +195,22 @@ def sample_xz_constraint_mask(
     # Variable-size waypoint/goal selection still uses a Python loop, but copy
     # its scalar control data to CPU once rather than synchronizing repeatedly
     # for every sample.
-    bounds = torch.stack((active_start, active_end, valid_counts), dim=1).tolist()
+    bounds = torch.stack(
+        (active_start, active_end, valid_counts, horizon), dim=1
+    ).tolist()
     mode_draws_list = mode_draws.tolist()
     rows = zip(bounds, mode_draws_list, strict=True)
     for batch_index, (
-        (sample_active_start, sample_active_end, valid_count),
+        (sample_active_start, sample_active_end, valid_count, sample_horizon),
         draw,
     ) in enumerate(rows):
-        future_end = min(valid_count, sample_active_end + lookahead)
+        # The immutable plan must cover the lookahead after every later commit,
+        # not only after the initial active band.  Per-step compilation still
+        # exposes at most ``sample_horizon`` tokens from the current boundary.
+        future_end = min(
+            valid_count,
+            sample_active_end + sample_horizon + rollout_steps - 1,
+        )
         eligible_tokens = torch.arange(
             sample_active_start,
             future_end,
@@ -219,58 +289,6 @@ def sample_xz_constraint_mask(
     return plan
 
 
-def _pack_future_constraints(
-    *,
-    clean_root_motion: torch.Tensor,
-    constraint_mask: torch.Tensor,
-    timeline_position_ids: torch.Tensor,
-    future_start: torch.Tensor,
-    future_end: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    batch, tokens = constraint_mask.shape[:2]
-    positions = torch.arange(tokens, device=constraint_mask.device)[None]
-    candidate_range = (
-        (positions >= future_start[:, None])
-        & (positions < future_end[:, None])
-    )
-    candidate_valid = constraint_mask.flatten(2).any(dim=-1) & candidate_range
-    counts = candidate_valid.sum(dim=1, dtype=torch.long)
-    packed_tokens = int(counts.max().item())
-    if packed_tokens == 0:
-        return None
-
-    future_value = clean_root_motion.new_zeros(
-        batch, packed_tokens, FRAMES_PER_TOKEN, ROOT_DIM
-    )
-    future_mask = torch.zeros_like(future_value, dtype=torch.bool)
-    future_positions = timeline_position_ids.new_zeros(batch, packed_tokens)
-    future_valid = torch.zeros(
-        batch,
-        packed_tokens,
-        device=clean_root_motion.device,
-        dtype=torch.bool,
-    )
-    packed_indices = candidate_valid.cumsum(dim=1, dtype=torch.long) - 1
-    batch_indices = torch.arange(
-        batch, device=constraint_mask.device
-    )[:, None].expand(-1, tokens)
-    source_indices = positions.expand(batch, -1)
-    selected_batch = batch_indices[candidate_valid]
-    selected_source = source_indices[candidate_valid]
-    selected_destination = packed_indices[candidate_valid]
-    future_value[selected_batch, selected_destination] = clean_root_motion[
-        selected_batch, selected_source
-    ]
-    future_mask[selected_batch, selected_destination] = constraint_mask[
-        selected_batch, selected_source
-    ]
-    future_positions[selected_batch, selected_destination] = timeline_position_ids[
-        selected_batch, selected_source
-    ]
-    future_valid[selected_batch, selected_destination] = True
-    return future_value, future_mask, future_positions, future_valid
-
-
 def create_xz_condition(
     *,
     clean_root_motion: torch.Tensor,
@@ -279,7 +297,7 @@ def create_xz_condition(
     view: LDFStepView,
     text_context: list[torch.Tensor],
     text_null_context: list[torch.Tensor],
-    max_horizon_token: int,
+    future_horizon_tokens: torch.Tensor,
 ) -> LDFCondition:
     """Compile one persistent absolute XZ plan for the current rollout view."""
 
@@ -300,9 +318,15 @@ def create_xz_condition(
     if tuple(mask.shape) != tuple(clean_root_motion.shape):
         raise ValueError("constraint_mask must match clean_root_motion")
     mask = mask & token_valid_mask[..., None, None]
-    lookahead = int(max_horizon_token)
-    if lookahead < 0:
-        raise ValueError("max_horizon_token must be non-negative")
+    horizon = torch.as_tensor(
+        future_horizon_tokens,
+        device=clean_root_motion.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    if tuple(horizon.shape) != (batch,):
+        raise ValueError("future_horizon_tokens must be [B]")
+    if bool((horizon < 0).any()):
+        raise ValueError("future_horizon_tokens must be non-negative")
     for name, value in (
         ("active_start", view.active_start),
         ("active_end", view.active_end),
@@ -324,49 +348,36 @@ def create_xz_condition(
     # Stage will move the effective boundary from the first currently-visible
     # motion token through the active band as triangular denoising progresses.
     future_start = view.active_start + 1
+    requested_future_end = torch.where(
+        horizon > 0,
+        view.active_end + horizon,
+        future_start,
+    )
     future_end = torch.minimum(
         valid_counts,
-        view.active_end + lookahead,
+        requested_future_end,
     )
-    packed = None
-    if lookahead > 0:
-        packed = _pack_future_constraints(
-            clean_root_motion=clean_root_motion,
-            constraint_mask=mask,
-            timeline_position_ids=view.timeline_position_ids,
-            future_start=future_start,
-            future_end=future_end,
-        )
-    future_value = future_mask = future_positions = future_valid = None
-    if packed is not None:
-        future_value, future_mask, future_positions, future_valid = packed
+    candidate_range = (
+        (positions >= future_start[:, None])
+        & (positions < future_end[:, None])
+    )
+    future_mask = mask & candidate_range[..., None, None]
 
-    condition = LDFCondition(
-        text_context=list(text_context),
-        text_null_context=list(text_null_context),
+    return create_ldf_condition(
+        text_context=text_context,
+        text_null_context=text_null_context,
         root_condition_value=clean_root_motion.detach(),
         root_condition_mask=active_mask,
-        future_root_condition_value=future_value,
+        future_root_condition_value=clean_root_motion.detach(),
         future_root_condition_mask=future_mask,
-        future_timeline_position_ids=future_positions,
-        future_valid_mask=future_valid,
-        future_horizon_tokens=(
-            None
-            if future_value is None
-            else torch.full(
-                (batch,),
-                lookahead,
-                device=clean_root_motion.device,
-                dtype=torch.long,
-            )
-        ),
+        future_timeline_position_ids=view.timeline_position_ids,
+        future_horizon_tokens=horizon,
     )
-    condition.validate_structure(batch_size=batch, token_length=tokens)
-    return condition
 
 
 __all__ = [
     "create_xz_condition",
     "sample_constraint_keep_mask",
+    "sample_future_horizon_tokens",
     "sample_xz_constraint_mask",
 ]

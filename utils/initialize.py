@@ -61,9 +61,37 @@ class ProjectConfig:
             self.apply_overrides(overrides)
 
     def merge_yaml(self, config_path: str | Path) -> None:
-        """Merge one YAML file into the current configuration."""
-        loaded = OmegaConf.load(config_path)
+        """Merge one YAML file after resolving its optional base recursively."""
+
+        loaded = self._load_yaml_with_base(Path(config_path), stack=())
         self.config = OmegaConf.merge(self.config, loaded)
+
+    @classmethod
+    def _load_yaml_with_base(
+        cls,
+        config_path: Path,
+        *,
+        stack: tuple[Path, ...],
+    ):
+        path = config_path.expanduser().resolve()
+        if path in stack:
+            cycle = " -> ".join(str(item) for item in (*stack, path))
+            raise ValueError(f"configuration base cycle detected: {cycle}")
+        if not path.is_file():
+            raise FileNotFoundError(f"configuration file not found: {path}")
+
+        loaded = OmegaConf.load(path)
+        base_config = loaded.pop("base_config", None)
+        if base_config is None:
+            return loaded
+        if not isinstance(base_config, str) or not base_config.strip():
+            raise TypeError("base_config must be one non-empty YAML path")
+
+        base_path = Path(base_config).expanduser()
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        base = cls._load_yaml_with_base(base_path, stack=(*stack, path))
+        return OmegaConf.merge(base, loaded)
 
     def apply_overrides(self, overrides: Mapping[str, Any]) -> None:
         """Apply dot-separated OmegaConf keys after parsing scalar strings."""
