@@ -119,6 +119,12 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
         assert injected_name not in cfg.model.params
 
 
+def test_formal_t2m_evaluation_uses_nocfg():
+    cfg = load_config(str(REMOTE_LDF_CONFIG))
+    assert cfg.validation.t2m.enabled is True
+    assert cfg.validation.t2m.cfg_mode == "nocfg"
+
+
 def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     cfg = load_config(str(ROOT / "configs" / "ldf_multi.yaml"))
     human_cfg = load_config(str(LOCAL_LDF_CONFIG))

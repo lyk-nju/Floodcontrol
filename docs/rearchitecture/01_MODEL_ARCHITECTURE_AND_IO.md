@@ -250,8 +250,8 @@ LDFCondition
 
 - text context 支持 token 时间轴上的 prompt segment/change；Root/Body Transformer共享同一语义文本条件和 text encoder，不各自维护文本历史；
 - root/body observation 使用 typed value + mask；进入 LDF 前已完成坐标变换、normalization 和 active-window 裁剪；
-- observation projector 在模型内部产生 in-window observation features 与 constraint-only future-goal tokens；
-- future timeline IDs使用absolute坐标并严格位于当前motion window之后；Root Stage根据`rope_origin`派生future RoPE IDs，future token数量不得改变motion、beta或Body Stage长度；
+- observation projector 在模型内部产生当前可见motion的observation features与constraint-only future候选tokens；
+- future timeline IDs使用absolute坐标；候选superset可覆盖尚未可见的active位置，但实际attention视图严格位于当前visible-motion末端之后。Root Stage根据`rope_origin`派生future RoPE IDs，future token数量不得改变motion、beta或Body Stage长度；
 - `previous_root_frame/previous_root_valid_mask`由`LDFInput`成对携带，只供backward local-root codec使用，不伪装成noisy generation token或CFG条件；全batch cold start时两者均为`None`，随机crop混合batch则使用physical `[B,5]`与逐样本bool `[B]`；
 - condition dropout 与 CFG 分支由 `utils/conditions/ldf.py` 的 `create_window_condition/create_ldf_condition/create_cfg_condition` 纯函数创建，不增加公共 wrapper dataclass；
 - 不存在 `controlnet_condition`、`root_refiner_plan` 或 post-decode feedback 输入。
@@ -281,7 +281,7 @@ active XZ等观测不得覆盖`noisy_motion.root_motion`。root flow监督`v*=x0
 
 稀疏 body observations 通常是 frame-level body265/joint/keyframe constraints，并不天然等于 causal body latent。因此 V1 只把它们通过 observation projector 作为条件，不对 latent state 或最终输出做 hard overwrite。
 
-超出 current generation state 的 observations 被编译为 future constraint tokens。它们参加 non-causal window attention，但没有 `root_t/latent_t/beta`，也不会被 scheduler 更新或 commit。
+超出当前真实visible generation state的observations会从commit级候选superset中动态选为future constraint tokens。它们参加non-causal window attention，但没有`root_t/latent_t/beta`，也不会被scheduler更新或commit；同一absolute token一旦成为motion query，就不再作为future query进入该次forward。
 
 ### 5. Root stage
 

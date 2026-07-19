@@ -192,7 +192,8 @@ def test_condition_compiler_aligns_world_route_masks_and_future_positions():
         torch.tensor([0.2, 0.2]),
         atol=1e-6,
     )
-    assert condition.future_timeline_position_ids.tolist() == [[3, 4]]
+    assert condition.future_timeline_position_ids.tolist() == [[2, 3, 4]]
+    assert condition.future_horizon_tokens.tolist() == [2]
     assert len(condition.text_context) == 6
     assert not torch.equal(condition.text_context[0], condition.text_context[1])
 

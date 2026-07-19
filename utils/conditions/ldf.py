@@ -98,6 +98,7 @@ class LDFCondition:
     future_root_condition_mask: torch.Tensor | None = None
     future_timeline_position_ids: torch.Tensor | None = None
     future_valid_mask: torch.Tensor | None = None
+    future_horizon_tokens: torch.Tensor | None = None
 
     def validate_structure(
         self,
@@ -180,6 +181,7 @@ class LDFCondition:
             self.future_root_condition_mask,
             self.future_timeline_position_ids,
             self.future_valid_mask,
+            self.future_horizon_tokens,
         )
         if any(value is not None for value in future_fields) and not all(
             value is not None for value in future_fields
@@ -195,6 +197,9 @@ class LDFCondition:
                 2,
             )
             _require_tensor("future_valid_mask", self.future_valid_mask, 2)
+            _require_tensor(
+                "future_horizon_tokens", self.future_horizon_tokens, 1
+            )
             if tuple(self.future_root_condition_value.shape[2:]) != (
                 FRAMES_PER_TOKEN,
                 ROOT_DIM,
@@ -207,10 +212,14 @@ class LDFCondition:
                 raise ValueError("future root fields must share [B,N]")
             if batch_size is not None and prefix[0] != batch_size:
                 raise ValueError("future root batch size does not match LDF input")
+            if tuple(self.future_horizon_tokens.shape) != (prefix[0],):
+                raise ValueError("future_horizon_tokens must be [B]")
             if self.future_timeline_position_ids.dtype != torch.long:
                 raise TypeError("future_timeline_position_ids must be int64")
             if self.future_valid_mask.dtype != torch.bool:
                 raise TypeError("future_valid_mask must be bool")
+            if self.future_horizon_tokens.dtype != torch.long:
+                raise TypeError("future_horizon_tokens must be int64")
 
     def validate(
         self,
@@ -300,6 +309,7 @@ class LDFCondition:
             self.future_root_condition_mask,
             self.future_timeline_position_ids,
             self.future_valid_mask,
+            self.future_horizon_tokens,
         )
         if any(value is not None for value in future_fields) and not all(
             value is not None for value in future_fields
@@ -315,6 +325,9 @@ class LDFCondition:
                 2,
             )
             _require_tensor("future_valid_mask", self.future_valid_mask, 2)
+            _require_tensor(
+                "future_horizon_tokens", self.future_horizon_tokens, 1
+            )
             if tuple(self.future_root_condition_value.shape[2:]) != (
                 FRAMES_PER_TOKEN,
                 ROOT_DIM,
@@ -325,10 +338,16 @@ class LDFCondition:
                 self.future_valid_mask.shape
             ) != prefix:
                 raise ValueError("future root fields must share [B,N]")
+            if tuple(self.future_horizon_tokens.shape) != (prefix[0],):
+                raise ValueError("future_horizon_tokens must be [B]")
             if self.future_timeline_position_ids.dtype != torch.long:
                 raise TypeError("future_timeline_position_ids must be int64")
             if self.future_valid_mask.dtype != torch.bool:
                 raise TypeError("future_valid_mask must be bool")
+            if self.future_horizon_tokens.dtype != torch.long:
+                raise TypeError("future_horizon_tokens must be int64")
+            if bool((self.future_horizon_tokens <= 0).any()):
+                raise ValueError("future_horizon_tokens must be positive")
             if not _is_prefix_mask(self.future_valid_mask):
                 raise ValueError("future_valid_mask must be prefix-valid for packed attention")
             mask_valid = self.future_root_condition_mask.flatten(2).any(dim=-1)
@@ -481,7 +500,7 @@ class LDFInput:
             latent_dim=self.noisy_motion.latent_motion.shape[-1],
         )
         future_positions = self.condition.future_timeline_position_ids
-        future_valid = self.condition.future_valid_mask
+        future_valid = self.future_attention_mask()
         if future_positions is not None:
             for batch_idx in range(batch):
                 valid_current = valid[batch_idx]
@@ -508,6 +527,43 @@ class LDFInput:
         if timeline_position_ids.dtype != torch.long:
             raise TypeError("timeline_position_ids must be int64")
         return timeline_position_ids - self.rope_origin.to(timeline_position_ids.device)
+
+    def future_attention_mask(self) -> torch.Tensor | None:
+        """Select the future constraints visible at this denoising microstep.
+
+        The condition stores one immutable, prefix-packed candidate superset for
+        the whole commit.  Motion visibility changes with the triangular
+        schedule, so this method removes candidates which have already become
+        motion queries, applies the configured absolute lookahead, and caps the
+        combined motion/future query count at the model window length.
+        """
+
+        condition = self.condition
+        if condition.future_valid_mask is None:
+            return None
+        visible_motion = self.history_mask | self.generation_mask
+        visible_count = visible_motion.sum(dim=1, dtype=torch.long)
+        visible_end = self.timeline_position_ids[:, 0] + visible_count
+        future_positions = condition.future_timeline_position_ids.to(
+            device=self.timeline_position_ids.device
+        )
+        future_valid = condition.future_valid_mask.to(
+            device=self.timeline_position_ids.device
+        )
+        horizon = condition.future_horizon_tokens.to(
+            device=self.timeline_position_ids.device
+        )
+        selected = (
+            future_valid
+            & (future_positions >= visible_end[:, None])
+            & (future_positions < visible_end[:, None] + horizon[:, None])
+        )
+
+        # Sparse waypoint/goal candidates need a rank-based capacity limit.  A
+        # positional cutoff could otherwise under-fill the available budget.
+        available_slots = self.noisy_motion.token_length - visible_count
+        selected_rank = selected.cumsum(dim=1, dtype=torch.long)
+        return selected & (selected_rank <= available_slots[:, None])
 
 
 @dataclass(frozen=True)
@@ -638,6 +694,9 @@ def create_window_condition(
             device=(root_condition_value.device if root_condition_value is not None else None),
             dtype=torch.long,
         ),
+        "future_horizon_tokens": torch.full(
+            (batch_size,), future_tokens, dtype=torch.long
+        ),
     }
 
 
@@ -661,6 +720,9 @@ def create_ldf_condition(window_condition: Mapping[str, Any]) -> LDFCondition:
         window_condition.get("future_root_condition_value")
     )
     future_mask = _root_to_tokens(window_condition.get("future_root_condition_mask"))
+    if future_value is not None and future_value.shape[1] == 0:
+        future_value = None
+        future_mask = None
     future_valid = None
     future_timeline_position_ids = None
     if future_value is not None:
@@ -688,6 +750,25 @@ def create_ldf_condition(window_condition: Mapping[str, Any]) -> LDFCondition:
         future_value, future_mask = packed_value, packed_mask
         future_timeline_position_ids, future_valid = packed_pos, packed_valid
 
+    future_horizon_tokens = None
+    if future_value is not None:
+        raw_horizon = window_condition.get("future_horizon_tokens")
+        if raw_horizon is None:
+            raise ValueError(
+                "future_horizon_tokens is required with future root conditions"
+            )
+        future_horizon_tokens = torch.as_tensor(
+            raw_horizon,
+            device=future_value.device,
+            dtype=torch.long,
+        )
+        if future_horizon_tokens.ndim == 0:
+            future_horizon_tokens = future_horizon_tokens.expand(
+                future_value.shape[0]
+            )
+        else:
+            future_horizon_tokens = future_horizon_tokens.reshape(-1)
+
     condition = LDFCondition(
         text_context=list(window_condition.get("text_context", [])),
         text_null_context=list(window_condition.get("text_null_context", [])),
@@ -699,6 +780,7 @@ def create_ldf_condition(window_condition: Mapping[str, Any]) -> LDFCondition:
         future_root_condition_mask=future_mask,
         future_timeline_position_ids=future_timeline_position_ids,
         future_valid_mask=future_valid,
+        future_horizon_tokens=future_horizon_tokens,
     )
     condition.validate()
     return condition

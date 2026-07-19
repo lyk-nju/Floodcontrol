@@ -49,6 +49,7 @@ validation:
   t2m:
     enabled: false
     steps: 10000
+    cfg_mode: nocfg
 
 vae:
   target: models.vae_wan_1d.BodyVAE

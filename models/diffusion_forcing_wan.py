@@ -322,7 +322,10 @@ class RootTransformer(TransformerStage):
             # the packed token buffer remain FP32. Indexed assignment requires
             # an exact dtype match, so the packed stream follows motion dtype.
             future = future.to(dtype=current.dtype)
-            future_count = condition.future_valid_mask.sum(
+            future_attention_mask = inputs.future_attention_mask().to(
+                device=current.device
+            )
+            future_count = future_attention_mask.sum(
                 dim=1, dtype=torch.long
             ).to(valid_lengths.device)
             future_rope_positions = inputs.timeline_to_rope(
@@ -364,12 +367,13 @@ class RootTransformer(TransformerStage):
             future_positions = torch.arange(
                 future_tokens, device=current.device
             )[None]
-            future_valid = future_positions < future_count[:, None]
+            future_valid = future_attention_mask
             future_batch = batch_grid.expand(-1, future_tokens)[future_valid]
             future_index = future_positions.expand(batch, -1)[future_valid]
+            future_rank = future_valid.cumsum(dim=1, dtype=torch.long) - 1
             future_destination = (
-                valid_lengths[:, None] + future_positions
-            ).expand(batch, -1)[future_valid]
+                valid_lengths[:, None] + future_rank
+            )[future_valid]
             all_tokens[future_batch, future_destination] = future[
                 future_batch, future_index
             ]

@@ -86,7 +86,7 @@ future goal（25%）:
     样本没有真实future frame时退化为一个active waypoint
 ```
 
-稀疏性在`[B,T,4,5]`的frame维采样，不会因选择一个token而自动暴露该token全部四帧。每个step只把落在当前active band的选中帧写入current mask；其后的选中帧按absolute timeline position压紧打包为future tokens。goal随self-forcing窗口前移会自然从future token变为active内约束，不会重新采样。lookahead只使用当前sample/span内真实有效token；短span末尾自然缩短，不用零值冒充未来轨迹。future value在进入projection前按feature mask清零，因此未观测的root y与heading不能泄露给Root Stage。Body Stage不读取raw active/future XZ，只读取Root Stage组合后的唯一clean root派生的local root和heading condition。
+稀疏性在`[B,T,4,5]`的frame维采样，不会因选择一个token而自动暴露该token全部四帧。每个commit从`active_start+1`到`active_end+max_horizon_token`编译一次按absolute timeline position压紧的候选superset；每个denoise microstep再以`history_mask | generation_mask`的真实可见末端为边界，保留其后最多`max_horizon_token`范围内的候选。这样cold start中尚未可见的active XZ会先作为future条件，成为motion query后立即从future attention视图移除，同一absolute token不会扮演两种query。goal随self-forcing窗口前移会自然从future候选变为active内约束，不会重新采样。lookahead只使用当前sample/span内真实有效token；短span末尾自然缩短，不用零值冒充未来轨迹。future value在进入projection前按feature mask清零，因此未观测的root y与heading不能泄露给Root Stage。Body Stage不读取raw active/future XZ，只读取Root Stage组合后的唯一clean root派生的local root和heading condition。
 
 训练以sample为单位分别采样text keep/drop与constraint keep/drop，两个Bernoulli变量相互独立，并在同一个self-forcing rollout的所有step复用同一constraint决定。这使单分支训练自然覆盖history-only、text-only、constraint-only和joint四种分布；推理时`create_cfg_condition()`再显式构造对应分支并进行separated CFG。当前正式配置为：
 

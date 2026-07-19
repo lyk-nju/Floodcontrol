@@ -59,7 +59,9 @@ def _distributed_collective_worker(rank: int, world_size: int, init_file: str) -
 
 
 def _zero_prediction(self, inputs, **kwargs):
-    del kwargs
+    seen_cfg_modes = getattr(self, "_seen_cfg_modes", None)
+    if seen_cfg_modes is not None:
+        seen_cfg_modes.append(kwargs.get("mode"))
     root_velocity = torch.zeros_like(inputs.noisy_motion.root_motion)
     latent_velocity = torch.zeros_like(inputs.noisy_motion.latent_motion)
     local = torch.zeros(*root_velocity.shape[:3], 4, device=root_velocity.device)
@@ -434,3 +436,43 @@ def test_generation_modes_share_runtime_but_only_rolling_moves_window(
     assert generated.root_motion.shape == (16, 5)
     assert generated.body_motion.shape == (16, 265)
     assert generated.traces[-1].window_origin_after == expected_final_origin
+
+
+def test_generation_evaluation_can_override_model_guidance_mode():
+    module = _evaluation_module()
+    module.model.cfg_mode = "separated"
+    module.model._seen_cfg_modes = []
+    root = torch.zeros(8, 5)
+    root[:, 1] = 1.0
+    root[:, 3] = 1.0
+    sample = {
+        "dataset": "HumanML3D",
+        "name": "sample",
+        "root_motion": root,
+        "body_motion": torch.zeros(8, 265),
+        "text_data": [
+            {
+                "text": "walk",
+                "tokens": ["walk/VERB"],
+                "start_frame": 0,
+                "end_frame": 8,
+            }
+        ],
+    }
+
+    generate_evaluation_sequence(
+        module,
+        sample,
+        mode="stream",
+        guidance_mode="nocfg",
+        seed=7,
+        frame_count=8,
+        dense_xz=False,
+        rolling_window_tokens=4,
+        max_horizon_token=2,
+        num_denoise_steps=2,
+    )
+
+    assert module.model.cfg_mode == "separated"
+    assert module.model._seen_cfg_modes
+    assert set(module.model._seen_cfg_modes) == {"nocfg"}

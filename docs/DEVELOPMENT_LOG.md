@@ -4264,3 +4264,97 @@
 
 - 在远端HumanML和HumanML+BABEL正式batch上分别记录峰值显存与step time；GPU上的`nonzero/unique/sort`仍属于prompt map编译成本，若profiler确认其影响流式延迟，再将identity/group map前移到CPU condition compiler。
 - 通用Root/Body visible-length与future packing仍有既有动态长度读取，本次只删除文本group新增的最大长度同步，不宣称整个模型已经零同步。
+
+## 2026-07-19 · T2M评测固定使用No-CFG Joint条件
+
+改动类型：评测协议 / CFG路由 / 配置与回归测试
+
+实际改动内容：
+
+- 为通用`generate_evaluation_sequence()`增加可选`guidance_mode`参数；未指定时继续继承`model.cfg_mode`，因此既有dense-XZ轨迹评测语义不变。
+- T2M runner现在读取`validation.t2m.cfg_mode`并显式传入生成session；正式远端配置和本机配置均写明`cfg_mode: nocfg`。
+- T2M summary新增`cfg_mode`字段，避免只记录`stream/rolling`窗口模式却无法识别实际guidance协议。
+- 训练入口校验T2M guidance只能为`nocfg/joint/separated`；默认值仍为`nocfg`，方便旧的最小测试配置。
+- 更新训练配置与生成评测文档，明确T2M使用joint文本条件的单分支forward，而dense-XZ仍独立继承模型全局CFG配置。
+
+改动理由：
+
+- T2M不提供轨迹或future XZ，不需要为text/history/constraint执行三套Root/Body forward；直接使用joint条件既符合训练forward，也避免用线性分支组合近似非线性的联合响应。
+- `validation.generation.modes`表示`stream/rolling`，此前没有T2M专用CFG入口，导致T2M静默继承全局`separated`。显式拆分两个mode可以防止配置语义混淆和评测互相污染。
+
+验证：
+
+- 新增生成入口回归，确认T2M式`guidance_mode=nocfg`传递到每个denoise step，同时不修改`module.model.cfg_mode`。
+- 本次实现完成时运行全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：281项通过。
+- 最终复查时工作区中的远端`ldf.yaml`被并发改成新的K切换点、空resume路径、学习率和worker设置；重新运行两份完整定向文件得到50项通过、2项既有migration guard因仍锁定旧K schedule而失败。未擅自回滚这组不属于本任务的配置改动。
+- 将本次T2M断言拆成独立guard后，`tests/test_ldf_evaluation.py + test_formal_t2m_evaluation_uses_nocfg`最终结果为12项通过、1项因sandbox网络能力跳过；T2M guidance实现和配置断言均通过。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+- 曾按用户初始要求启动40k checkpoint完整1450样本T2M FID，但在用户取消后立即中断；进程与GPU显存均已释放，未产生summary，因此本条不报告FID数值。
+
+涉及文件：
+
+- `utils/training/ldf/evaluation/generation.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `train_ldf.py`
+- `configs/ldf.yaml`
+- `configs/ldf_s5.yaml`
+- `tests/test_ldf_evaluation.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 本轮按用户要求不继续运行40k完整FID；需要正式数值时再使用完整HumanML3D validation split运行，不能用中断结果或子集冒充正式FID。
+- dense-XZ当前仍使用模型全局`separated`，后续应在修复early-cold future XZ可见性后独立比较joint与separated，不由本次T2M改动提前改变。
+
+## 2026-07-19 · Dynamic Future XZ可见边界
+
+改动类型：训练/runtime条件合同 / Root attention动态打包 / cold-start轨迹控制修复
+
+实际改动内容：
+
+- `LDFCondition`新增逐样本`future_horizon_tokens [B]`，将commit级future候选superset的存储范围与每个microstep真正允许读取的absolute lookahead明确分开。
+- `LDFInput.future_attention_mask()`统一计算动态future视图：以`history_mask | generation_mask`的真实可见prefix末端为起点，排除已经成为motion query的absolute token，执行horizon上限，并用rank-based容量限制保证motion加future query不超过模型window。
+- RootTransformer不再假设future有效项始终是候选buffer的前N项；它按动态非前缀mask抽取候选、重新计算packed destination，再接到visible motion prefix之后。候选condition保持只读，CFG和persistent solver state不被修改，`future_projection`的静态DDP零梯度依赖继续保留。
+- 训练condition compiler改为从`active_start + 1`到`active_end + max_horizon_token`编译一次候选superset。cold denoise中尚未可见的active XZ先作为future query，变成motion query后由动态mask自动移除；普通K=1和persistent K>1继续复用同一入口。
+- runtime compiler改为每个commit从`commit_index + 1`开始编译`active_tokens - 1 + max_horizon_token`个候选位置；同一commit的所有denoise microstep复用route/text/condition编译结果，只重算廉价的future attention mask。
+- 通用`create_window_condition/create_ldf_condition`同步携带并校验future horizon；零future窗口不会构造空的future合同。
+- 更新模型、训练、streaming和评测设计文档，删除“future固定从active band末端开始”以及“候选必须位于整个motion tensor之后”的旧表述。
+
+改动理由：
+
+- cold start的三角调度只会逐步暴露`1,1,2,2,3,3,4,4,5,5`个motion token。旧合同却固定把token 1–4留在active condition里、future从token 5开始；最困难的早期阶段因此缺少最近局部XZ方向，并直接跳读远期轨迹。
+- candidate storage允许覆盖尚未可见active位置，但实际attention必须以当前可见末端为边界；两者分离后既不需要每个microstep重新采样或编译route，也不会让同一absolute token同时作为motion和future query。
+
+验证：
+
+- 新增cold 10阶段回归，确认visible motion严格为`1,1,2,2,3,3,4,4,5,5`，future起点随之从token 1推进到token 5，且每阶段只保留配置的3-token lookahead。
+- 新增混合batch逐样本动态边界、候选superset只读、非前缀future gather/scatter、query容量上限和runtime superset absolute position测试。
+- LDF conditions/forward/training/self-forcing/stream/CFG/inference/evaluation/Web runtime定向测试：112项通过。
+- 全仓`/home/yuankai/.conda/envs/flooddiffusion/bin/python -m pytest tests -q`：283项通过、2项失败；两项均为工作区远端`configs/ldf.yaml`当前K schedule与旧migration guard期望不一致，和本次dynamic future实现无关。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `utils/conditions/ldf.py`
+- `utils/training/ldf/conditioning.py`
+- `utils/inference/condition.py`
+- `models/diffusion_forcing_wan.py`
+- `tests/test_ldf_conditions.py`
+- `tests/test_ldf_forward.py`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_inference.py`
+- `docs/rearchitecture/01_MODEL_ARCHITECTURE_AND_IO.md`
+- `docs/rearchitecture/03_STREAMING_ACTIVE_WINDOW.md`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/06_LDF_IMPLEMENTATION_DESIGN.md`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 尚未用40k checkpoint执行固定sample/noise的旧/新runtime对照；下一步应先做无需训练的condition-gap实验，再决定是否从40k checkpoint微调5k–10k。
+- 本轮没有加入heading auxiliary，也没有改变root/body loss、statistics、VAE、checkpoint权重或CFG默认值。

@@ -129,6 +129,7 @@ def generate_evaluation_sequence(
     sample: dict[str, object],
     *,
     mode: str,
+    guidance_mode: str | None = None,
     seed: int,
     frame_count: int,
     dense_xz: bool,
@@ -170,7 +171,11 @@ def generate_evaluation_sequence(
             rolling=rolling,
         ),
         guidance=GuidanceConfig(
-            mode=module.model.cfg_mode,
+            mode=(
+                module.model.cfg_mode
+                if guidance_mode is None
+                else str(guidance_mode)
+            ),
             scale_text=module.model.cfg_scale_text,
             scale_constraint=module.model.cfg_scale_constraint,
             scale_joint=module.model.cfg_scale_joint,

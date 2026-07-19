@@ -8,8 +8,8 @@ seed: 1234
 debug: false
 train: true
 save_dir: ./outputs/ldf
-resume_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260717_123044_ldf_hybrid/step_200000.ckpt
-test_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260717_123044_ldf_hybrid/step_200000.ckpt
+resume_ckpt:
+test_ckpt:
 
 wandb_info:
   project: Floodcontrol
@@ -49,6 +49,7 @@ validation:
   t2m:
     enabled: true
     steps: 10000
+    cfg_mode: nocfg
 
 vae:
   target: models.vae_wan_1d.BodyVAE
@@ -83,7 +84,7 @@ data:
   random_yaw: true
   train_batch_size: 32
   val_batch_size: 16
-  num_workers: 4
+  num_workers: 2
   pin_memory: true
 
 text_encoder:
@@ -142,21 +143,18 @@ training:
 
 loss:
   root_weight: 1.0
-  body_weight: 1.0
+  body_weight: 3.0
   rollout_weight: 1.0
   offpath_beta_min: 0.1
   root_boundary_weight: 0.0
 
 self_forcing:
-  # Cold replay is sampled before K and therefore covers the complete run.
   cold_start_replay: 0.1
-  # Absolute global-step schedule.  This preserves the former 200k-start,
-  # 300k-phase recipe while remaining stable when max_steps changes.
   k_schedule:
     - [0, 1]
-    - [200000, 2]
-    - [290000, 3]
-    - [350000, 5]
+    - [100000, 2]
+    - [200000, 3]
+    - [300000, 5]
   teacher_replay:
     2: 0.1
     3: 0.1
@@ -187,7 +185,7 @@ model:
 optimizer:
   target: AdamW
   params:
-    lr: 1.0e-4
+    lr: 2.0e-5
     betas: [0.9, 0.99]
     weight_decay: 0.0
     eps: 1.0e-8

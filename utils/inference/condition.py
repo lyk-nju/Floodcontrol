@@ -261,17 +261,16 @@ class InferenceConditionCompiler:
 
         future_value = future_mask = None
         future_positions = None
-        local_commit = state.commit_index - state.window_origin
-        visible_motion_tokens = min(
-            window_tokens,
-            local_commit + self.active_tokens,
+        # Compile once per commit from the first token which may still be hidden
+        # during the earliest microstep.  RootTransformer dynamically removes
+        # candidates as those absolute tokens become visible motion queries.
+        future_count = (
+            self.active_tokens - 1 + self.max_horizon_token
+            if self.max_horizon_token > 0
+            else 0
         )
-        # Scaled-ARDY budget: retained history + active band + packed future
-        # conditions never exceeds the model's configured window length.
-        future_budget = max(0, window_tokens - visible_motion_tokens)
-        future_count = min(self.max_horizon_token, future_budget)
         if future_count:
-            future_start_token = state.commit_index + self.active_tokens
+            future_start_token = state.commit_index + 1
             future_positions = torch.arange(
                 future_start_token,
                 future_start_token + future_count,
@@ -305,6 +304,12 @@ class InferenceConditionCompiler:
                 "future_root_condition_value": future_value,
                 "future_root_condition_mask": future_mask,
                 "future_timeline_position_ids": future_positions,
+                "future_horizon_tokens": torch.full(
+                    (state.noisy_motion.batch_size,),
+                    self.max_horizon_token,
+                    device=device,
+                    dtype=torch.long,
+                ),
             }
         )
         compiled = CompiledCondition(

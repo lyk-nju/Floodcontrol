@@ -191,9 +191,10 @@ class LDFCondition:
     future_root_condition_mask: torch.Tensor | None
     future_timeline_position_ids: torch.Tensor | None
     future_valid_mask: torch.Tensor | None
+    future_horizon_tokens: torch.Tensor | None
 ```
 
-第一版只为 future root trajectory 建立正式协议：`future_root_condition_value/future_root_condition_mask` 按四帧 root patch 表达，推荐形状为 `[B,N_future,4,5]`；`future_timeline_position_ids[B,N_future]` 使用absolute timeline坐标，必须位于当前motion window之后；Root Stage使用当前`rope_origin`把它转换为generation-centered future RoPE位置。`future_valid_mask[B,N_future]` 区分真实future token与batch padding，padding不能伪装成零值约束。
+第一版只为 future root trajectory 建立正式协议：`future_root_condition_value/future_root_condition_mask` 按四帧 root patch 表达，推荐形状为 `[B,N_future,4,5]`；`future_timeline_position_ids[B,N_future]` 使用absolute timeline坐标，候选superset可以覆盖尚未可见的active位置。`future_valid_mask[B,N_future]`只表示prefix-packed候选与padding，`future_horizon_tokens[B]`冻结本commit的最大absolute lookahead。Root Stage根据每个microstep的真实visible-motion末端生成临时attention mask，排除已经成为motion query的候选、执行lookahead限制，并保证motion加future query不超过模型window；随后使用当前`rope_origin`派生generation-centered future RoPE位置。
 
 训练侧的XZ计划允许frame-level稀疏mask。只有实际含至少一个选中frame的future token才进入上述packed字段，token内部仍保留`[4,5]`mask，不能把一个waypoint扩大成四帧dense约束。absolute计划在一次self-forcing rollout内保持固定；窗口移动只改变同一选中frame属于current还是future，不重新采样约束。
 
@@ -448,7 +449,7 @@ future constraints 需要通用的 explicit-position RoPE：
 apply_rope_with_position_ids(q_or_k, rope_position_ids)
 ```
 
-模型将 `[visible history/generation prefix | packed future constraints]` 作为普通有效 token 序列送入 non-causal Transformer。pure-noise且本步尚未更新的motion frontier保留在persistent state中，但不会被假装成有效attention token；future condition紧接当前可见motion前缀打包，不受固定window尾部padding影响。future token 的输出被忽略，不被 scheduler 更新或 commit；不再需要 trajectory-query/latent-key 的专用非对称 mask。
+模型将 `[visible history/generation prefix | dynamically selected future constraints]` 作为普通有效 token 序列送入 non-causal Transformer。pure-noise且本步尚未更新的motion frontier保留在persistent state中，但不会被假装成有效attention token；future候选condition在一个commit内保持只读，Root Stage用逐microstep临时mask从非前缀候选尾部抽取并紧接当前可见motion前缀打包，不受固定window尾部padding影响。future token 的输出被忽略，不被 scheduler 更新或 commit；不再需要 trajectory-query/latent-key 的专用非对称 mask。
 
 `create_window_condition()`从`window_origin + window_tokens`开始生成absolute future timeline IDs，不能在rolling后重新从`window_tokens`起算。future horizon不得反向扩大`HybridMotion`、`beta`、history/generation mask或Body Stage长度。
 

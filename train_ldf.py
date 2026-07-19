@@ -180,6 +180,11 @@ def _validate_training_config(cfg) -> None:
                     "validation.t2m.steps must be a positive multiple of "
                     "validation.validation_steps"
                 )
+            t2m_cfg_mode = str(t2m.get("cfg_mode", "nocfg"))
+            if t2m_cfg_mode not in {"nocfg", "joint", "separated"}:
+                raise ValueError(
+                    "validation.t2m.cfg_mode must be nocfg, joint, or separated"
+                )
             if cfg.get("metrics") is None or cfg.metrics.get("t2m") is None:
                 raise ValueError("validation.t2m requires metrics.t2m")
             metric_cfg = cfg.metrics.t2m

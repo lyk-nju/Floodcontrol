@@ -358,9 +358,16 @@ def test_xz_condition_exposes_only_active_xz_and_post_active_lookahead():
     assert not mask[0, :2].any() and not mask[0, 5:].any()
     assert not mask[1].any()
     assert torch.equal(condition.root_condition_value, root)
-    assert condition.future_root_condition_value.shape == (2, 2, 4, 5)
-    assert condition.future_timeline_position_ids.tolist() == [[15, 16], [0, 0]]
-    assert condition.future_valid_mask.tolist() == [[True, True], [False, False]]
+    assert condition.future_root_condition_value.shape == (2, 4, 4, 5)
+    assert condition.future_timeline_position_ids.tolist() == [
+        [13, 14, 15, 16],
+        [0, 0, 0, 0],
+    ]
+    assert condition.future_valid_mask.tolist() == [
+        [True, True, True, True],
+        [False, False, False, False],
+    ]
+    assert condition.future_horizon_tokens.tolist() == [2, 2]
     assert condition.future_root_condition_mask[0, :, :, 0].all()
     assert condition.future_root_condition_mask[0, :, :, 2].all()
     assert not condition.future_root_condition_mask[..., 1].any()

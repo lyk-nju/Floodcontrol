@@ -471,6 +471,7 @@ class LDFEvaluationRunner:
     def _run_t2m(self, module, *, step: int, step_tag: str) -> None:
         validation = self.cfg.validation
         config = self._generation_config(validation)
+        guidance_mode = str(validation.t2m.get("cfg_mode", "nocfg"))
         samples, sample_count = self._selected_sample_shard(
             module,
             limit=0,
@@ -494,6 +495,7 @@ class LDFEvaluationRunner:
                     module,
                     sample,
                     mode=mode,
+                    guidance_mode=guidance_mode,
                     seed=seed,
                     frame_count=frames,
                     dense_xz=False,
@@ -532,6 +534,7 @@ class LDFEvaluationRunner:
                 {
                     "num_samples": sample_count,
                     "mode": mode,
+                    "cfg_mode": guidance_mode,
                     "split": "val",
                 }
             )

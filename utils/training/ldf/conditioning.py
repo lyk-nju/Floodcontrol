@@ -320,18 +320,23 @@ def create_xz_condition(
     )
     active_mask = mask & active_range[..., None, None]
 
-    future_start = view.active_end
+    # Compile one immutable candidate superset for the whole commit.  The Root
+    # Stage will move the effective boundary from the first currently-visible
+    # motion token through the active band as triangular denoising progresses.
+    future_start = view.active_start + 1
     future_end = torch.minimum(
         valid_counts,
-        future_start + lookahead,
+        view.active_end + lookahead,
     )
-    packed = _pack_future_constraints(
-        clean_root_motion=clean_root_motion,
-        constraint_mask=mask,
-        timeline_position_ids=view.timeline_position_ids,
-        future_start=future_start,
-        future_end=future_end,
-    )
+    packed = None
+    if lookahead > 0:
+        packed = _pack_future_constraints(
+            clean_root_motion=clean_root_motion,
+            constraint_mask=mask,
+            timeline_position_ids=view.timeline_position_ids,
+            future_start=future_start,
+            future_end=future_end,
+        )
     future_value = future_mask = future_positions = future_valid = None
     if packed is not None:
         future_value, future_mask, future_positions, future_valid = packed
@@ -345,6 +350,16 @@ def create_xz_condition(
         future_root_condition_mask=future_mask,
         future_timeline_position_ids=future_positions,
         future_valid_mask=future_valid,
+        future_horizon_tokens=(
+            None
+            if future_value is None
+            else torch.full(
+                (batch,),
+                lookahead,
+                device=clean_root_motion.device,
+                dtype=torch.long,
+            )
+        ),
     )
     condition.validate_structure(batch_size=batch, token_length=tokens)
     return condition

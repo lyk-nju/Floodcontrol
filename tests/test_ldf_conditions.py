@@ -120,7 +120,7 @@ def test_timeline_and_rope_positions_remain_distinct_after_window_roll():
     ).tolist() == [[3, -4]]
 
 
-def test_future_timeline_positions_cannot_overlap_current_window():
+def test_future_candidate_overlap_is_removed_from_attention_view():
     text, null = _text(tokens=4)
     condition = LDFCondition(
         text_context=text,
@@ -129,6 +129,7 @@ def test_future_timeline_positions_cannot_overlap_current_window():
         future_root_condition_mask=torch.ones(1, 1, 4, 5, dtype=torch.bool),
         future_timeline_position_ids=torch.tensor([[3]]),
         future_valid_mask=torch.tensor([[True]]),
+        future_horizon_tokens=torch.tensor([1]),
     )
     inputs = LDFInput(
         noisy_motion=HybridMotion(
@@ -143,8 +144,49 @@ def test_future_timeline_positions_cannot_overlap_current_window():
         previous_root_valid_mask=None,
         condition=condition,
     )
-    with pytest.raises(ValueError, match="after the current motion window"):
-        inputs.validate()
+    inputs.validate()
+    assert inputs.future_attention_mask().tolist() == [[False]]
+
+
+def test_dynamic_future_selection_is_per_sample_and_preserves_candidate_superset():
+    prompt = torch.ones(1, 8)
+    null = torch.zeros(1, 8)
+    candidate_positions = torch.tensor(
+        [list(range(1, 8)), list(range(11, 18))], dtype=torch.long
+    )
+    candidate_valid = torch.ones(2, 7, dtype=torch.bool)
+    condition = LDFCondition(
+        text_context=[prompt for _ in range(16)],
+        text_null_context=[null, null],
+        future_root_condition_value=torch.zeros(2, 7, 4, 5),
+        future_root_condition_mask=torch.ones(2, 7, 4, 5, dtype=torch.bool),
+        future_timeline_position_ids=candidate_positions,
+        future_valid_mask=candidate_valid,
+        future_horizon_tokens=torch.tensor([3, 3]),
+    )
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(
+            torch.zeros(2, 8, 4, 5), torch.zeros(2, 8, 8)
+        ),
+        beta=torch.ones(2, 8),
+        history_mask=torch.zeros(2, 8, dtype=torch.bool),
+        generation_mask=torch.tensor(
+            [
+                [True, False, False, False, False, False, False, False],
+                [True, True, True, True, False, False, False, False],
+            ]
+        ),
+        timeline_position_ids=torch.stack((torch.arange(8), torch.arange(10, 18))),
+        rope_position_ids=torch.arange(8)[None].expand(2, -1),
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=condition,
+    )
+
+    selected = inputs.future_attention_mask()
+    assert candidate_positions[0, selected[0]].tolist() == [1, 2, 3]
+    assert candidate_positions[1, selected[1]].tolist() == [14, 15, 16]
+    assert torch.equal(condition.future_valid_mask, candidate_valid)
 
 
 def test_future_valid_mask_must_match_observed_constraint_tokens():
@@ -156,6 +198,7 @@ def test_future_valid_mask_must_match_observed_constraint_tokens():
         future_root_condition_mask=torch.zeros(1, 2, 4, 5, dtype=torch.bool),
         future_timeline_position_ids=torch.tensor([[4, 5]]),
         future_valid_mask=torch.tensor([[True, False]]),
+        future_horizon_tokens=torch.tensor([2]),
     )
     with pytest.raises(ValueError, match="exactly match constrained future tokens"):
         condition.validate(batch_size=1, token_length=4, latent_dim=8)

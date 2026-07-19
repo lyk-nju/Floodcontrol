@@ -61,6 +61,7 @@ def _with_future_condition(inputs: LDFInput) -> LDFInput:
         future_root_condition_mask=torch.ones(1, 1, 4, 5, dtype=torch.bool),
         future_timeline_position_ids=torch.tensor([[8]]),
         future_valid_mask=torch.tensor([[True]]),
+        future_horizon_tokens=torch.tensor([1]),
     )
     return LDFInput(**{**inputs.__dict__, "condition": condition})
 
@@ -277,9 +278,9 @@ def test_body_heading_is_derived_from_clean_root():
 
 def test_future_root_uses_generation_centered_rope_without_extending_body():
     model = make_model().eval()
-    root = torch.randn(1, 4, 4, 5)
-    latent = torch.randn(1, 4, 8)
-    text = [torch.randn(3, 8) for _ in range(4)]
+    root = torch.randn(1, 6, 4, 5)
+    latent = torch.randn(1, 6, 8)
+    text = [torch.randn(3, 8) for _ in range(6)]
     null = [torch.zeros(1, 8)]
     condition = LDFCondition(
         text_context=text,
@@ -288,14 +289,15 @@ def test_future_root_uses_generation_centered_rope_without_extending_body():
         future_root_condition_mask=torch.ones(1, 2, 4, 5, dtype=torch.bool),
         future_timeline_position_ids=torch.tensor([[9, 10]]),
         future_valid_mask=torch.tensor([[True, True]]),
+        future_horizon_tokens=torch.tensor([2]),
     )
     inputs = LDFInput(
         noisy_motion=HybridMotion(root, latent),
-        beta=torch.tensor([[0.0, 0.5, 0.75, 1.0]]),
-        history_mask=torch.tensor([[True, False, False, False]]),
-        generation_mask=torch.tensor([[False, True, True, True]]),
-        timeline_position_ids=torch.tensor([[5, 6, 7, 8]]),
-        rope_position_ids=torch.tensor([[-1, 0, 1, 2]]),
+        beta=torch.tensor([[0.0, 0.5, 0.75, 1.0, 1.0, 1.0]]),
+        history_mask=torch.tensor([[True, False, False, False, False, False]]),
+        generation_mask=torch.tensor([[False, True, True, True, False, False]]),
+        timeline_position_ids=torch.tensor([[5, 6, 7, 8, 9, 10]]),
+        rope_position_ids=torch.tensor([[-1, 0, 1, 2, 3, 4]]),
         previous_root_frame=None,
         previous_root_valid_mask=None,
         condition=condition,
@@ -313,8 +315,8 @@ def test_future_root_uses_generation_centered_rope_without_extending_body():
     output = model(inputs)
     assert captured["input_length"] == 6
     assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 2, 3, 4]]
-    assert output.velocity.root_motion.shape[1] == 4
-    assert output.velocity.latent_motion.shape[1] == 4
+    assert output.velocity.root_motion.shape[1] == 6
+    assert output.velocity.latent_motion.shape[1] == 6
 
 
 def test_future_root_supports_bfloat16_autocast():
@@ -328,6 +330,7 @@ def test_future_root_supports_bfloat16_autocast():
         future_root_condition_mask=torch.ones(1, 2, 4, 5, dtype=torch.bool),
         future_timeline_position_ids=torch.tensor([[9, 10]]),
         future_valid_mask=torch.tensor([[True, True]]),
+        future_horizon_tokens=torch.tensor([3]),
     )
     inputs = LDFInput(
         noisy_motion=HybridMotion(root, latent),
@@ -359,6 +362,7 @@ def test_future_root_is_packed_after_the_visible_motion_prefix():
         future_root_condition_mask=torch.ones(1, 2, 4, 5, dtype=torch.bool),
         future_timeline_position_ids=torch.tensor([[9, 10]]),
         future_valid_mask=torch.tensor([[True, True]]),
+        future_horizon_tokens=torch.tensor([3]),
     )
     inputs = LDFInput(
         noisy_motion=HybridMotion(
@@ -386,10 +390,56 @@ def test_future_root_is_packed_after_the_visible_motion_prefix():
     )
     output = model(inputs)
 
-    assert captured["input_length"] == 5
-    assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 3, 4]]
-    assert captured["text_query_indices"].tolist() == [[0, 1, 2, -1, -1]]
+    assert captured["input_length"] == 4
+    assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 3]]
+    assert captured["text_query_indices"].tolist() == [[0, 1, 2, -1]]
     assert not output.velocity.root_motion[:, 3].any()
+
+
+def test_root_transformer_packs_only_dynamic_future_tail():
+    model = make_model().eval()
+    future_mask = torch.ones(1, 5, 4, 5, dtype=torch.bool)
+    condition = LDFCondition(
+        text_context=[torch.randn(2, 8) for _ in range(6)],
+        text_null_context=[torch.zeros(1, 8)],
+        future_root_condition_value=torch.zeros(1, 5, 4, 5),
+        future_root_condition_mask=future_mask,
+        future_timeline_position_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+        future_valid_mask=torch.ones(1, 5, dtype=torch.bool),
+        future_horizon_tokens=torch.tensor([3]),
+    )
+    inputs = LDFInput(
+        noisy_motion=HybridMotion(
+            torch.randn(1, 6, 4, 5), torch.randn(1, 6, 8)
+        ),
+        beta=torch.tensor([[0.5, 0.75, 1.0, 1.0, 1.0, 1.0]]),
+        history_mask=torch.zeros(1, 6, dtype=torch.bool),
+        generation_mask=torch.tensor([[True, True, False, False, False, False]]),
+        timeline_position_ids=torch.arange(6)[None],
+        rope_position_ids=torch.arange(6)[None],
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition=condition,
+    )
+    captured = {}
+
+    def capture_root_blocks(self, tokens, **kwargs):
+        captured["input_length"] = tokens.shape[1]
+        captured["rope_position_ids"] = kwargs["rope_position_ids"].clone()
+        captured["text_query_indices"] = kwargs["text_query_indices"].clone()
+        return tokens.new_zeros(tokens.shape[0], tokens.shape[1], self.root_patch_dim)
+
+    model.root_transformer._run_blocks = types.MethodType(
+        capture_root_blocks, model.root_transformer
+    )
+    model(inputs)
+
+    assert inputs.future_attention_mask().tolist() == [
+        [False, True, True, True, False]
+    ]
+    assert captured["input_length"] == 5
+    assert captured["rope_position_ids"].tolist() == [[0, 1, 2, 3, 4]]
+    assert captured["text_query_indices"].tolist() == [[0, 1, -1, -1, -1]]
 
 
 def test_text_preparation_keeps_unique_prompt_bank_and_query_mapping():
@@ -455,6 +505,7 @@ def test_future_root_mask_blocks_unobserved_features_before_projection():
         future_root_condition_mask=future_mask,
         future_timeline_position_ids=torch.tensor([[2]]),
         future_valid_mask=torch.tensor([[True]]),
+        future_horizon_tokens=torch.tensor([1]),
     )
     inputs = LDFInput(
         noisy_motion=HybridMotion(
@@ -491,6 +542,12 @@ def test_changing_future_xz_lookahead_changes_root_prediction():
     torch.manual_seed(17)
     model = make_model().eval()
     inputs = make_input(batch=1, tokens=3)
+    inputs = LDFInput(
+        **{
+            **inputs.__dict__,
+            "generation_mask": torch.tensor([[True, False, False]]),
+        }
+    )
     future_mask = torch.zeros(1, 2, 4, 5, dtype=torch.bool)
     future_mask[..., 0] = True
     future_mask[..., 2] = True
@@ -505,8 +562,9 @@ def test_changing_future_xz_lookahead_changes_root_prediction():
             inputs.condition.text_null_context,
             future_root_condition_value=value,
             future_root_condition_mask=future_mask,
-            future_timeline_position_ids=torch.tensor([[3, 4]]),
+            future_timeline_position_ids=torch.tensor([[1, 2]]),
             future_valid_mask=torch.ones(1, 2, dtype=torch.bool),
+            future_horizon_tokens=torch.tensor([2]),
         )
         conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
         return model(conditioned).velocity.root_motion

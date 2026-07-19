@@ -348,6 +348,87 @@ def test_cold_ideal_phase_matches_runtime_beta_visibility_and_state(denoise_step
     assert int(step.loss_mask.sum()) == 1 + denoise_step // 2
 
 
+def test_cold_dynamic_future_starts_at_each_microstep_visible_end():
+    model = LDF(
+        latent_dim=3,
+        root_mean=[0.0] * 5,
+        root_std=[1.0] * 5,
+        local_root_mean=[0.0] * 4,
+        local_root_std=[1.0] * 4,
+        hidden_dim=16,
+        ffn_dim=32,
+        freq_dim=8,
+        text_dim=1,
+        text_len=1,
+        num_heads=4,
+        root_num_layers=1,
+        body_num_layers=1,
+        chunk_size=5,
+        noise_steps=10,
+    )
+    clean = HybridMotion(
+        torch.zeros(1, 10, 4, 5),
+        torch.zeros(1, 10, 3),
+    )
+    noise = HybridMotion(
+        torch.ones_like(clean.root_motion),
+        torch.ones_like(clean.latent_motion),
+    )
+    constraint_mask = torch.zeros_like(clean.root_motion, dtype=torch.bool)
+    constraint_mask[:, :8, :, 0] = True
+    constraint_mask[:, :8, :, 2] = True
+
+    def condition_builder(view, clean_motion):
+        return create_xz_condition(
+            clean_root_motion=clean_motion.root_motion,
+            token_valid_mask=torch.ones(1, 10, dtype=torch.bool),
+            constraint_mask=constraint_mask,
+            view=view,
+            text_context=[torch.zeros(1, 1) for _ in range(10)],
+            text_null_context=[torch.zeros(1, 1)],
+            max_horizon_token=3,
+        )
+
+    visible_counts = []
+    selected_positions = []
+    candidate_positions = []
+    for denoise_step in range(10):
+        step = build_cold_start_training_step(
+            model=model,
+            clean_motion=clean,
+            noise=noise,
+            source_start_token=torch.zeros(1, dtype=torch.long),
+            span_token_count=torch.tensor([10]),
+            active_tokens=5,
+            denoise_step_index=torch.tensor([denoise_step]),
+            previous_root_frame=None,
+            previous_root_valid_mask=None,
+            condition_builder=condition_builder,
+        )
+        visible = int(step.inputs.generation_mask.sum().item())
+        selected = step.inputs.future_attention_mask()[0]
+        positions = step.inputs.condition.future_timeline_position_ids[0]
+        visible_counts.append(visible)
+        candidate_positions.append(positions.tolist())
+        selected_positions.append(positions[selected].tolist())
+        assert all(position >= visible for position in positions[selected].tolist())
+
+    assert visible_counts == [1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+    assert all(positions == list(range(1, 8)) for positions in candidate_positions)
+    assert selected_positions == [
+        [1, 2, 3],
+        [1, 2, 3],
+        [2, 3, 4],
+        [2, 3, 4],
+        [3, 4, 5],
+        [3, 4, 5],
+        [4, 5, 6],
+        [4, 5, 6],
+        [5, 6, 7],
+        [5, 6, 7],
+    ]
+
+
 def test_mixed_batch_uses_each_samples_own_history_and_real_span_length():
     clean = HybridMotion(
         torch.zeros(2, 10, 4, 5),
@@ -698,8 +779,12 @@ def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
     second_active = conditions[1].root_condition_mask.flatten(2).any(-1)
     assert first_active.tolist() == [[False, False] + [True] * 5 + [False] * 3]
     assert second_active.tolist() == [[False] * 3 + [True] * 5 + [False] * 2]
-    assert conditions[0].future_timeline_position_ids.tolist() == [[11, 12]]
-    assert conditions[1].future_timeline_position_ids.tolist() == [[12]]
+    assert conditions[0].future_timeline_position_ids.tolist() == [
+        [7, 8, 9, 10, 11, 12]
+    ]
+    assert conditions[1].future_timeline_position_ids.tolist() == [
+        [8, 9, 10, 11, 12]
+    ]
 
 
 def test_one_persistent_future_goal_becomes_active_during_self_forcing():
@@ -752,7 +837,9 @@ def test_one_persistent_future_goal_becomes_active_during_self_forcing():
     assert conditions[0].future_timeline_position_ids.tolist() == [[11]]
     assert conditions[0].future_root_condition_mask[0, 0, 2, 0]
     assert conditions[1].root_condition_mask[0, 7, 2, 0]
-    assert conditions[1].future_root_condition_value is None
+    # The immutable commit superset still contains this candidate; the dynamic
+    # attention mask removes it once token 7 is a visible motion query.
+    assert conditions[1].future_timeline_position_ids.tolist() == [[11]]
 
 
 def test_teacher_replay_is_configurable_without_changing_k_curriculum():
