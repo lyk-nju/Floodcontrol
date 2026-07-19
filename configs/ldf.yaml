@@ -38,7 +38,7 @@ validation:
     num_denoise_steps: 10
     max_horizon_token: 10
     rolling:
-      window_tokens: 40
+      window_tokens: 50
 
   dense_xz:
     enabled: true
@@ -80,9 +80,9 @@ data:
   artifact_path: artifacts
   text_path: texts
   min_frames: 20
-  max_frames: 160
+  max_frames: 200
   random_yaw: true
-  train_batch_size: 32
+  train_batch_size: 64
   val_batch_size: 16
   num_workers: 2
   pin_memory: true
@@ -131,14 +131,14 @@ training:
   text_dropout: 0.1
   constraint_dropout: 0.1
   window:
-    max_tokens: 40
+    max_tokens: 50
     generation_tokens: 5
     sampling: random_generation_start
-  max_horizon_token: 35
+  max_horizon_token: 45
   constraint_sampling:
-    dense_probability: 0.5
-    waypoint_probability: 0.25
-    goal_probability: 0.25
+    dense_probability: 1.0
+    waypoint_probability: 0.0
+    goal_probability: 0.0
     max_waypoint_count: 4
 
 loss:
