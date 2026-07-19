@@ -176,7 +176,7 @@ model:
     noise_steps: 10
     fps: 20.0
     time_embedding_scale: 1.0
-    cfg_mode: separated
+    cfg_mode: joint
     cfg_scale_text: 1.0
     cfg_scale_constraint: 1.0
     cfg_scale_joint: 1.0
