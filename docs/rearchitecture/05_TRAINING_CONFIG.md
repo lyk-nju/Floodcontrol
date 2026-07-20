@@ -98,7 +98,7 @@ canonical root statistics只通过HumanML配置与正式span sampler生成一次
 python -m tools.compute_ldf_root_stats --config configs/ldf_s5.yaml
 ```
 
-工具默认写入HumanML配置的`data.root_stats_path`，读取独立`root_statistics`块中的50-token、C=5、uniform-legal-history anchor与uniform-yaw协议。它不读取cold replay或K schedule，因此这些策略调整不触发重算。`ldf_multi.yaml`直接引用同一文件，不再根据BABEL mixture重算或切换归一化尺度。`train_ldf.py`除检查所有外部文件外，还校验50-token总预算、active chunk一致性、XZ horizon上限、课程和两种dropout。无法确认来源的旧root stats只需按冻结协议重新生成一次。
+工具默认写入HumanML配置的`data.root_stats_path`，并可读取独立`root_statistics`块来复现50-token、C=5、uniform-legal-history anchor与uniform-yaw采样。该块属于统计生成工具的recipe，不是训练入口合同：训练只要求`root_stats.npz`存在，并在模型加载时检查`root_mean/root_std`为有限、正std的`[5]`张量，不再比较window、active chunk、yaw或metadata。`ldf_multi.yaml`可以直接引用同一文件，不根据BABEL mixture切换归一化尺度。`train_ldf.py`仍校验当前训练自身的50-token总预算、active chunk一致性、XZ horizon上限、课程和两种dropout。
 
 普通loss validation每1,000 steps运行。teacher-continuation固定覆盖early/middle/late H；self-forcing validation始终使用统一课程`k_schedule`中的最大K，不再维护第二套validation history/K参数。dense XZ每5,000 steps读取`data.test_probe_meta_paths.dense_xz`指定的小型split；远端配置启用T2M，本机S5配置默认关闭。T2M通过`validation.t2m.cfg_mode: nocfg`固定使用joint文本条件的单分支forward，不继承轨迹实验的全局separated CFG；dense XZ仍使用模型全局CFG设置。生成评测支持固定buffer `stream`与真实窗口滚动`rolling`并只使用EMA模型；当前实验配置只启用`stream`，需要同周期比较时可将modes改为`[stream, rolling]`。评测语义、指标和输出目录见[`07_LDF_TRAINING_EVALUATION.md`](07_LDF_TRAINING_EVALUATION.md)。
 

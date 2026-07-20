@@ -1,6 +1,5 @@
 from pathlib import Path
 import inspect
-import json
 import subprocess
 import sys
 
@@ -338,29 +337,14 @@ def test_training_entry_rejects_missing_xz_lookahead():
         _validate_training_config(cfg)
 
 
-def test_training_entry_requires_proven_root_statistics_contract(tmp_path):
+def test_training_entry_accepts_root_statistics_without_sampling_metadata(tmp_path):
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     root_stats = tmp_path / "root_stats.npz"
     np.savez(root_stats, root_mean=np.zeros(5), root_std=np.ones(5))
     cfg.config.data.root_stats_path = str(root_stats)
-    with pytest.raises(RuntimeError, match="ROOT_STATISTICS_REBUILD_REQUIRED"):
-        _validate_training_config(cfg)
+    cfg.config.root_statistics = None
 
-    metadata = {
-        "window_tokens": 40,
-        "generation_tokens": 5,
-        "anchor_sampling": "uniform_legal_history",
-        "random_yaw": True,
-        "windows_per_sample": 1,
-    }
-    np.savez(
-        root_stats,
-        root_mean=np.zeros(5),
-        root_std=np.ones(5),
-        metadata=np.asarray(json.dumps(metadata)),
-    )
-    with pytest.raises(RuntimeError, match="sampling contract"):
-        _validate_training_config(cfg)
+    _validate_training_config(cfg)
 
 
 def test_training_entry_rejects_invalid_constraint_dropout():

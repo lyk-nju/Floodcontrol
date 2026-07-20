@@ -4837,3 +4837,36 @@
 后续事项：
 
 - 完整resume仍会从checkpoint恢复optimizer param groups与scheduler state；若需要在resume后强制改变学习率，应增加显式的optimizer恢复后override，而不能只修改YAML中的`optimizer.params.lr`。
+
+## 2026-07-20 · Root Statistics训练策略校验解耦
+
+改动类型：LDF训练入口 / statistics合同简化
+
+实际改动内容：
+
+- 删除训练入口对`root_statistics.window_tokens/generation_tokens/anchor_sampling/random_yaw/windows_per_sample`与当前训练配置的逐项一致性校验。
+- 删除训练入口对`root_stats.npz`采样metadata的强制读取和匹配；`root_statistics`配置块现在只服务于root statistics生成工具，不再是启动训练的必需字段。
+- 保留root statistics文件存在性检查；模型加载时仍严格校验`root_mean/root_std`的`[5]`shape、finite数值与正std。
+- 将迁移测试改为确认没有采样metadata、且当前配置不含`root_statistics`块时仍可通过训练配置校验。
+
+改动理由：
+
+- root statistics是归一化数值产物，窗口长度、cold比例、K课程和yaw采样属于生成recipe或当前训练策略；把二者做成硬相等关系会阻止使用数值兼容的既有statistics，也会让普通策略调整产生无必要的启动错误。
+- 真正影响模型计算安全的是statistics张量本身是否合法，而不是NPZ是否携带某组策略字符串。
+
+验证：
+
+- 新增回归测试通过：无采样metadata、且当前配置不含`root_statistics`块时，训练入口接受合法的root mean/std文件。
+- `tests/test_migration_guards.py`：`42 passed, 1 failed`；唯一失败是该文件既有测试仍要求用户当前远端配置的`resume_ckpt`为空，与本次statistics校验解耦无关。
+- `py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `train_ldf.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- `tools/compute_ldf_root_stats.py`和资产准备工具仍可用`root_statistics`块复现统计采样；本轮不改变统计生成算法。

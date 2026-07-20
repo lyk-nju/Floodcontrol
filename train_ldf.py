@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 from pathlib import Path
 
-import numpy as np
 import torch
 from lightning import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -26,34 +24,6 @@ from utils.training.memory import CUDAMemoryReporter
 def _require_file(path: str, name: str) -> None:
     if not Path(path).is_file():
         raise RuntimeError(f"{name}_REQUIRED: file not found at {path}")
-
-
-def _validate_root_statistics_contract(cfg) -> None:
-    path = Path(str(cfg.data.root_stats_path))
-    with np.load(path, allow_pickle=False) as values:
-        if "metadata" not in values:
-            raise RuntimeError(
-                "ROOT_STATISTICS_REBUILD_REQUIRED: root_stats.npz does not prove "
-                "the frozen 50-token sampling contract"
-            )
-        try:
-            metadata = json.loads(str(np.asarray(values["metadata"]).item()))
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise RuntimeError(
-                "ROOT_STATISTICS_REBUILD_REQUIRED: invalid root statistics metadata"
-            ) from error
-    expected = {
-        "window_tokens": int(cfg.root_statistics.window_tokens),
-        "generation_tokens": int(cfg.root_statistics.generation_tokens),
-        "anchor_sampling": str(cfg.root_statistics.anchor_sampling),
-        "random_yaw": bool(cfg.root_statistics.random_yaw),
-        "windows_per_sample": int(cfg.root_statistics.windows_per_sample),
-    }
-    if metadata != expected:
-        raise RuntimeError(
-            "ROOT_STATISTICS_REBUILD_REQUIRED: root statistics sampling contract "
-            f"does not match configuration: saved={metadata}, expected={expected}"
-        )
 
 
 def _validate_training_config(cfg) -> None:
@@ -94,26 +64,6 @@ def _validate_training_config(cfg) -> None:
         raise ValueError(
             "data.min_frames must contain at least one complete generation chunk"
         )
-    root_statistics = cfg.get("root_statistics") or {}
-    if int(root_statistics.get("window_tokens", 0)) != max_window_tokens:
-        raise ValueError(
-            "root_statistics.window_tokens must equal training.window.max_tokens"
-        )
-    if int(root_statistics.get("generation_tokens", 0)) != generation_tokens:
-        raise ValueError(
-            "root_statistics.generation_tokens must equal the generation window"
-        )
-    if str(root_statistics.get("anchor_sampling", "")) != "uniform_legal_history":
-        raise ValueError(
-            "root_statistics.anchor_sampling must be uniform_legal_history"
-        )
-    if bool(root_statistics.get("random_yaw", False)) != bool(cfg.data.random_yaw):
-        raise ValueError(
-            "root_statistics.random_yaw must match data.random_yaw"
-        )
-    if int(root_statistics.get("windows_per_sample", 0)) <= 0:
-        raise ValueError("root_statistics.windows_per_sample must be positive")
-    _validate_root_statistics_contract(cfg)
     if lookahead <= 0 or lookahead > max_window_tokens - generation_tokens:
         raise RuntimeError(
             "LDF_XZ_CONSTRAINT_REQUIRED: "
