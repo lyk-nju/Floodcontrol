@@ -105,6 +105,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.loss.rollout_weight == pytest.approx(1.0)
     assert cfg.loss.offpath_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_boundary_weight == pytest.approx(0.0)
+    assert cfg.loss.root_heading_weight == pytest.approx(0.1)
     assert cfg.loss.body_weight == pytest.approx(3.0)
     assert cfg.model.params.cfg_mode == "joint"
     assert cfg.root_statistics.window_tokens == 50

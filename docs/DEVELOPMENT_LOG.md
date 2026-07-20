@@ -4643,3 +4643,197 @@
 
 - 远端服务器首次使用冻结合同前需运行`python -m tools.compute_ldf_root_stats --config configs/ldf.yaml`生成带metadata的root statistics；之后cold replay概率或K课程的小改动不要求重算。
 - 本轮没有启动正式训练，也没有恢复Web；下一步是从冻结后的50-token合同启动新LDF训练并观察cold朝向、dense-XZ ADE/FDE、T2M FID和K课程稳定性。
+
+## 2026-07-20 · LDF Root/Body Heading观测指标
+
+改动类型：训练诊断 / 流式评测指标 / 朝向几何
+
+实际改动内容：
+
+- 新增`root_gt_heading_angle_deg`：在当前active loss frames上比较Root Stage恢复的physical root5 heading与GT root5 heading，使用稳定的二维向量夹角并以度为单位。
+- 新增`root_body_heading_angle_deg`：冻结VAE解码预测clean latent后，从最终渲染所使用的左右髋、左右肩关节位置估计身体朝向，再与预测root heading比较。
+- Body朝向明确不读取body265的global root rotation；HumanML转换中的该旋转携带IK gauge/符号约定，不能直接与physical root5 yaw相减。
+- 训练仅按`trainer.log_every_n_steps`执行一次额外VAE decode并写入`train_metric/*`，避免每步增加decoder开销；validation每个batch聚合到`val_metric/<probe>/*`。
+- Dense-XZ完整stream/rolling生成也记录两个heading指标，写入sample/summary JSON、WandB scalar，并在rank-zero控制台摘要中打印。
+
+改动理由：
+
+- 当前root/body flow loss较低仍不能区分“Root Stage heading自身错误”和“Root与最终可见身体朝向不一致”；两个独立指标可将问题拆开观测。
+- 从骨架几何估计body facing与视频中的视觉朝向一致，并规避此前已确认的global rotation gauge冲突。
+
+验证：
+
+- Heading、LDF training和LDF evaluation定向测试：`35 passed, 1 skipped`。
+- 新增角度、mask、退化body axis及训练bridge指标生成测试均通过。
+- 真实HumanML train split前100个GT artifact基线：root/body几何夹角mean `7.17°`、median `5.33°`、p95 `17.74°`；确认朝向轴没有出现系统性90°/180°翻转。
+- 修改文件`py_compile`通过；`git diff --check`通过。
+- 全仓测试：`295 passed, 3 failed`。三个失败均来自任务开始前用户正在修改的`configs/ldf.yaml`：其resume路径与既有测试期望不一致，且缺少资产脚本所需的`root_statistics`段；本任务未覆盖或回滚该配置。
+
+涉及文件：
+
+- `utils/training/ldf/metrics.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `metrics/trajectory.py`
+- `tests/test_ldf_heading_metrics.py`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_evaluation.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 先用这两个指标对cold/continuation/self-forcing probe及完整dense-XZ生成分开观察；若Root-GT小而Root-Body大，优先检查Body/VAE朝向耦合，反之优先处理Root Stage heading。
+- `root_body_heading_angle_deg`在真实GT上天然不严格为零，未来若转为loss，应保留动作相关的root/body相对朝向分布，不能无条件把身体强制对齐root heading。
+
+## 2026-07-20 · GT轨迹切线Heading观测指标
+
+改动类型：训练诊断 / 轨迹朝向评测
+
+实际改动内容：
+
+- 新增`root_gt_trajectory_heading_angle_deg`，比较预测root heading与GT root XZ轨迹切线方向。
+- 轨迹切线严格沿用项目的backward语义：frame `t`使用`root_xz[t]-root_xz[t-1]`；序列首帧没有前驱，因此不参与。
+- 仅统计速度不低于`0.05 m/s`且当前/前一帧均有效的transition，避免静止帧的未定义方向污染角度。
+- 训练指标使用完整frame validity推导切线、仅在当前active loss frames归约；因此continuation的第一个active frame可以正确读取其真实历史frame，而不会被误判为cold start。
+- 新指标与既有两个heading指标一同进入训练、validation probe、dense-XZ sample/summary JSON、WandB scalar及控制台摘要。
+
+改动理由：
+
+- 预测root对GT显式heading只能衡量Root Stage是否复现数据heading，不能回答人物朝向是否沿着被控制的XZ路径运动。
+- 将显式root、GT轨迹切线和解码body朝向拆成三个量，才能区分root回归误差、path-facing关系以及root/body耦合误差。
+
+验证：
+
+- LDF heading/training/evaluation定向测试：`37 passed`。
+- 全仓测试：`296 passed, 3 failed`；失败仍仅来自任务开始前用户修改中的`configs/ldf.yaml` resume值及缺失`root_statistics`配置，本任务未修改该文件。
+- 修改文件`py_compile`通过；`git diff --check`通过。
+- HumanML train split前100个GT样本按与训练日志相同的frame-weighted算法统计：`root_gt_trajectory_heading_angle_deg = 58.89°`；8,829/13,172个有效transition达到`0.05 m/s`阈值，占`67.03%`。
+- 同一批GT的校验基线为：显式root对自身GT heading `0°`，root对body几何朝向frame-weighted mean `8.00°`。
+
+涉及文件：
+
+- `utils/training/ldf/metrics.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `metrics/trajectory.py`
+- `tests/test_ldf_heading_metrics.py`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_evaluation.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 该指标不能无条件转成趋近零的loss：HumanML包含后退、侧移、转身、舞蹈及原地动作，root/body facing与trajectory tangent可能有意不同。若后续训练使用，应结合文本动作语义或GT root-heading/trajectory-heading关系构造目标。
+
+## 2026-07-20 · Dense-XZ Root通道因果消融
+
+改动类型：诊断评测脚本 / 完整流式视频消融
+
+实际改动内容：
+
+- 在git忽略的`debug/`目录新增`audit_dense_xz_root_ablation.py`，对同一文本、同一Root/Body初始噪声和同一完整dense GT XZ路径成批运行四种Root通道组合：baseline、predicted XZ + GT heading、GT XZ + predicted heading、full GT root。
+- 四种模式均通过正式`create_xz_condition()`编译XZ条件；每个microstep使用`LDF.create_input()`执行Dynamic Future过滤，未给Root Stage提供Y或heading observation。
+- Root通道干预发生在每个microstep的Root-to-Body边界，并在commit时写入相同通道；Body latent始终由模型持续生成，没有替换为GT latent或事后旋转视频。
+- 使用step 130000 EMA、joint CFG、10-token future horizon，对`000021`（176帧）和`001168`（144帧）分别运行seed 4321/4322/4323，生成目标视频、24个完整消融视频、逐模式NPZ及汇总JSON。
+
+改动理由：
+
+- 既有全量Root通道FID消融没有dense轨迹条件，无法单独回答“XZ已经被准确控制时，视频反向是否主要来自heading”。本次固定dense GT XZ并仅交换Root通道，隔离XZ与heading的因果贡献。
+
+验证：
+
+- 脚本`py_compile`和`git diff --check`通过；20帧GPU smoke通过。
+- 完整GPU诊断通过。baseline三种子平均XZ ADE：`000021=6.94 mm`、`001168=4.54 mm`，但Root对GT heading误差分别为`75.60°`和`126.20°`。
+- predicted XZ + GT heading保持毫米级ADE（`5.87 mm`、`3.36 mm`），同时将Root对GT heading误差归零；joint-position RMSE分别由`13.42 cm→9.89 cm`和`16.53 cm→7.34 cm`。
+- GT XZ + predicted heading虽然XZ误差数值为零，heading误差仍为`59.91°`和`136.72°`，视频问题仍存在；predicted XZ + GT heading的body误差已接近full GT root，支持这两个样本的主要Root瓶颈是heading而非XZ。
+- 输出：`debug/results/dense_xz_root_ablation_step130000_joint/summary.json`；由于`debug/`按项目约定不进入Git，诊断视频和结果只保存在本地。
+
+涉及文件：
+
+- `debug/audit_dense_xz_root_ablation.py`（git忽略）
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 该结论覆盖两个明确问题样本和三个固定噪声，尚不能直接外推到完整验证集；下一步可将同一因果消融扩展为validation统计，随后再决定采用heading auxiliary、heading条件或Root表示修正。
+
+## 2026-07-20 · Root Heading直接监督与Root通道Loss拆分
+
+改动类型：LDF训练目标 / Root Stage诊断
+
+实际改动内容：
+
+- 新增`root_heading_cosine`辅助损失，直接比较Root Stage恢复并投影到单位圆后的physical clean heading与GT root5 heading。
+- heading损失只作用于active loss token对应的四帧，不经过VAE decoder，也不会把Body loss梯度传回Root Stage。
+- ideal bridge与persistent off-path rollout使用同一heading定义；正式配置默认`root_heading_weight: 0.1`。
+- 将聚合的Root loss拆分记录为XZ、高度和heading三个通道；ideal路径记录flow-v通道误差，rollout路径记录endpoint通道误差。
+- heading向量在FP32中归一化，cosine限制在`[-1, 1]`，避免BF16舍入产生负损失。
+- 训练配置入口拒绝负数或非finite的`root_heading_weight`。
+
+改动理由：
+
+- Dense-XZ因果消融已确认两个问题样本的XZ只有毫米级误差，而heading误差达到`75.60°/126.20°`；聚合root5 loss无法直接显示这一通道失衡。
+- 原有normalized root5 flow/off-path loss已经覆盖heading，但二维cos/sin的逐元素误差并不直接表达最终角度；投影后的cosine目标为Root Stage提供显式、周期连续的方向监督。
+- 显式root5由RootTransformer直接生成，因此不需要通过Body VAE decoder计算该损失；decoder只在观测Root与最终body几何朝向时需要。
+
+验证：
+
+- 新增90°heading误差、梯度传播以及Root分通道loss单元测试。
+- LDF self-forcing/training定向测试：`52 passed`。
+- LDF conditions/forward/CFG/stream/training/evaluation定向测试：`105 passed, 2 skipped`。
+- 全仓测试：`298 passed, 3 failed`；三个失败来自当前用户配置中的非空resume路径及缺失`root_statistics`段，与本次loss实现无关。
+
+涉及文件：
+
+- `utils/training/ldf/losses.py`
+- `utils/training/ldf/lightning_module.py`
+- `train_ldf.py`
+- `configs/ldf_base.yaml`
+- `configs/ldf.yaml`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+- `tests/test_migration_guards.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 从既有checkpoint恢复时无需修改模型参数；新heading目标会从恢复后的第一个optimizer step开始生效。
+- 固定样本、noise与CFG比较微调前后的`root_heading_cosine`、Root-GT heading角误差及完整stream视频，判断显式监督是否改善长期rollout方向。
+
+## 2026-07-20 · LDF Resume合同精简
+
+改动类型：checkpoint resume / fine-tune策略 / 资产身份
+
+实际改动内容：
+
+- 将新checkpoint字段从`ldf_training_contract`收口为`ldf_resume_contract`，同时保留对现有`ldf_training_contract`的读取兼容。
+- 删除window、future horizon、self-forcing/cold replay、loss和root-statistics采样配置的checkpoint一致性门闩；它们仍由当前训练入口验证内部合法性，但可以在resume后fine-tune时调整。
+- 将模型合同改为只比较结构与数学语义签名；`cfg_mode/cfg_scale_*`不再阻止resume，attention heads、Root/Body层数、维度、FPS、time scale与prediction type继续保护。
+- VAE身份从整个训练checkpoint文件SHA改为实际加载后的EMA tokenizer参数身份；重新打包但参数相同的VAE可恢复，真正改变tokenizer权重仍fail-fast。已保存VAE文件SHA的旧LDF checkpoint继续按原SHA校验；更早的`paths + vae_statistics`合同则在严格LDF state/VAE statistics校验后warning并允许恢复。
+- 文本embedding表`content_id`改为来源metadata；内容变化时给出rank-zero warning但允许继续，`TextEmbeddingLookup`仍强制`text_dim/text_len`与张量shape合法。
+- 保留LDF strict state load、EMA状态、root/local statistics、VAE physical/latent statistics和VAE tokenizer身份硬校验。Lightning继续恢复optimizer、scheduler和absolute global step。
+
+改动理由：
+
+- self-forcing课程、cold比例、heading loss和CFG均是后续fine-tune策略，不会改变LDF参数shape或VAE latent坐标系，将它们作为硬resume条件会阻止正常实验。
+- LDF checkpoint不保存VAE，因此实际EMA tokenizer和statistics仍是必须保护的外置坐标系；但整个VAE训练文件的字节身份比真正计算语义更严格。
+
+验证：
+
+- 新增测试确认self-forcing/window/horizon/loss/CFG改变可resume，文本表变化warning后可resume，VAE重新打包可resume。
+- 新增测试确认EMA tokenizer权重改变和不改state shape的attention-head语义改变仍被拒绝；旧合同可按原VAE文件SHA恢复，实际step 120000所用的pre-identity path合同也有专项兼容测试。
+- LDF/EMA定向回归：`117 passed`。
+- 全仓测试：`304 passed, 3 failed`。三个失败仍来自当前用户修改中的`configs/ldf.yaml`：非空resume路径与既有migration test预期不同，且独立配置缺少资产工具需要的`root_statistics`段；与本次resume代码无关。
+- `py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/lightning_module.py`
+- `tests/test_ldf_training.py`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 完整resume仍会从checkpoint恢复optimizer param groups与scheduler state；若需要在resume后强制改变学习率，应增加显式的optimizer恢复后override，而不能只修改YAML中的`optimizer.params.lr`。

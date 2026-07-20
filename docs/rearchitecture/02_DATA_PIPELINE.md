@@ -156,7 +156,7 @@ python -m tools.pretokenize_t5_text \
 # 正式LDF训练直接从checkpoint加载EMA encoder并在线产生deterministic mu。
 ```
 
-两份LDF配置通过`data.text_meta_paths`显式指向各数据集的`all.txt`；T5工具只读取这些完整库存，不再从某次实验的train/val/test/probe字段猜测文本范围。文本表在离线写出时对encoder/tokenizer身份、caption和embedding内容生成一次`content_id`。训练加载只检查metadata与shape，具体tensor在第一次lookup时才检查finite，避免启动阶段扫描整个mmap文件；LDF checkpoint保存`content_id`，即使路径不变而表内容被替换，resume也会失败。
+两份LDF配置通过`data.text_meta_paths`显式指向各数据集的`all.txt`；T5工具只读取这些完整库存，不再从某次实验的train/val/test/probe字段猜测文本范围。文本表在离线写出时对encoder/tokenizer身份、caption和embedding内容生成一次`content_id`。训练加载只检查metadata与shape，具体tensor在第一次lookup时才检查finite，避免启动阶段扫描整个mmap文件；LDF checkpoint仍保存`content_id`用于记录实验来源，但兼容表的内容变化只在resume时给出warning，不再阻止补充caption或切换数据集后的fine-tune。
 
 `configs/vae.yaml`保留HumanML-only基线，`configs/vae_multi.yaml`使用HumanML3D+BABEL联合statistics。BABEL源目录没有正式test split，因此构建器默认只发布train/val；空的`test_processed.txt`和调试用`test_min_processed.txt`不会被伪装成正式test。
 

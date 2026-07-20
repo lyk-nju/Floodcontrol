@@ -84,7 +84,7 @@ validation:
 
 WandB的key/entity仍由共享环境配置提供，但实验级project由各训练配置所有：`vae*.yaml`显式使用`VAE_Flood`，`ldf*.yaml`显式使用`Floodcontrol`，避免共享路径配置改变某一类实验的冻结recipe。
 
-`configs/ldf_base.yaml`是模型、50-token窗口、K课程、loss、optimizer与评测语义的唯一来源；`configs/ldf.yaml`只覆盖远端路径、8卡、batch与worker，`configs/ldf_s5.yaml`只覆盖本机路径、单卡资源和本地评测开关，`configs/ldf_multi.yaml`只覆盖HumanML3D+BABEL数据源与联合文本表。普通loss validation、dense-XZ/video和完整T2M均可走同一DDP作业。LDF使用EMA并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`。resume比较内容身份、数值statistics、模型结构和训练合同，不比较绝对路径，因此同一资产复制到另一服务器仍可恢复。
+`configs/ldf_base.yaml`是模型、50-token窗口、K课程、loss、optimizer与评测语义的唯一来源；`configs/ldf.yaml`只覆盖远端路径、8卡、batch与worker，`configs/ldf_s5.yaml`只覆盖本机路径、单卡资源和本地评测开关，`configs/ldf_multi.yaml`只覆盖HumanML3D+BABEL数据源与联合文本表。普通loss validation、dense-XZ/video和完整T2M均可走同一DDP作业。LDF使用EMA并从独立checkpoint加载冻结VAE；VAE不进入LDF optimizer、EMA或checkpoint，UMT5不进入训练进程。root statistics和离线T5表都属于数据产物，因此路径统一放在`data.root_stats_path`和`data.text_embeddings_path`；`data.text_meta_paths`只指向处理后数据集级`all.txt`。resume只硬性比较LDF结构/数学语义签名、实际加载的EMA VAE tokenizer参数身份和root/local/latent statistics；self-forcing、window/horizon、loss、CFG及其他训练策略不再属于checkpoint恢复门闩。文本表内容变化仅给出warning，只要`text_dim/text_len`仍满足当前模型即允许继续fine-tune。合同不比较绝对路径，同一资产复制到另一服务器仍可恢复。
 
 训练DataLoader内部固定使用20-frame（1秒）长度bucket减少batch右侧padding。这是20 FPS项目合同下的加载实现细节，不改变crop或窗口语义，因此不暴露为正式YAML实验参数。DDP时sampler先构造`per_device_batch_size * world_size`的全局同长度batch，再为每个rank切分自己的per-device batch；不足一个全局batch的bucket会确定性重复少量样本，使所有rank拥有完全相同的step数。validation使用无重复的strided rank shard。由于这两条sampler都由项目显式拥有，Trainer固定`use_distributed_sampler: false`，禁止Lightning再次注入一层DistributedSampler。
 

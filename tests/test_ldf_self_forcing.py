@@ -659,8 +659,11 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
             {
                 "loss_mask": result.final_step.loss_mask,
                 "target_velocity": result.prediction.velocity,
+                "clean_motion": result.final_step.clean_motion,
             },
         )(),
+        root_mean=model.root_mean,
+        root_std=model.root_std,
     )
     assert tuple(losses) == tuple(ideal_losses)
     losses["total"].backward()
@@ -721,6 +724,97 @@ def test_offpath_loss_is_finite_near_zero_beta_and_boundary_loss_backpropagates(
     assert root_velocity.grad is not None
     assert torch.isfinite(root_velocity.grad).all()
     assert root_velocity.grad.abs().sum() > 0
+
+
+def test_root_heading_auxiliary_uses_projected_clean_root_without_body_decode():
+    angle = torch.tensor(torch.pi / 2, requires_grad=True)
+    heading = torch.stack((torch.cos(angle), torch.sin(angle)))
+    predicted_root = torch.cat(
+        (
+            torch.zeros(1, 1, 4, 3),
+            heading.reshape(1, 1, 1, 2).expand(1, 1, 4, 2),
+        ),
+        dim=-1,
+    )
+    target_root = torch.zeros(1, 1, 4, 5)
+    target_root[..., 3] = 1.0
+    root_velocity = torch.zeros_like(target_root)
+    body_velocity = torch.zeros(1, 1, 3)
+    local = torch.zeros(1, 1, 4, 4)
+    prediction = LDFPrediction(
+        velocity=HybridMotion(root_velocity, body_velocity),
+        clean_root_motion=predicted_root,
+        local_root_motion=local,
+        local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
+    )
+    step = type(
+        "HeadingStep",
+        (),
+        {
+            "loss_mask": torch.ones(1, 1, dtype=torch.bool),
+            "target_velocity": HybridMotion(
+                torch.zeros_like(root_velocity),
+                torch.zeros_like(body_velocity),
+            ),
+            "clean_motion": HybridMotion(target_root, torch.zeros_like(body_velocity)),
+        },
+    )()
+
+    losses = compute_velocity_loss(
+        prediction,
+        step,
+        root_mean=torch.zeros(5),
+        root_std=torch.ones(5),
+        root_heading_weight=0.1,
+    )
+
+    assert losses["root_heading_cosine"].detach().item() == pytest.approx(1.0)
+    assert losses["anchor_root_flow_xz"].detach().item() == pytest.approx(0.0)
+    assert losses["anchor_root_flow_height"].detach().item() == pytest.approx(0.0)
+    assert losses["anchor_root_flow_heading"].detach().item() == pytest.approx(0.0)
+    assert losses["total"].detach().item() == pytest.approx(0.1)
+    losses["total"].backward()
+    assert angle.grad is not None
+    assert angle.grad.abs() > 0
+
+
+def test_root_flow_logs_partition_xz_height_and_heading_channels():
+    root_velocity = torch.zeros(1, 1, 4, 5)
+    root_velocity[..., 3:5] = 2.0
+    body_velocity = torch.zeros(1, 1, 3)
+    clean_root = torch.zeros_like(root_velocity)
+    clean_root[..., 3] = 1.0
+    local = torch.zeros(1, 1, 4, 4)
+    prediction = LDFPrediction(
+        velocity=HybridMotion(root_velocity, body_velocity),
+        clean_root_motion=clean_root,
+        local_root_motion=local,
+        local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
+    )
+    step = type(
+        "ChannelStep",
+        (),
+        {
+            "loss_mask": torch.ones(1, 1, dtype=torch.bool),
+            "target_velocity": HybridMotion(
+                torch.zeros_like(root_velocity),
+                torch.zeros_like(body_velocity),
+            ),
+            "clean_motion": HybridMotion(clean_root, torch.zeros_like(body_velocity)),
+        },
+    )()
+
+    losses = compute_velocity_loss(
+        prediction,
+        step,
+        root_mean=torch.zeros(5),
+        root_std=torch.ones(5),
+    )
+
+    assert losses["anchor_root_flow_xz"].item() == pytest.approx(0.0)
+    assert losses["anchor_root_flow_height"].item() == pytest.approx(0.0)
+    assert losses["anchor_root_flow_heading"].item() == pytest.approx(4.0)
+    assert losses["anchor_root_flow_v"].item() == pytest.approx(1.6)
 
 
 def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():

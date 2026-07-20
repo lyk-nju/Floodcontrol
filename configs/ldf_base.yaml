@@ -129,6 +129,7 @@ loss:
   rollout_weight: 1.0
   offpath_beta_min: 0.1
   root_boundary_weight: 0.0
+  root_heading_weight: 0.1
 
 self_forcing:
   cold_start_replay: 0.1

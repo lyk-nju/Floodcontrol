@@ -140,6 +140,7 @@ def _validate_training_config(cfg) -> None:
         "body_weight",
         "rollout_weight",
         "root_boundary_weight",
+        "root_heading_weight",
     ):
         value = float(loss.get(name, 0.0))
         if not math.isfinite(value) or value < 0.0:

@@ -1,22 +1,72 @@
-base_config: ldf_base.yaml
-
 dirs:
   deps: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/deps
   outputs: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/outputs
   raw_data: /data/home/shengqiuProf_user_yuankai/FloodDiffusion/raw_data
 
+exp_name: ldf_hybrid
+seed: 1234
+debug: false
+train: true
 save_dir: ./outputs/ldf
+resume_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260719_010947_ldf_hybrid/step_120000.ckpt
+test_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260719_010947_ldf_hybrid/step_120000.ckpt
+
+wandb_info:
+  project: Floodcontrol
 
 trainer:
+  max_steps: 500000
+  accelerator: gpu
   devices: 8
+  strategy: auto
+  precision: bf16-mixed
+  log_every_n_steps: 50
+
+validation:
+  validation_steps: 1000
+  save_every_n_steps: 10000
+  save_top_k: 20
+  seed: 4321
+
+  generation:
+    enabled: true
+    steps: 5000
+    modes: [stream]
+    num_runs: 3
+    video_samples: 4
+    render: true
+    num_denoise_steps: 10
+    max_horizon_token: 10
+    rolling:
+      window_tokens: 50
+
+  dense_xz:
+    enabled: true
+    probe: dense_xz
+    video_samples: ${validation.generation.video_samples}
+    segment_frames: 20
+
+  t2m:
+    enabled: true
+    steps: 10000
+    cfg_mode: nocfg
 
 vae:
+  target: models.vae_wan_1d.BodyVAE
   checkpoint_path: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/vae/step_299999.ckpt
   params:
+    latent_dim: 128
+    hidden_dim: 512
+    encoder_layers: 6
+    decoder_layers: 6
+    kernel_size: 3
+    dropout: 0.0
+    motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
     latent_stats_path: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/vae/latent_stats.npz
 
 data:
   target: datasets.humanml3d.HumanML3DDataset
+  root_stats_path: ${dirs.raw_data}/HumanML3D_motion/root_stats.npz
   text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion/t5_text_embeddings.pt
   text_meta_paths:
     - ${dirs.raw_data}/HumanML3D_motion/all.txt
@@ -29,6 +79,120 @@ data:
       - ${dirs.raw_data}/HumanML3D_motion/test_min.txt
   artifact_path: artifacts
   text_path: texts
+  min_frames: 20
+  max_frames: 200
+  random_yaw: true
   train_batch_size: 64
   val_batch_size: 16
   num_workers: 2
+  pin_memory: true
+
+text_encoder:
+  checkpoint_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/models_t5_umt5-xxl-enc-bf16.pth
+  tokenizer_path: ${dirs.deps}/t5_umt5-xxl-enc-bf16/google/umt5-xxl
+  text_len: 128
+  dtype: bfloat16
+
+metrics:
+  t2m:
+    evaluate_text: true
+    metric_mean_path: ${dirs.deps}/t2m/meta/mean.npy
+    metric_std_path: ${dirs.deps}/t2m/meta/std.npy
+    wordvectorizer:
+      target: metrics.tools.word_vectorizer.WordVectorizer
+      params:
+        meta_root: ${dirs.deps}/glove
+        prefix: our_vab
+      max_text_len: 20
+    textencoder:
+      target: metrics.tools.t2m_evaluator.TextEncoderBiGRUCo
+      ckpt: ${dirs.deps}/t2m/humanml3d/text_encoder.pt
+      params:
+        word_size: 300
+        pos_size: 15
+        hidden_size: 512
+        output_size: 512
+    moveencoder:
+      target: metrics.tools.t2m_evaluator.MovementConvEncoder
+      ckpt: ${dirs.deps}/t2m/humanml3d/movement_encoder.pt
+      params:
+        input_size: 259
+        hidden_size: 512
+        output_size: 512
+    motionencoder:
+      target: metrics.tools.t2m_evaluator.MotionEncoderBiGRUCo
+      ckpt: ${dirs.deps}/t2m/humanml3d/motion_encoder.pt
+      params:
+        input_size: 512
+        hidden_size: 1024
+        output_size: 512
+
+training:
+  text_dropout: 0.1
+  constraint_dropout: 0.1
+  window:
+    max_tokens: 50
+    generation_tokens: 5
+    sampling: random_generation_start
+  max_horizon_token: 45
+  constraint_sampling:
+    dense_probability: 1.0
+    waypoint_probability: 0.0
+    goal_probability: 0.0
+    max_waypoint_count: 4
+
+loss:
+  root_weight: 1.0
+  body_weight: 1.0
+  rollout_weight: 1.0
+  offpath_beta_min: 0.1
+  root_boundary_weight: 0.0
+  root_heading_weight: 0.1
+
+self_forcing:
+  cold_start_replay: 0.1
+  k_schedule:
+    - [0, 1]
+    - [100000, 2]
+    - [200000, 3]
+    - [300000, 5]
+  teacher_replay:
+    2: 0.1
+    3: 0.1
+    5: 0.1
+
+model:
+  target: models.diffusion_forcing_wan.LDF
+  ema_decay: 0.99
+  params:
+    hidden_dim: 1024
+    ffn_dim: 2048
+    freq_dim: 256
+    text_dim: 4096
+    text_len: ${text_encoder.text_len}
+    num_heads: 8
+    root_num_layers: 8
+    body_num_layers: 8
+    chunk_size: 5
+    noise_steps: 10
+    fps: 20.0
+    time_embedding_scale: 1.0
+    cfg_mode: joint
+    cfg_scale_text: 1.0
+    cfg_scale_constraint: 1.0
+    cfg_scale_joint: 1.0
+    prediction_type: vel
+
+optimizer:
+  target: AdamW
+  params:
+    lr: 1.0e-4
+    betas: [0.9, 0.99]
+    weight_decay: 0.0
+    eps: 1.0e-8
+
+lr_scheduler:
+  target: diffusers.optimization.get_cosine_schedule_with_warmup
+  params:
+    num_warmup_steps: 5000
+    num_training_steps: ${trainer.max_steps}

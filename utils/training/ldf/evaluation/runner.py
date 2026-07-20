@@ -22,6 +22,7 @@ from metrics.trajectory import (
     summarize_dense_xz_records,
 )
 from utils.training.ldf.data import create_dataset
+from utils.training.ldf.metrics import compute_heading_metrics
 
 from .artifacts import (
     evaluation_artifact_dirs,
@@ -410,6 +411,24 @@ class LDFEvaluationRunner:
                         generated.body_motion,
                         fps=float(module.model.fps),
                     )
+                    heading = compute_heading_metrics(
+                        predicted_root=generated.root_motion[None],
+                        target_root=target_root.to(generated.root_motion)[None],
+                        predicted_body=generated.body_motion[None],
+                        frame_mask=torch.ones(
+                            1,
+                            frames,
+                            device=generated.root_motion.device,
+                            dtype=torch.bool,
+                        ),
+                        fps=float(module.model.fps),
+                    )
+                    record.update(
+                        {
+                            name: float(value.detach().cpu())
+                            for name, value in heading.items()
+                        }
+                    )
                     boundaries = compute_stream_boundary_metrics(
                         generated.root_motion,
                         generated.body_motion,
@@ -513,7 +532,13 @@ class LDFEvaluationRunner:
                     rank_zero_info(
                         f"[dense-xz][{mode}][{dataset}][{step_tag}] "
                         f"ADE={summary.get('ade_mean', float('nan')):.4f} "
-                        f"FDE={summary.get('fde_mean', float('nan')):.4f}"
+                        f"FDE={summary.get('fde_mean', float('nan')):.4f} "
+                        f"root-GT-heading="
+                        f"{summary.get('root_gt_heading_angle_deg_mean', float('nan')):.2f}deg "
+                        f"root-GT-trajectory-heading="
+                        f"{summary.get('root_gt_trajectory_heading_angle_deg_mean', float('nan')):.2f}deg "
+                        f"root-body-heading="
+                        f"{summary.get('root_body_heading_angle_deg_mean', float('nan')):.2f}deg"
                     )
                 videos = [
                     Path(path)

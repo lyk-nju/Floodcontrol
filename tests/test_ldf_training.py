@@ -23,6 +23,7 @@ from utils.training.ldf.data import LDFSpanCollator
 from utils.training.ldf.lightning_module import (
     LDFLightningModule,
     _create_curriculum_generator,
+    _file_sha256,
 )
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import sample_window_plan
@@ -620,13 +621,28 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
     losses = module._step(batch, is_training=True, initial_history_tokens=0)
     assert set(losses) == {
         "anchor_root_flow_v",
+        "anchor_root_flow_xz",
+        "anchor_root_flow_height",
+        "anchor_root_flow_heading",
         "latent_body_flow_v",
         "anchor_root_offpath_endpoint",
+        "anchor_root_offpath_xz",
+        "anchor_root_offpath_height",
+        "anchor_root_offpath_heading",
         "latent_body_offpath_endpoint",
+        "root_heading_cosine",
         "root_boundary_displacement",
         "total",
     }
     assert torch.isfinite(losses["total"])
+    assert set(module._last_heading_metrics) == {
+        "root_gt_heading_angle_deg",
+        "root_gt_trajectory_heading_angle_deg",
+        "root_body_heading_angle_deg",
+    }
+    assert all(
+        torch.isfinite(value) for value in module._last_heading_metrics.values()
+    )
     assert len(seen_conditions) == 1
     condition = seen_conditions[0]
     assert condition.root_condition_mask[:, 0, :, 0].all()
@@ -698,14 +714,14 @@ def test_ldf_resume_rejects_changed_vae_statistics_contract(tmp_path):
     module = LDFLightningModule(cfg)
     checkpoint = {}
     module.on_save_checkpoint(checkpoint)
-    checkpoint["ldf_training_contract"]["vae_statistics"]["latent_mean"] += 1
+    checkpoint["ldf_resume_contract"]["vae_statistics"]["latent_mean"] += 1
 
     resumed = LDFLightningModule(cfg)
     with pytest.raises(RuntimeError, match="VAE statistics mismatch for latent_mean"):
         resumed.on_load_checkpoint(checkpoint)
 
 
-def test_ldf_resume_rejects_changed_text_embedding_at_the_same_path(tmp_path):
+def test_ldf_resume_warns_but_accepts_changed_compatible_text_embeddings(tmp_path):
     cfg = _make_config(tmp_path)
     module = LDFLightningModule(cfg)
     checkpoint = {}
@@ -720,8 +736,127 @@ def test_ldf_resume_rejects_changed_text_embedding_at_the_same_path(tmp_path):
     torch.save(payload, path)
 
     resumed = LDFLightningModule(cfg)
-    with pytest.raises(RuntimeError, match="text embedding content"):
+    with pytest.warns(UserWarning, match="text embedding content changed"):
         resumed.on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_accepts_changed_training_and_cfg_policy(tmp_path):
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+
+    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    resumed_cfg.training.window.max_tokens = 80
+    resumed_cfg.training.max_horizon_token = 17
+    resumed_cfg.self_forcing.k_schedule = [[0, 1], [2, 2]]
+    resumed_cfg.self_forcing.teacher_replay = {2: 0.75}
+    resumed_cfg.self_forcing.cold_start_replay = 0.25
+    resumed_cfg.loss.root_weight = 3.0
+    resumed_cfg.loss.root_heading_weight = 0.2
+    resumed_cfg.model.params.cfg_mode = "separated"
+    resumed_cfg.model.params.cfg_scale_text = 2.0
+    resumed_cfg.model.params.cfg_scale_constraint = 3.0
+    resumed_cfg.model.params.cfg_scale_joint = 4.0
+
+    LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_rejects_changed_model_semantics_with_same_state_shapes(tmp_path):
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+
+    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    resumed_cfg.model.params.num_heads = 4
+    with pytest.raises(RuntimeError, match="model structure contract"):
+        LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_uses_loaded_ema_tokenizer_identity_not_checkpoint_bytes(tmp_path):
+    source_root = tmp_path / "source"
+    cfg = _make_config(source_root)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+
+    repacked_path = tmp_path / "repacked_vae.ckpt"
+    payload = torch.load(cfg.vae.checkpoint_path, map_location="cpu", weights_only=False)
+    payload["unrelated_training_metadata"] = {"step": 123}
+    torch.save(payload, repacked_path)
+    assert _file_sha256(repacked_path) != _file_sha256(cfg.vae.checkpoint_path)
+
+    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    resumed_cfg.vae.checkpoint_path = str(repacked_path)
+    LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_rejects_changed_loaded_ema_tokenizer_weights(tmp_path):
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+
+    payload = torch.load(cfg.vae.checkpoint_path, map_location="cpu", weights_only=False)
+    payload["ema_state"]["shadow_params"][0] += 1.0
+    torch.save(payload, cfg.vae.checkpoint_path)
+
+    with pytest.raises(RuntimeError, match="VAE tokenizer content"):
+        LDFLightningModule(cfg).on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_accepts_legacy_contract_with_matching_vae_file(tmp_path):
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+    contract = checkpoint.pop("ldf_resume_contract")
+    contract.pop("resume_contract_version")
+    contract.pop("vae_tokenizer_content_id")
+    contract["vae_checkpoint_content_id"] = _file_sha256(cfg.vae.checkpoint_path)
+    contract["model"] = {
+        "target": str(cfg.model.target),
+        "params": OmegaConf.to_container(cfg.model.params, resolve=True),
+    }
+    contract.pop("model_signature")
+    contract["training"] = {
+        "window": OmegaConf.to_container(cfg.training.window, resolve=True),
+        "max_horizon_token": int(cfg.training.max_horizon_token),
+        "self_forcing": OmegaConf.to_container(cfg.self_forcing, resolve=True),
+        "root_statistics": None,
+    }
+    checkpoint["ldf_training_contract"] = contract
+
+    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    resumed_cfg.self_forcing.k_schedule = [[0, 1], [1, 2]]
+    resumed_cfg.self_forcing.teacher_replay = {2: 0.5}
+    LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
+
+
+def test_ldf_resume_accepts_preidentity_path_contract_with_warnings(tmp_path):
+    cfg = _make_config(tmp_path)
+    module = LDFLightningModule(cfg)
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+    current = checkpoint.pop("ldf_resume_contract")
+    checkpoint["ldf_training_contract"] = {
+        "paths": {
+            "vae_checkpoint_path": str(cfg.vae.checkpoint_path),
+            "text_embeddings_path": str(cfg.data.text_embeddings_path),
+        },
+        "text_embedding_content_id": current["text_embedding_content_id"],
+        "vae_statistics": current["vae_statistics"],
+    }
+
+    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    resumed_cfg.self_forcing.k_schedule = [[0, 1], [1, 2]]
+    resumed_cfg.self_forcing.teacher_replay = {2: 0.5}
+    with pytest.warns(UserWarning) as warnings:
+        LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
+    messages = [str(item.message) for item in warnings]
+    assert any("predates VAE content identities" in message for message in messages)
+    assert any("predates model signatures" in message for message in messages)
 
 
 def test_ldf_resume_rejects_checkpoint_without_frozen_contract(tmp_path):
@@ -729,9 +864,9 @@ def test_ldf_resume_rejects_checkpoint_without_frozen_contract(tmp_path):
     module = LDFLightningModule(cfg)
     checkpoint = {}
     module.on_save_checkpoint(checkpoint)
-    checkpoint.pop("ldf_training_contract")
+    checkpoint.pop("ldf_resume_contract")
 
-    with pytest.raises(RuntimeError, match="no frozen training contract"):
+    with pytest.raises(RuntimeError, match="no resume contract"):
         LDFLightningModule(cfg).on_load_checkpoint(checkpoint)
 
 

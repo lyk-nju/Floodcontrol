@@ -10,12 +10,46 @@ from utils.training.ldf.steps import LDFTrainingStep
 from utils.training.ldf.flow import endpoint_estimate
 
 
+def _root_heading_cosine_loss(
+    prediction: LDFPrediction,
+    training_step: LDFTrainingStep,
+    *,
+    root_mean: torch.Tensor,
+    root_std: torch.Tensor,
+) -> torch.Tensor:
+    """Compare the projected clean Root heading directly with GT heading."""
+
+    predicted = prediction.clean_root_motion
+    target = training_step.clean_motion.root_motion
+    if tuple(predicted.shape) != tuple(target.shape):
+        raise ValueError("predicted and target clean root must share shape")
+    mean = root_mean.to(predicted)
+    std = root_std.to(predicted)
+    predicted_heading = F.normalize(
+        (predicted * std + mean)[..., 3:5].float(),
+        dim=-1,
+        eps=1e-6,
+    )
+    target_heading = F.normalize(
+        (target * std + mean)[..., 3:5].float(),
+        dim=-1,
+        eps=1e-6,
+    )
+    cosine = (predicted_heading * target_heading).sum(dim=-1).clamp(-1.0, 1.0)
+    error = 1.0 - cosine
+    frame_mask = training_step.loss_mask[..., None].expand_as(error)
+    return error[frame_mask].mean()
+
+
 def compute_velocity_loss(
     prediction: LDFPrediction,
     training_step: LDFTrainingStep,
     *,
+    root_mean: torch.Tensor,
+    root_std: torch.Tensor,
     root_weight: float = 1.0,
     body_weight: float = 1.0,
+    root_heading_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Compute root/body flow-v MSE only on the active band."""
 
@@ -31,14 +65,34 @@ def compute_velocity_loss(
         - training_step.target_velocity.latent_motion
     ).square()
     root_loss = root_error[mask].mean()
+    root_xz_loss = root_error[..., [0, 2]][mask].mean()
+    root_height_loss = root_error[..., 1:2][mask].mean()
+    root_heading_loss = root_error[..., 3:5][mask].mean()
     body_loss = body_error[mask].mean()
-    total = float(root_weight) * root_loss + float(body_weight) * body_loss
+    heading_cosine = _root_heading_cosine_loss(
+        prediction,
+        training_step,
+        root_mean=root_mean,
+        root_std=root_std,
+    )
+    total = (
+        float(root_weight) * root_loss
+        + float(body_weight) * body_loss
+        + float(root_heading_weight) * heading_cosine
+    )
     zero = total.detach() * 0.0
     return {
         "anchor_root_flow_v": root_loss,
+        "anchor_root_flow_xz": root_xz_loss,
+        "anchor_root_flow_height": root_height_loss,
+        "anchor_root_flow_heading": root_heading_loss,
         "latent_body_flow_v": body_loss,
         "anchor_root_offpath_endpoint": zero,
+        "anchor_root_offpath_xz": zero,
+        "anchor_root_offpath_height": zero,
+        "anchor_root_offpath_heading": zero,
         "latent_body_offpath_endpoint": zero,
+        "root_heading_cosine": heading_cosine,
         "root_boundary_displacement": zero,
         "total": total,
     }
@@ -73,9 +127,7 @@ def _root_boundary_displacement_loss(
     predicted = predicted.flatten(1, 2)
     target = target.flatten(1, 2)
 
-    valid_tokens = (
-        training_step.inputs.history_mask | training_step.loss_mask
-    )
+    valid_tokens = training_step.inputs.history_mask | training_step.loss_mask
     active_frames = training_step.loss_mask.repeat_interleave(
         endpoint_root.shape[2], dim=1
     )
@@ -102,6 +154,7 @@ def compute_offpath_loss(
     rollout_weight: float = 1.0,
     offpath_beta_min: float = 0.1,
     root_boundary_weight: float = 0.0,
+    root_heading_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Stabilize the clean endpoint from a persistent off-path solver state."""
 
@@ -123,11 +176,35 @@ def compute_offpath_loss(
         training_step.inputs.beta,
         float(offpath_beta_min),
     )
+    root_xz_loss = _masked_endpoint_loss(
+        root_error[..., [0, 2]],
+        mask,
+        training_step.inputs.beta,
+        float(offpath_beta_min),
+    )
+    root_height_loss = _masked_endpoint_loss(
+        root_error[..., 1:2],
+        mask,
+        training_step.inputs.beta,
+        float(offpath_beta_min),
+    )
+    root_heading_loss = _masked_endpoint_loss(
+        root_error[..., 3:5],
+        mask,
+        training_step.inputs.beta,
+        float(offpath_beta_min),
+    )
     body_loss = _masked_endpoint_loss(
         body_error,
         mask,
         training_step.inputs.beta,
         float(offpath_beta_min),
+    )
+    heading_cosine = _root_heading_cosine_loss(
+        prediction,
+        training_step,
+        root_mean=root_mean,
+        root_std=root_std,
     )
     if float(root_boundary_weight) != 0.0:
         boundary_loss = _root_boundary_displacement_loss(
@@ -140,14 +217,23 @@ def compute_offpath_loss(
     else:
         boundary_loss = root_loss.detach() * 0.0
     total = float(rollout_weight) * (
-        float(root_weight) * root_loss + float(body_weight) * body_loss
+        float(root_weight) * root_loss
+        + float(body_weight) * body_loss
+        + float(root_heading_weight) * heading_cosine
     ) + float(root_boundary_weight) * boundary_loss
     zero = total.detach() * 0.0
     return {
         "anchor_root_flow_v": zero,
+        "anchor_root_flow_xz": zero,
+        "anchor_root_flow_height": zero,
+        "anchor_root_flow_heading": zero,
         "latent_body_flow_v": zero,
         "anchor_root_offpath_endpoint": root_loss,
+        "anchor_root_offpath_xz": root_xz_loss,
+        "anchor_root_offpath_height": root_height_loss,
+        "anchor_root_offpath_heading": root_heading_loss,
         "latent_body_offpath_endpoint": body_loss,
+        "root_heading_cosine": heading_cosine,
         "root_boundary_displacement": boundary_loss,
         "total": total,
     }

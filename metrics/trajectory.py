@@ -174,6 +174,9 @@ def summarize_dense_xz_records(records: Sequence[dict[str, Any]]) -> dict[str, A
         "foot_skating_ratio",
         "root_boundary_jump_mean",
         "joint_boundary_jump_mean",
+        "root_gt_heading_angle_deg",
+        "root_gt_trajectory_heading_angle_deg",
+        "root_body_heading_angle_deg",
     )
     for key in scalar_keys:
         values = np.asarray(

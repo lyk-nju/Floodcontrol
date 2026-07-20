@@ -280,13 +280,32 @@ def test_dense_xz_metrics_report_time_aligned_and_path_errors():
 def test_dense_xz_summary_keeps_modes_and_segment_slots_separate():
     summary = summarize_dense_xz_records(
         [
-            {"ade": 0.1, "fde": 0.2, "segment_mse": [0.01, 0.02]},
-            {"ade": 0.3, "fde": 0.4, "segment_mse": [0.03, None]},
+            {
+                "ade": 0.1,
+                "fde": 0.2,
+                "root_gt_heading_angle_deg": 10.0,
+                "root_gt_trajectory_heading_angle_deg": 15.0,
+                "root_body_heading_angle_deg": 20.0,
+                "segment_mse": [0.01, 0.02],
+            },
+            {
+                "ade": 0.3,
+                "fde": 0.4,
+                "root_gt_heading_angle_deg": 30.0,
+                "root_gt_trajectory_heading_angle_deg": 35.0,
+                "root_body_heading_angle_deg": 40.0,
+                "segment_mse": [0.03, None],
+            },
         ]
     )
     assert summary["num_samples"] == 2
     assert summary["ade_mean"] == pytest.approx(0.2)
     assert summary["fde_std"] == pytest.approx(0.1)
+    assert summary["root_gt_heading_angle_deg_mean"] == pytest.approx(20.0)
+    assert summary["root_gt_trajectory_heading_angle_deg_mean"] == pytest.approx(
+        25.0
+    )
+    assert summary["root_body_heading_angle_deg_mean"] == pytest.approx(30.0)
     assert summary["segment_mse_per_slot"] == pytest.approx([0.02, 0.02])
 
 
