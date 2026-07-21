@@ -32,6 +32,7 @@ def _validate_inputs(
     predicted_root: torch.Tensor,
     target_root: torch.Tensor,
     predicted_body: torch.Tensor,
+    target_body: torch.Tensor,
     frame_mask: torch.Tensor,
     frame_valid_mask: torch.Tensor,
 ) -> None:
@@ -46,6 +47,13 @@ def _validate_inputs(
         raise ValueError("predicted_body must be physical [B,F,261 or 265]")
     if tuple(predicted_body.shape[:2]) != tuple(predicted_root.shape[:2]):
         raise ValueError("predicted body and root must share [B,F]")
+    if target_body.ndim != 3 or target_body.shape[-1] not in (
+        BODY_CONTINUOUS_DIM,
+        BODY_DIM,
+    ):
+        raise ValueError("target_body must be physical [B,F,261 or 265]")
+    if tuple(target_body.shape[:2]) != tuple(predicted_root.shape[:2]):
+        raise ValueError("target body and root must share [B,F]")
     if tuple(frame_mask.shape) != tuple(predicted_root.shape[:2]):
         raise ValueError("frame_mask must match root [B,F]")
     if frame_mask.dtype != torch.bool:
@@ -58,6 +66,7 @@ def _validate_inputs(
         predicted_root.device
         == target_root.device
         == predicted_body.device
+        == target_body.device
         == frame_mask.device
         == frame_valid_mask.device
     ):
@@ -165,12 +174,13 @@ def compute_heading_metrics(
     predicted_root: torch.Tensor,
     target_root: torch.Tensor,
     predicted_body: torch.Tensor,
+    target_body: torch.Tensor,
     frame_mask: torch.Tensor,
     frame_valid_mask: torch.Tensor | None = None,
     fps: float = 20.0,
     minimum_trajectory_speed_mps: float = 0.05,
 ) -> dict[str, torch.Tensor]:
-    """Measure Root Stage heading accuracy and root/body facing consistency.
+    """Measure generated and GT root/body/feet heading relationships.
 
     All motion inputs are physical frame-space tensors.  GT trajectory heading
     uses causal backward XZ displacement and excludes near-stationary frames.
@@ -188,16 +198,23 @@ def compute_heading_metrics(
         predicted_root,
         target_root,
         predicted_body,
+        target_body,
         frame_mask,
         frame_valid_mask,
     )
-    predicted_direction = _root_forward_direction(predicted_root)
-    target_direction = _root_forward_direction(target_root)
+    root_direction = _root_forward_direction(predicted_root)
+    gt_root_direction = _root_forward_direction(target_root)
     body_direction, body_valid = _body_forward_direction(
         predicted_root, predicted_body
     )
-    foot_direction, foot_valid = _foot_forward_directions(
+    feet_direction, feet_valid = _foot_forward_directions(
         predicted_root, predicted_body
+    )
+    gt_body_direction, gt_body_valid = _body_forward_direction(
+        target_root, target_body
+    )
+    gt_feet_direction, gt_feet_valid = _foot_forward_directions(
+        target_root, target_body
     )
     trajectory_direction, trajectory_valid = _trajectory_forward_direction(
         target_root,
@@ -206,25 +223,50 @@ def compute_heading_metrics(
         minimum_speed_mps=float(minimum_trajectory_speed_mps),
     )
     return {
-        "root_gt_heading_angle_deg": _mean_angle_degrees(
-            predicted_direction,
-            target_direction,
+        "root_gt_root_heading_angle_deg": _mean_angle_degrees(
+            root_direction,
+            gt_root_direction,
             frame_mask,
         ),
-        "root_gt_trajectory_heading_angle_deg": _mean_angle_degrees(
-            predicted_direction,
+        "body_gt_body_heading_angle_deg": _mean_angle_degrees(
+            body_direction,
+            gt_body_direction,
+            frame_mask & body_valid & gt_body_valid,
+        ),
+        "feet_gt_feet_heading_angle_deg": _mean_angle_degrees(
+            feet_direction,
+            gt_feet_direction,
+            frame_mask[..., None] & feet_valid & gt_feet_valid,
+        ),
+        "root_trajectory_heading_angle_deg": _mean_angle_degrees(
+            root_direction,
             trajectory_direction,
             frame_mask & trajectory_valid,
         ),
         "root_body_heading_angle_deg": _mean_angle_degrees(
-            predicted_direction,
+            root_direction,
             body_direction,
             frame_mask & body_valid,
         ),
-        "feet_root_reverse_ratio": _reverse_ratio(
-            foot_direction,
-            predicted_direction[..., None, :].expand_as(foot_direction),
-            frame_mask[..., None] & foot_valid,
+        "root_feet_heading_angle_deg": _mean_angle_degrees(
+            root_direction[..., None, :].expand_as(feet_direction),
+            feet_direction,
+            frame_mask[..., None] & feet_valid,
+        ),
+        "gt_root_body_heading_angle_deg": _mean_angle_degrees(
+            gt_root_direction,
+            gt_body_direction,
+            frame_mask & gt_body_valid,
+        ),
+        "gt_root_feet_heading_angle_deg": _mean_angle_degrees(
+            gt_root_direction[..., None, :].expand_as(gt_feet_direction),
+            gt_feet_direction,
+            frame_mask[..., None] & gt_feet_valid,
+        ),
+        "root_feet_reverse_ratio": _reverse_ratio(
+            feet_direction,
+            root_direction[..., None, :].expand_as(feet_direction),
+            frame_mask[..., None] & feet_valid,
         ),
     }
 

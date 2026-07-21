@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
+from pathlib import Path
 import types
 
 import numpy as np
@@ -21,10 +23,13 @@ from metrics.trajectory import (
 from tests.vae_helpers import make_vae
 from utils.conditions.ldf import HybridMotion, LDFPrediction
 from utils.training.ldf.evaluation import artifacts as evaluation_artifacts
+from utils.training.ldf.evaluation import runner as evaluation_runner
 from utils.training.ldf.evaluation.artifacts import save_dense_xz_sample
 from utils.training.ldf.evaluation.generation import (
     compile_evaluation_prompt,
+    create_evaluation_initial_noise,
     generate_evaluation_sequence,
+    rotate_evaluation_sample,
 )
 from utils.training.ldf.evaluation.runner import (
     LDFEvaluationRunner,
@@ -111,16 +116,24 @@ def test_generation_evaluation_is_composed_as_an_entrypoint_callback():
     callback = object.__new__(LDFEvaluationCallback)
     calls = []
     coverage_calls = []
+    startup_calls = []
     callback.runner = types.SimpleNamespace(
         maybe_run=calls.append,
         validate_text_coverage=coverage_calls.append,
+        run_at_start=lambda module: startup_calls.append(module) or True,
     )
     module = object()
 
-    callback.on_fit_start(types.SimpleNamespace(is_global_zero=True), module)
-    callback.on_fit_start(types.SimpleNamespace(is_global_zero=False), module)
+    callback.on_validation_start(types.SimpleNamespace(is_global_zero=True), module)
+    callback.on_validation_start(types.SimpleNamespace(is_global_zero=False), module)
     assert coverage_calls == [module, module]
-
+    callback.on_validation_epoch_end(
+        types.SimpleNamespace(sanity_checking=False, is_global_zero=True),
+        module,
+    )
+    assert startup_calls == [module]
+    assert calls == []
+    callback.runner.run_at_start = lambda module: False
     callback.on_validation_epoch_end(
         types.SimpleNamespace(sanity_checking=False, is_global_zero=True),
         module,
@@ -135,6 +148,37 @@ def test_generation_evaluation_is_composed_as_an_entrypoint_callback():
         module,
     )
     assert calls == [module, module]
+
+
+def test_startup_yaw_video_probe_runs_once_before_optimizer_steps(monkeypatch):
+    cfg = OmegaConf.create(
+        {
+            "validation": {
+                "generation": {
+                    "enabled": True,
+                    "run_at_start": True,
+                    "render": True,
+                },
+                "dense_xz": {"enabled": True},
+                "t2m": {"enabled": False},
+            },
+            "train": True,
+        }
+    )
+    runner = LDFEvaluationRunner(cfg)
+    calls = []
+    monkeypatch.setattr(runner, "_evaluation_context", lambda module: nullcontext())
+    monkeypatch.setattr(
+        runner,
+        "_run_startup_yaw_videos",
+        lambda module, **kwargs: calls.append(kwargs),
+    )
+    module = types.SimpleNamespace(global_step=160_000)
+
+    assert runner.run_at_start(module) is True
+    assert runner.run_at_start(module) is False
+
+    assert calls == [{"step": 160_000, "step_tag": "fit_start"}]
 
 
 def test_t2m_console_summary_reports_all_computed_metrics():
@@ -259,7 +303,7 @@ def test_evaluation_text_coverage_fails_before_training_for_missing_probe_prompt
         )
 
 
-def test_dense_xz_metrics_report_time_aligned_and_path_errors():
+def test_dense_xz_metrics_keep_only_time_aligned_control_errors():
     target = torch.zeros(8, 5)
     target[:, 0] = torch.arange(8) * 0.1
     predicted = target.clone()
@@ -267,46 +311,50 @@ def test_dense_xz_metrics_report_time_aligned_and_path_errors():
     metrics = compute_dense_xz_metrics(
         predicted,
         target,
-        segment_frames=4,
     )
     assert metrics["ade"] == pytest.approx(0.1)
     assert metrics["fde"] == pytest.approx(0.1)
-    assert metrics["mse"] == pytest.approx(0.01)
-    assert metrics["traj_fail_20cm"] == 0.0
-    assert metrics["path_arc_ade"] == pytest.approx(0.1)
-    assert len(metrics["segment_mse"]) == 2
+    assert metrics["max_error"] == pytest.approx(0.1)
+    assert set(metrics) == {"frames", "ade", "fde", "max_error"}
 
 
-def test_dense_xz_summary_keeps_modes_and_segment_slots_separate():
+def test_dense_xz_summary_prioritizes_control_and_heading_metrics():
     summary = summarize_dense_xz_records(
         [
             {
                 "ade": 0.1,
                 "fde": 0.2,
-                "root_gt_heading_angle_deg": 10.0,
-                "root_gt_trajectory_heading_angle_deg": 15.0,
+                "max_error": 0.3,
+                "root_gt_root_heading_angle_deg": 10.0,
+                "body_gt_body_heading_angle_deg": 15.0,
+                "feet_gt_feet_heading_angle_deg": 17.0,
+                "root_trajectory_heading_angle_deg": 18.0,
                 "root_body_heading_angle_deg": 20.0,
-                "segment_mse": [0.01, 0.02],
+                "root_feet_heading_angle_deg": 25.0,
             },
             {
                 "ade": 0.3,
                 "fde": 0.4,
-                "root_gt_heading_angle_deg": 30.0,
-                "root_gt_trajectory_heading_angle_deg": 35.0,
+                "max_error": 0.5,
+                "root_gt_root_heading_angle_deg": 30.0,
+                "body_gt_body_heading_angle_deg": 35.0,
+                "feet_gt_feet_heading_angle_deg": 37.0,
+                "root_trajectory_heading_angle_deg": 38.0,
                 "root_body_heading_angle_deg": 40.0,
-                "segment_mse": [0.03, None],
+                "root_feet_heading_angle_deg": 45.0,
             },
         ]
     )
     assert summary["num_samples"] == 2
     assert summary["ade_mean"] == pytest.approx(0.2)
     assert summary["fde_std"] == pytest.approx(0.1)
-    assert summary["root_gt_heading_angle_deg_mean"] == pytest.approx(20.0)
-    assert summary["root_gt_trajectory_heading_angle_deg_mean"] == pytest.approx(
-        25.0
-    )
+    assert summary["max_error_mean"] == pytest.approx(0.4)
+    assert summary["root_gt_root_heading_angle_deg_mean"] == pytest.approx(20.0)
+    assert summary["body_gt_body_heading_angle_deg_mean"] == pytest.approx(25.0)
+    assert summary["feet_gt_feet_heading_angle_deg_mean"] == pytest.approx(27.0)
+    assert summary["root_trajectory_heading_angle_deg_mean"] == pytest.approx(28.0)
     assert summary["root_body_heading_angle_deg_mean"] == pytest.approx(30.0)
-    assert summary["segment_mse_per_slot"] == pytest.approx([0.02, 0.02])
+    assert summary["root_feet_heading_angle_deg_mean"] == pytest.approx(35.0)
 
 
 def test_evaluation_prompt_is_deterministic_for_humanml_and_babel():
@@ -331,6 +379,117 @@ def test_evaluation_prompt_is_deterministic_for_humanml_and_babel():
     prompt = compile_evaluation_prompt(babel, frame_count=12)
     assert prompt.timeline == ("walk", "turn", "turn")
     assert prompt.change_frames.tolist() == [0, 4, 12]
+
+
+def test_paired_yaw_source_keeps_latent_noise_and_rotates_root_noise():
+    module = _evaluation_module()
+    base = create_evaluation_initial_noise(
+        module,
+        window_tokens=4,
+        seed=17,
+        yaw_degrees=0,
+    )
+    rotated = create_evaluation_initial_noise(
+        module,
+        window_tokens=4,
+        seed=17,
+        yaw_degrees=90,
+    )
+    assert torch.equal(rotated.latent_motion, base.latent_motion)
+    assert torch.allclose(rotated.root_motion[..., 0], base.root_motion[..., 2])
+    assert torch.allclose(rotated.root_motion[..., 2], -base.root_motion[..., 0])
+    assert torch.allclose(rotated.root_motion[..., 3], -base.root_motion[..., 4])
+    assert torch.allclose(rotated.root_motion[..., 4], base.root_motion[..., 3])
+
+
+def test_dense_xz_yaw_video_probe_renders_only_configured_rotation_triplet(
+    tmp_path,
+    monkeypatch,
+):
+    root = torch.zeros(8, 5)
+    root[:, 0] = torch.linspace(0.0, 0.7, 8)
+    root[:, 1] = 1.0
+    root[:, 3] = 1.0
+    body = torch.zeros(8, 265)
+    sample = {
+        "dataset": "HumanML3D",
+        "name": "001168",
+        "root_motion": root,
+        "body_motion": body,
+        "text_data": [],
+    }
+    prompt = types.SimpleNamespace(caption="walk")
+    base_generated = types.SimpleNamespace(
+        root_motion=root,
+        body_motion=body,
+        prompt=prompt,
+    )
+    generation_calls = []
+    render_calls = []
+
+    def fake_generate(module, rotated_sample, **kwargs):
+        generation_calls.append((rotated_sample, kwargs))
+        return types.SimpleNamespace(
+            root_motion=rotated_sample["root_motion"],
+            body_motion=rotated_sample["body_motion"],
+            prompt=prompt,
+        )
+
+    monkeypatch.setattr(evaluation_runner, "generate_evaluation_sequence", fake_generate)
+    monkeypatch.setattr(
+        evaluation_runner,
+        "render_comparison_video",
+        lambda **kwargs: render_calls.append(kwargs),
+    )
+    runner = LDFEvaluationRunner(OmegaConf.create({}))
+    paths = runner._render_yaw_videos(
+        types.SimpleNamespace(model=types.SimpleNamespace(fps=20.0)),
+        sample=sample,
+        base_generated=base_generated,
+        base_target_root=root,
+        base_target_body=body,
+        frame_count=8,
+        seed=4321,
+        mode="stream",
+        config={
+            "rolling_window_tokens": 50,
+            "max_horizon_token": 10,
+            "num_denoise_steps": 10,
+        },
+        yaw_degrees=(0.0, 90.0, 180.0),
+        video_dir=tmp_path / "video",
+        composite_dir=tmp_path / "composite",
+    )
+    assert [call[1]["initial_noise_yaw_degrees"] for call in generation_calls] == [
+        90.0,
+        180.0,
+    ]
+    assert len(render_calls) == 3
+    assert [Path(path).name for path in paths] == [
+        "001168_yaw_000deg.mp4",
+        "001168_yaw_090deg.mp4",
+        "001168_yaw_180deg.mp4",
+    ]
+    assert torch.allclose(
+        generation_calls[0][0]["root_motion"][:, 0],
+        root[:, 2],
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        generation_calls[0][0]["root_motion"][:, 2],
+        -root[:, 0],
+        atol=1e-6,
+    )
+
+
+def test_dense_xz_yaw_video_config_uses_probe_samples():
+    dense = OmegaConf.create(
+        {
+            "video_yaw_degrees": [0, 90, 180],
+        }
+    )
+    yaw_degrees = LDFEvaluationRunner._yaw_video_config(dense)
+    assert yaw_degrees == (0.0, 90.0, 180.0)
 
 
 def test_dense_xz_artifacts_follow_floodnet_layout(tmp_path):
@@ -479,6 +638,7 @@ def test_generation_modes_share_runtime_but_only_rolling_moves_window(
         rolling_window_tokens=4,
         max_horizon_token=2,
         num_denoise_steps=2,
+        initial_noise_yaw_degrees=0,
     )
     assert generated.normalized_motion.root_motion.shape == (1, 4, 4, 5)
     assert generated.normalized_motion.latent_motion.shape == (1, 4, 3)

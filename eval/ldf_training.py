@@ -14,7 +14,7 @@ class LDFEvaluationCallback(Callback):
         super().__init__()
         self.runner = LDFEvaluationRunner(cfg)
 
-    def on_fit_start(self, trainer, pl_module) -> None:
+    def on_validation_start(self, trainer, pl_module) -> None:
         # Every rank validates its local lookup before entering generation
         # collectives.  A rank-local failure must stop the whole DDP job rather
         # than leave peers waiting in a later all-gather.
@@ -28,6 +28,8 @@ class LDFEvaluationCallback(Callback):
         # them in its own on_validation_epoch_end after this callback returns.
         # All ranks participate.  The runner shards generation work and keeps
         # summaries/logger writes rank-zero-only.
+        if self.runner.run_at_start(pl_module):
+            return
         self.runner.maybe_run(pl_module)
 
 

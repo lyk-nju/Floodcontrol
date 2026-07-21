@@ -63,17 +63,17 @@ lr_scheduler:
 validation:
   generation:
     enabled: true
+    run_at_start: true
     steps: 5000
     modes: [stream]
     num_runs: 3
-    video_samples: 4
     max_horizon_token: 10
     rolling:
       window_tokens: 50
   dense_xz:
     enabled: true
     probe: dense_xz
-    segment_frames: 20
+    video_yaw_degrees: [0, 90, 180]
   t2m:
     enabled: false
     steps: 10000
@@ -83,7 +83,7 @@ validation:
 
 正式validation的rolling buffer同样固定为50 tokens，使训练parent与训练期部署模拟使用同一容量。独立Web/runtime实验若覆盖其他buffer长度，必须在专用配置和报告中明确标记，不能反向改变50-token训练合同。
 
-`k_schedule`的每一行是`[start_global_step,K]`：首行必须为`[0,1]`，step和K必须严格递增，所有stage必须落在`trainer.max_steps`内，`teacher_replay`只为K>1配置。启动入口会拒绝遗留`enabled/phase_start_step/phase_steps`字段，并校验最大K窗口预算。所有正式配置继承同一`[0,1]→[100000,2]→[200000,3]→[300000,5]`课程；它只依赖checkpoint恢复的absolute `global_step`，不因设备、数据集或路径覆盖而变化。
+`k_schedule`的每一行是`[start_global_step,K]`：首行必须为`[0,1]`，step和K必须严格递增，所有stage必须落在`trainer.max_steps`内，`teacher_replay`只为K>1配置。启动入口会拒绝遗留`enabled/phase_start_step/phase_steps`字段，并校验最大K窗口预算。课程只依赖checkpoint恢复的absolute `global_step`，不因设备、数据集或路径覆盖而变化。当前远端resume配置使用`[0,1]→[100000,2]→[200000,5]`；基础/本地配置中的额外K=3阶段属于另一条显式recipe，不能由代码隐式插入。
 
 WandB的key/entity仍由共享环境配置提供，但实验级project由各训练配置所有：`vae*.yaml`显式使用`VAE_Flood`，`ldf*.yaml`显式使用`Floodcontrol`，避免共享路径配置改变某一类实验的冻结recipe。
 
@@ -101,9 +101,9 @@ canonical root statistics只通过HumanML配置与正式span sampler生成一次
 python -m tools.compute_ldf_root_stats --config configs/ldf_s5.yaml
 ```
 
-工具默认写入HumanML配置的`data.root_stats_path`，并可读取独立`root_statistics`块来复现50-token、C=5、uniform-legal-history anchor与uniform-yaw采样。该块属于统计生成工具的recipe，不是训练入口合同：训练只要求`root_stats.npz`存在，并在模型加载时检查`root_mean/root_std`为有限、正std的`[5]`张量，不再比较window、active chunk、yaw或metadata。`ldf_multi.yaml`可以直接引用同一文件，不根据BABEL mixture切换归一化尺度。`train_ldf.py`仍校验当前训练自身的50-token总预算、active chunk一致性、XZ horizon上限、课程和两种dropout。
+工具默认写入HumanML配置的`data.root_stats_path`。若存在独立`root_statistics`块，工具按它复现采样recipe；若正式训练配置省略该块，则直接从`training.window`、`data.random_yaw`和固定的uniform-legal-history规则推导同一recipe，避免为离线工具复制训练配置。`root_statistics`不是训练入口合同：训练只要求`root_stats.npz`存在，并在模型加载时检查`root_mean/root_std`为有限、正std的`[5]`张量，不再比较window、active chunk、yaw或metadata。`ldf_multi.yaml`可以直接引用同一文件，不根据BABEL mixture切换归一化尺度。`train_ldf.py`仍校验当前训练自身的50-token总预算、active chunk一致性、XZ horizon上限、课程和两种dropout。
 
-普通loss validation每1,000 steps运行。teacher-continuation固定覆盖early/middle/late H；self-forcing validation始终使用统一课程`k_schedule`中的最大K，不再维护第二套validation history/K参数。dense XZ每5,000 steps读取`data.test_probe_meta_paths.dense_xz`指定的小型split；远端配置启用T2M，本机S5配置默认关闭。T2M通过`validation.t2m.cfg_mode: nocfg`固定使用joint文本条件的单分支forward，不继承轨迹实验的全局separated CFG；dense XZ仍使用模型全局CFG设置。生成评测支持固定buffer `stream`与真实窗口滚动`rolling`并只使用EMA模型；当前实验配置只启用`stream`，需要同周期比较时可将modes改为`[stream, rolling]`。评测语义、指标和输出目录见[`07_LDF_TRAINING_EVALUATION.md`](07_LDF_TRAINING_EVALUATION.md)。
+普通loss validation按`validation.validation_steps`运行。teacher-continuation固定覆盖early/middle/late H；self-forcing validation始终使用当前课程的最大K，不再维护第二套validation history/K参数。`run_at_start: true`时训练入口在`trainer.fit()`前显式调用一次`trainer.validate(..., ckpt_path=resume_ckpt)`，同一轮validation为dense-XZ probe TXT中的每条样本额外生成0°/90°/180° paired-yaw视频；不再使用独立`on_train_start`生命周期。dense XZ每5,000 steps读取`data.test_probe_meta_paths.dense_xz`指定的小型split，TXT是数值样本和视频样本的唯一来源；每条样本的全部run参与数值指标，只有run 0渲染视频。XZ数值只保留ADE/FDE/max error，主要诊断转向root/body/feet及对应GT的heading关系。T2M/FID能力仍保留但正式配置默认关闭；启用时通过`validation.t2m.cfg_mode: nocfg`使用joint文本条件的单分支forward。dense XZ继续使用模型全局CFG设置。生成评测支持固定buffer `stream`与真实窗口滚动`rolling`并只使用EMA模型；当前实验配置只启用`stream`，需要同周期比较时可将modes改为`[stream, rolling]`。评测语义、指标和输出目录见[`07_LDF_TRAINING_EVALUATION.md`](07_LDF_TRAINING_EVALUATION.md)。
 
 ## 开始填写前的门槛
 

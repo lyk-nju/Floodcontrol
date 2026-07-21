@@ -175,14 +175,21 @@ def _validate_training_config(cfg) -> None:
                 "validation future constraints cannot exceed the training lookahead cap"
             )
         if bool(dense_xz.get("enabled", False)):
-            if int(dense_xz.get("segment_frames", 0)) <= 0:
-                raise ValueError("validation.dense_xz.segment_frames must be positive")
-            video_samples = int(dense_xz.get("video_samples", 0))
-            if video_samples < 0:
-                raise ValueError("validation.dense_xz.video_samples must be non-negative")
             probe = str(dense_xz.get("probe", "")).strip()
             if not probe:
                 raise ValueError("validation.dense_xz.probe must name a data probe")
+            video_yaw_degrees = [
+                float(value)
+                for value in dense_xz.get("video_yaw_degrees", (0, 90, 180))
+            ]
+            if (
+                not video_yaw_degrees
+                or any(not math.isfinite(value) for value in video_yaw_degrees)
+                or len(set(video_yaw_degrees)) != len(video_yaw_degrees)
+            ):
+                raise ValueError(
+                    "validation.dense_xz.video_yaw_degrees must be finite and unique"
+                )
             probe_paths = cfg.data.get("test_probe_meta_paths") or {}
             if probe not in probe_paths or not probe_paths[probe]:
                 raise ValueError(
@@ -312,6 +319,13 @@ def main() -> None:
         check_val_every_n_epoch=None,
     )
     if cfg.train:
+        if bool(cfg.validation.generation.get("run_at_start", False)):
+            trainer.validate(
+                module,
+                dataloaders=val_loader,
+                ckpt_path=cfg.resume_ckpt,
+                weights_only=False,
+            )
         trainer.fit(
             module,
             train_loader,

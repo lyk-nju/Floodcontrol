@@ -72,16 +72,21 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert "continuation_span_frames" not in cfg.validation
     assert "loss_probes" not in cfg.validation
     assert cfg.validation.generation.enabled is True
+    assert cfg.validation.generation.run_at_start is True
     assert cfg.validation.generation.modes
     assert set(cfg.validation.generation.modes) <= {"stream", "rolling"}
     assert cfg.validation.generation.max_horizon_token == 10
     assert cfg.validation.generation.rolling.window_tokens == 50
+    assert "video_samples" not in cfg.validation.generation
     assert cfg.validation.dense_xz.enabled is True
     assert cfg.validation.dense_xz.probe == "dense_xz"
+    assert "video_sample_ids" not in cfg.validation.dense_xz
+    assert list(cfg.validation.dense_xz.video_yaw_degrees) == [0, 90, 180]
+    assert "segment_frames" not in cfg.validation.dense_xz
     assert cfg.data.test_probe_meta_paths.dense_xz[0].endswith(
         "HumanML3D_motion/test_min.txt"
     )
-    assert cfg.validation.t2m.enabled is True
+    assert cfg.validation.t2m.enabled is False
     assert "max_samples" not in cfg.validation.t2m
     assert "enabled" not in cfg.self_forcing
     assert "phase_start_step" not in cfg.self_forcing
@@ -92,29 +97,26 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert list(cfg.self_forcing.k_schedule) == [
         [0, 1],
         [100000, 2],
-        [200000, 3],
-        [300000, 5],
+        [200000, 5],
     ]
-    assert dict(cfg.self_forcing.teacher_replay) == {2: 0.1, 3: 0.1, 5: 0.1}
+    assert dict(cfg.self_forcing.teacher_replay) == {2: 0.1, 5: 0.1}
     assert cfg.trainer.max_steps == 500000
     assert cfg.trainer.devices == 8
     assert cfg.data.train_batch_size == 64
     assert cfg.data.num_workers == 2
     assert cfg.dirs.raw_data.startswith("/data/home/shengqiuProf_user_yuankai/")
-    assert cfg.resume_ckpt is None
-    assert cfg.test_ckpt is None
+    assert cfg.resume_ckpt == cfg.test_ckpt
+    assert str(cfg.resume_ckpt).endswith("step_160000.ckpt")
     assert cfg.loss.rollout_weight == pytest.approx(1.0)
     assert cfg.loss.offpath_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_boundary_weight == pytest.approx(0.0)
-    assert cfg.loss.root_heading_cosine_weight == pytest.approx(0.1)
-    assert cfg.loss.root_heading_vector_weight == pytest.approx(0.1)
+    assert cfg.loss.root_heading_cosine_weight == pytest.approx(0.3)
+    assert cfg.loss.root_heading_vector_weight == pytest.approx(0.3)
     assert cfg.loss.root_heading_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_heading_cosine_min_norm == pytest.approx(0.05)
-    assert cfg.loss.body_weight == pytest.approx(3.0)
+    assert cfg.loss.body_weight == pytest.approx(1.0)
     assert cfg.model.params.cfg_mode == "joint"
-    assert cfg.root_statistics.window_tokens == 50
-    assert cfg.root_statistics.generation_tokens == 5
-    assert cfg.root_statistics.anchor_sampling == "uniform_legal_history"
+    assert "root_statistics" not in cfg.config
     assert (
         cfg.lr_scheduler.target
         == "diffusers.optimization.get_cosine_schedule_with_warmup"
@@ -131,9 +133,9 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
         assert injected_name not in cfg.model.params
 
 
-def test_formal_t2m_evaluation_uses_nocfg():
+def test_formal_t2m_evaluation_is_available_but_disabled_by_default():
     cfg = load_config(str(REMOTE_LDF_CONFIG))
-    assert cfg.validation.t2m.enabled is True
+    assert cfg.validation.t2m.enabled is False
     assert cfg.validation.t2m.cfg_mode == "nocfg"
 
 
@@ -179,8 +181,8 @@ def test_remote_self_forcing_recipe_uses_resume_stable_absolute_boundaries():
     assert resolve_self_forcing_k(99_999, schedule) == 1
     assert resolve_self_forcing_k(100_000, schedule) == 2
     assert resolve_self_forcing_k(199_999, schedule) == 2
-    assert resolve_self_forcing_k(200_000, schedule) == 3
-    assert resolve_self_forcing_k(299_999, schedule) == 3
+    assert resolve_self_forcing_k(200_000, schedule) == 5
+    assert resolve_self_forcing_k(299_999, schedule) == 5
     assert resolve_self_forcing_k(300_000, schedule) == 5
     assert resolve_self_forcing_k(499_999, schedule) == 5
 
@@ -320,6 +322,7 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     assert "LDFLightningModule" in source
     assert "create_dataloaders" in source
     assert 'trainer_config["use_distributed_sampler"] = False' in source
+    assert source.index("trainer.validate(") < source.index("trainer.fit(")
     assert "BLOCKED_ON_LDF_TRAINING" not in source
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     _validate_training_config(cfg)

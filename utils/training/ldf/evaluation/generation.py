@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,6 +16,7 @@ from utils.inference import (
     RouteEndBehavior,
     RouteReference,
 )
+from utils.motion_process import rotate_motion_yaw
 from utils.token_frame import FRAMES_PER_TOKEN
 
 
@@ -37,6 +39,80 @@ class GeneratedSequence:
     body_motion: torch.Tensor
     prompt: EvaluationPrompt
     traces: tuple[object, ...]
+
+
+def rotate_evaluation_sample(
+    sample: dict[str, object],
+    *,
+    frame_count: int,
+    yaw_degrees: float,
+) -> dict[str, object]:
+    """Return a root/body-consistent global-yaw variant of one sample."""
+
+    frames = int(frame_count)
+    root = sample["root_motion"][:frames]
+    body = sample["body_motion"][:frames]
+    angle = torch.tensor(
+        [math.radians(float(yaw_degrees))],
+        device=root.device,
+        dtype=root.dtype,
+    )
+    rotated_root, rotated_body = rotate_motion_yaw(
+        root[None],
+        body[None].to(device=root.device, dtype=root.dtype),
+        angle,
+    )
+    rotated = dict(sample)
+    rotated["root_motion"] = rotated_root[0]
+    rotated["body_motion"] = rotated_body[0].to(body)
+    return rotated
+
+
+def create_evaluation_initial_noise(
+    module,
+    *,
+    window_tokens: int,
+    seed: int,
+    yaw_degrees: float,
+) -> HybridMotion:
+    """Create paired source noise and apply the physical yaw action to root5."""
+
+    device = module.model.root_mean.device
+    dtype = next(module.model.parameters()).dtype
+    generator = torch.Generator(device=device).manual_seed(int(seed))
+    root = torch.randn(
+        1,
+        int(window_tokens),
+        FRAMES_PER_TOKEN,
+        5,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    latent = torch.randn(
+        1,
+        int(window_tokens),
+        module.model.latent_dim,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    angle = math.radians(float(yaw_degrees))
+    if abs(angle) >= 1e-12:
+        physical = module.model.denormalize_root(root)
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        rotated = physical.clone()
+        x = physical[..., 0]
+        z = physical[..., 2]
+        rotated[..., 0] = cosine * x + sine * z
+        rotated[..., 2] = -sine * x + cosine * z
+        heading_cosine = physical[..., 3]
+        heading_sine = physical[..., 4]
+        rotated[..., 3] = cosine * heading_cosine - sine * heading_sine
+        rotated[..., 4] = sine * heading_cosine + cosine * heading_sine
+        root = module.model.normalize_root(rotated)
+    return HybridMotion(root, latent)
 
 
 def compile_evaluation_prompt(
@@ -136,6 +212,7 @@ def generate_evaluation_sequence(
     rolling_window_tokens: int,
     max_horizon_token: int,
     num_denoise_steps: int,
+    initial_noise_yaw_degrees: float | None = None,
 ) -> GeneratedSequence:
     """Generate and causally decode one complete physical validation sequence."""
 
@@ -159,6 +236,14 @@ def generate_evaluation_sequence(
         rolling = True
     if window_tokens <= int(module.model.chunk_size):
         raise ValueError("evaluation window must be larger than the LDF chunk size")
+    initial_noise = None
+    if initial_noise_yaw_degrees is not None:
+        initial_noise = create_evaluation_initial_noise(
+            module,
+            window_tokens=window_tokens,
+            seed=seed,
+            yaw_degrees=float(initial_noise_yaw_degrees),
+        )
 
     session = InferenceSession(
         ldf=module.model,
@@ -183,6 +268,7 @@ def generate_evaluation_sequence(
         seed=int(seed),
         initial_world_xz=target_root[0, [0, 2]].tolist(),
         initial_text=prompt.timeline[0],
+        initial_noise=initial_noise,
     )
     for token_index in range(1, token_count):
         if prompt.timeline[token_index] != prompt.timeline[token_index - 1]:
@@ -230,9 +316,11 @@ def generate_evaluation_sequence(
 
 
 __all__ = [
+    "create_evaluation_initial_noise",
     "EvaluationPrompt",
     "GENERATION_MODES",
     "GeneratedSequence",
     "compile_evaluation_prompt",
     "generate_evaluation_sequence",
+    "rotate_evaluation_sample",
 ]

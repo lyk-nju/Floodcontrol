@@ -27,11 +27,11 @@ target root XZ at every frame
 
 每个commit先从`commit_index + 1`开始编译覆盖尚未可见active位置和远期轨迹的候选superset；每个denoise microstep按当前`history_mask | generation_mask`动态把future起点推进到真实visible-motion末端，并限制为配置的最大horizon。route/text仍然每commit只编译一次。固定buffer和rolling window在同一commit/microstep看到相同absolute future语义。
 
-每个样本记录ADE、FDE、time-aligned MSE、20/50cm失败率、分段/前缀MSE、path arclength误差、Chamfer误差、轨迹jitter、foot skating和token边界跳变。对前若干样本输出GT动作、生成动作和俯视XZ轨迹的并排视频。
+XZ控制指标只保留物理意义直接且互补的ADE、FDE和最大逐帧误差，不再同时维护MSE、阈值失败率、分段/前缀MSE、path arclength、Chamfer与轨迹jitter。动作质量继续记录foot skating和token边界跳变。朝向诊断记录预测root/body/feet之间、GT root/body/feet之间，以及预测root/body/feet各自相对GT对应方向的二维无符号角度；另保留root相对GT轨迹切线的角度和root/feet反向比例。
 
 ## T2M评测
 
-HumanML3D生成结果通过唯一`root5/body265 -> HumanML263`converter进入已有T2M evaluator，记录FID、Matching Score、R-Precision以及Diversity。正式训练与FloodNet一致，T2M读取`data.val_meta_paths`并遍历完整HumanML3D validation split，不再提供容易被误当成正式FID的`max_samples`捷径。
+HumanML3D生成结果仍可通过唯一`root5/body265 -> HumanML263`converter进入已有T2M evaluator，记录FID、Matching Score、R-Precision以及Diversity。T2M读取`data.val_meta_paths`并遍历完整HumanML3D validation split，不提供容易被误当成正式FID的`max_samples`捷径。当前正式训练默认关闭该高成本评测；需要阶段性检查无轨迹动作分布时再显式启用，不删除其独立评测能力。
 
 T2M评测不提供轨迹条件；dense XZ评测和T2M评测分别回答“控制是否准确”和“无轨迹提示时动作分布是否合理”，不能把二者混为同一指标。T2M显式使用`cfg_mode: nocfg`，即用训练过的joint文本条件执行单分支forward，不继承模型用于轨迹控制实验的全局`separated`模式。这样既避免无轨迹生成承担三分支开销，也不使用线性分支组合近似真实joint文本响应。dense XZ仍独立继承模型全局CFG配置，以便继续评估constraint guidance。
 
@@ -45,10 +45,10 @@ T2M评测不提供轨迹条件；dense XZ评测和T2M评测分别回答“控制
 validation:
   generation:
     enabled: true
+    run_at_start: true
     steps: 5000
     modes: [stream]
     num_runs: 3
-    video_samples: 4
     num_denoise_steps: 10
     max_horizon_token: 10
     rolling:
@@ -57,15 +57,17 @@ validation:
   dense_xz:
     enabled: true
     probe: dense_xz
-    segment_frames: 20
+    video_yaw_degrees: [0, 90, 180]
 
   t2m:
-    enabled: true
+    enabled: false
     steps: 10000
     cfg_mode: nocfg
 ```
 
-生成视频/轨迹probe不从validation split中隐式取“前N条”，而是按FloodNet格式由`data.test_probe_meta_paths.dense_xz`指定小型TXT；当前文件包含8条固定HumanML3D测试样本。T2M仍独立使用完整validation split。
+生成轨迹probe不从validation split中隐式取“前N条”，而是按FloodNet格式由`data.test_probe_meta_paths.dense_xz`指定小型TXT。该TXT是数值样本与视频样本的唯一来源，不再维护第二层`video_sample_ids`筛选：每条样本的`num_runs`全部参与数值指标，只有run 0渲染原始、`+90°`和`+180°`三组结果。若只需要`000021/001168`，应让`test_min.txt`只包含这两个ID。T2M仍独立使用完整validation split。
+
+三组yaw视频采用paired-noise合同：root5/body265与dense world-XZ route同步旋转；latent source保持逐元素相同；root source在物理root5空间执行同一yaw旋转后重新归一化；文本、seed和denoise设置保持一致。因此三组差异用于诊断模型的yaw等变性，而不是比较三个无关随机生成。`run_at_start: true`使训练入口在`trainer.fit()`之前显式执行一次`trainer.validate(..., ckpt_path=resume_ckpt)`；该轮validation使用加载后的checkpoint/EMA并额外生成六个固定视频，目录标签为`fit_start`。不再通过`on_train_start`维护另一套启动生命周期。当前正式paired-yaw视频只随`modes: [stream]`执行。
 
 heavy evaluation在非sanity validation且step命中周期时执行，并支持单卡或DDP。所有rank都进入同一个EMA与collective作用域，但generation sample按全局稳定编号round-robin分片，每条motion只由一个rank生成。当前实验只启用`stream`；将modes改为`[stream, rolling]`即可同时比较两条runtime路径。运行前后每个rank分别恢复自己的Python、NumPy、Torch和当前CUDA device RNG状态。EMA参数在整轮validation开始时只交换一次，普通loss probe与inline evaluation共享同一EMA scope；epoch-end或异常路径恢复训练权重并释放临时副本，不改变optimizer、scheduler、LDF stream state或VAE decoder state。
 
@@ -96,7 +98,7 @@ DDP聚合遵守以下边界：
 └── composite/<probe>/<step>/
 ```
 
-`probe`为`dense_xz_stream`、`dense_xz_rolling`、`t2m_stream`或`t2m_rolling`。视频失败只产生warning；数值artifact与summary仍然保留。
+`probe`为`dense_xz_stream`、`dense_xz_rolling`、`t2m_stream`或`t2m_rolling`。固定yaw视频使用`000021_yaw_000deg.mp4`、`000021_yaw_090deg.mp4`等名称；视频失败只产生warning，数值artifact与summary仍然保留。
 
 对于dense XZ probe，人物和轨迹共享同一个固定正交相机，轨迹直接画在人物脚下的世界地面上，而不是放入独立俯视面板：
 
@@ -108,7 +110,7 @@ DDP聚合遵守以下边界：
 ## 当前边界
 
 - 当前只实现dense XZ视频/控制指标，没有稀疏waypoint或goal专用生成probe。
-- T2M训练期默认遍历完整HumanML3D validation split；它可用于checkpoint趋势比较，最终论文结果仍应使用独立固定evaluation protocol和重复随机运行。
+- T2M训练期默认关闭；启用时遍历完整HumanML3D validation split。最终论文结果仍应使用独立固定evaluation protocol和重复随机运行。
 - 生成目前逐样本运行，优先保证与真实runtime语义一致；后续若做批量加速，必须证明与逐session结果一致。
 - BABEL可参与dense XZ评测，但T2M evaluator只用于HumanML3D。
 - DDP只并行不同evaluation sample；单个`InferenceSession`仍按token顺序生成，不改变stream/rolling的数值语义。

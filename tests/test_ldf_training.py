@@ -768,10 +768,15 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
     }
     assert torch.isfinite(losses["total"])
     assert set(module._last_heading_metrics) == {
-        "root_gt_heading_angle_deg",
-        "root_gt_trajectory_heading_angle_deg",
+        "root_gt_root_heading_angle_deg",
+        "body_gt_body_heading_angle_deg",
+        "feet_gt_feet_heading_angle_deg",
+        "root_trajectory_heading_angle_deg",
         "root_body_heading_angle_deg",
-        "feet_root_reverse_ratio",
+        "root_feet_heading_angle_deg",
+        "gt_root_body_heading_angle_deg",
+        "gt_root_feet_heading_angle_deg",
+        "root_feet_reverse_ratio",
     }
     assert all(
         torch.isfinite(value) for value in module._last_heading_metrics.values()

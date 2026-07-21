@@ -20,46 +20,13 @@ def _motion_xz(value: torch.Tensor | np.ndarray, *, name: str) -> torch.Tensor:
     return tensor if tensor.shape[-1] == 2 else tensor[:, [0, 2]]
 
 
-def _resample_path(points: np.ndarray, count: int) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float32)
-    if len(points) == 1:
-        return np.repeat(points, count, axis=0)
-    lengths = np.linalg.norm(points[1:] - points[:-1], axis=-1)
-    cumulative = np.concatenate(
-        [np.zeros(1, dtype=np.float32), np.cumsum(lengths, dtype=np.float32)]
-    )
-    if float(cumulative[-1]) < 1e-8:
-        return np.repeat(points[:1], count, axis=0)
-    samples = np.linspace(0.0, float(cumulative[-1]), count, dtype=np.float32)
-    return np.stack(
-        [
-            np.interp(samples, cumulative, points[:, 0]),
-            np.interp(samples, cumulative, points[:, 1]),
-        ],
-        axis=-1,
-    ).astype(np.float32)
-
-
-def _path_metrics(predicted: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
-    count = min(max(len(predicted), len(target)), 256)
-    pred = _resample_path(predicted.numpy(), count)
-    ref = _resample_path(target.numpy(), count)
-    arc_ade = float(np.linalg.norm(pred - ref, axis=-1).mean())
-    distances = np.linalg.norm(pred[:, None] - ref[None], axis=-1)
-    chamfer = float(
-        0.5 * (distances.min(axis=1).mean() + distances.min(axis=0).mean())
-    )
-    return {"path_arc_ade": arc_ade, "path_chamfer": chamfer}
-
-
 def compute_dense_xz_metrics(
     predicted_root: torch.Tensor | np.ndarray,
     target_root: torch.Tensor | np.ndarray,
     *,
     valid_mask: torch.Tensor | np.ndarray | None = None,
-    segment_frames: int = 20,
 ) -> dict[str, Any]:
-    """Compare time-aligned dense root XZ trajectories in physical metres."""
+    """Return the minimal time-aligned dense-XZ control metrics in metres."""
 
     predicted = _motion_xz(predicted_root, name="predicted_root")
     target = _motion_xz(target_root, name="target_root")
@@ -79,47 +46,14 @@ def compute_dense_xz_metrics(
 
     delta = predicted - target
     distance = delta.norm(dim=-1)
-    squared_distance = delta.square().sum(dim=-1)
     selected_distance = distance[mask]
     last_index = int(mask.nonzero(as_tuple=False)[-1].item())
-    result: dict[str, Any] = {
+    return {
         "frames": int(frames),
-        "masked_ratio": float(mask.float().mean().item()),
         "ade": float(selected_distance.mean().item()),
         "fde": float(distance[last_index].item()),
-        "mse": float(squared_distance[mask].mean().item()),
-        "traj_fail_20cm": float((selected_distance > 0.20).any().item()),
-        "traj_fail_50cm": float((selected_distance > 0.50).any().item()),
-        "frame_fail_20cm": float((selected_distance > 0.20).float().mean().item()),
-        "frame_fail_50cm": float((selected_distance > 0.50).float().mean().item()),
+        "max_error": float(selected_distance.max().item()),
     }
-    result.update(_path_metrics(predicted[mask], target[mask]))
-
-    segment = int(segment_frames)
-    if segment <= 0:
-        raise ValueError("segment_frames must be positive")
-    result["segment_mse"] = [
-        (
-            float(squared_distance[start:end][mask[start:end]].mean().item())
-            if bool(mask[start:end].any())
-            else None
-        )
-        for start in range(0, frames, segment)
-        for end in [min(start + segment, frames)]
-    ]
-    result["prefix_mse"] = [
-        float(squared_distance[:end][mask[:end]].mean().item())
-        for end in range(segment, frames + 1, segment)
-        if bool(mask[:end].any())
-    ]
-    if frames >= 3:
-        acceleration = predicted[2:] - 2.0 * predicted[1:-1] + predicted[:-2]
-        result["traj_jitter"] = float(
-            acceleration.square().sum(dim=-1).mean().item()
-        )
-    else:
-        result["traj_jitter"] = float("nan")
-    return result
 
 
 def compute_foot_skating_ratio(
@@ -163,20 +97,19 @@ def summarize_dense_xz_records(records: Sequence[dict[str, Any]]) -> dict[str, A
     scalar_keys = (
         "ade",
         "fde",
-        "mse",
-        "traj_fail_20cm",
-        "traj_fail_50cm",
-        "frame_fail_20cm",
-        "frame_fail_50cm",
-        "traj_jitter",
-        "path_arc_ade",
-        "path_chamfer",
+        "max_error",
         "foot_skating_ratio",
         "root_boundary_jump_mean",
         "joint_boundary_jump_mean",
-        "root_gt_heading_angle_deg",
-        "root_gt_trajectory_heading_angle_deg",
+        "root_gt_root_heading_angle_deg",
+        "body_gt_body_heading_angle_deg",
+        "feet_gt_feet_heading_angle_deg",
+        "root_trajectory_heading_angle_deg",
         "root_body_heading_angle_deg",
+        "root_feet_heading_angle_deg",
+        "gt_root_body_heading_angle_deg",
+        "gt_root_feet_heading_angle_deg",
+        "root_feet_reverse_ratio",
     )
     for key in scalar_keys:
         values = np.asarray(
@@ -188,20 +121,6 @@ def summarize_dense_xz_records(records: Sequence[dict[str, Any]]) -> dict[str, A
             summary[f"{key}_mean"] = float(values.mean())
             summary[f"{key}_std"] = float(values.std())
 
-    for key in ("segment_mse", "prefix_mse"):
-        width = max((len(record.get(key, [])) for record in records), default=0)
-        slots = []
-        for index in range(width):
-            values = [
-                float(record[key][index])
-                for record in records
-                if index < len(record.get(key, []))
-                and record[key][index] is not None
-                and np.isfinite(float(record[key][index]))
-            ]
-            slots.append(float(np.mean(values)) if values else None)
-        if slots:
-            summary[f"{key}_per_slot"] = slots
     return summary
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import random
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from .generation import (
     GENERATION_MODES,
     compile_evaluation_prompt,
     generate_evaluation_sequence,
+    rotate_evaluation_sample,
 )
 
 
@@ -179,6 +181,7 @@ class LDFEvaluationRunner:
         self._dataset = None
         self._probe_datasets: dict[str, object] = {}
         self._text_coverage_validated = False
+        self._startup_evaluation_completed = False
 
     @property
     def enabled(self) -> bool:
@@ -216,27 +219,16 @@ class LDFEvaluationRunner:
         dataset=None,
         limit: int,
         dataset_name: str | None = None,
-        sample_ids: list[str] | None = None,
     ) -> list[dict[str, object]]:
-        requested = set(str(value) for value in (sample_ids or []))
         selected = []
         source = self._validation_dataset() if dataset is None else dataset
         for index in range(len(source)):
             sample = source[index]
             if dataset_name is not None and str(sample["dataset"]) != dataset_name:
                 continue
-            if requested and str(sample["name"]) not in requested:
-                continue
             selected.append(sample)
             if limit > 0 and len(selected) >= limit:
                 break
-        if requested:
-            found = {str(sample["name"]) for sample in selected}
-            missing = requested - found
-            if missing:
-                raise RuntimeError(
-                    f"evaluation sample ids were not found: {sorted(missing)}"
-                )
         if not selected:
             raise RuntimeError("generation evaluation selected no validation samples")
         return selected
@@ -248,13 +240,10 @@ class LDFEvaluationRunner:
         dataset=None,
         limit: int,
         dataset_name: str | None = None,
-        sample_ids: list[str] | None = None,
     ) -> tuple[list[tuple[int, dict[str, object]]], int]:
         """Select globally, but load only the samples owned by this DDP rank."""
 
         rank, world_size = _distributed_rank_world(module)
-        requested = set(str(value) for value in (sample_ids or []))
-        found: set[str] = set()
         selected: list[tuple[int, dict[str, object]]] = []
         selected_count = 0
         source = self._validation_dataset() if dataset is None else dataset
@@ -267,9 +256,6 @@ class LDFEvaluationRunner:
             source_name, sample_name = identity
             if dataset_name is not None and source_name != dataset_name:
                 continue
-            if requested and sample_name not in requested:
-                continue
-            found.add(sample_name)
             global_index = selected_count
             if global_index % world_size == rank:
                 if sample is None:
@@ -278,12 +264,6 @@ class LDFEvaluationRunner:
             selected_count += 1
             if limit > 0 and selected_count >= limit:
                 break
-        if requested:
-            missing = requested - found
-            if missing:
-                raise RuntimeError(
-                    f"evaluation sample ids were not found: {sorted(missing)}"
-                )
         if selected_count == 0:
             raise RuntimeError("generation evaluation selected no validation samples")
         return selected, selected_count
@@ -331,6 +311,85 @@ class LDFEvaluationRunner:
             "render": bool(generation.get("render", True)),
         }
 
+    @staticmethod
+    def _yaw_video_config(dense) -> tuple[float, ...]:
+        yaw_degrees = tuple(
+            float(value) for value in dense.get("video_yaw_degrees", (0, 90, 180))
+        )
+        if not yaw_degrees or any(not np.isfinite(value) for value in yaw_degrees):
+            raise ValueError(
+                "validation.dense_xz.video_yaw_degrees must contain finite values"
+            )
+        if len(set(yaw_degrees)) != len(yaw_degrees):
+            raise ValueError("validation.dense_xz.video_yaw_degrees must be unique")
+        return yaw_degrees
+
+    def _render_yaw_videos(
+        self,
+        module,
+        *,
+        sample: dict[str, object],
+        base_generated,
+        base_target_root: torch.Tensor,
+        base_target_body: torch.Tensor,
+        frame_count: int,
+        seed: int,
+        mode: str,
+        config: dict[str, Any],
+        yaw_degrees: tuple[float, ...],
+        video_dir: Path,
+        composite_dir: Path,
+    ) -> list[str]:
+        """Render fixed-yaw variants with paired root/latent source noise."""
+
+        paths = []
+        sample_id = str(sample["name"])
+        for angle in yaw_degrees:
+            if abs(angle) < 1e-12:
+                generated = base_generated
+                target_root = base_target_root
+                target_body = base_target_body
+            else:
+                rotated_sample = rotate_evaluation_sample(
+                    sample,
+                    frame_count=frame_count,
+                    yaw_degrees=angle,
+                )
+                target_root = rotated_sample["root_motion"]
+                target_body = rotated_sample["body_motion"]
+                generated = generate_evaluation_sequence(
+                    module,
+                    rotated_sample,
+                    mode=mode,
+                    seed=seed,
+                    frame_count=frame_count,
+                    dense_xz=True,
+                    rolling_window_tokens=config["rolling_window_tokens"],
+                    max_horizon_token=config["max_horizon_token"],
+                    num_denoise_steps=config["num_denoise_steps"],
+                    initial_noise_yaw_degrees=angle,
+                )
+            rounded = round(angle)
+            if abs(angle - rounded) < 1e-8:
+                yaw_label = f"yaw_{rounded:03d}deg"
+            else:
+                yaw_label = f"yaw_{angle:07.3f}deg".replace(".", "p")
+            output_name = f"{sample_id}_{yaw_label}.mp4"
+            predicted_path = video_dir / output_name
+            composite_path = composite_dir / output_name
+            render_comparison_video(
+                target_root=target_root,
+                target_body=target_body,
+                predicted_root=generated.root_motion,
+                predicted_body=generated.body_motion,
+                predicted_video_path=predicted_path,
+                composite_path=composite_path,
+                caption=f"{generated.prompt.caption} | yaw {angle:g} deg",
+                fps=float(module.model.fps),
+            )
+            paths.append(str(composite_path))
+        return paths
+
     def _log(self, module, metrics: dict[str, float], *, step: int) -> None:
         rank, _ = _distributed_rank_world(module)
         if rank == 0 and metrics and module.logger is not None:
@@ -360,18 +419,163 @@ class LDFEvaluationRunner:
         except Exception as error:
             warnings.warn(f"could not log validation videos: {error}", stacklevel=2)
 
+    @contextmanager
+    def _evaluation_context(self, module):
+        """Run generation with deterministic RNG and EMA, then restore training."""
+
+        validation = self.cfg.validation
+        evaluation_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_device = module.device if module.device.type == "cuda" else None
+        cuda_state = (
+            torch.cuda.get_rng_state(cuda_device) if cuda_device is not None else None
+        )
+        model_training = bool(module.model.training)
+        vae_training = bool(module.vae.training)
+        try:
+            random.seed(evaluation_seed)
+            np.random.seed(evaluation_seed % (2**32))
+            torch.random.default_generator.manual_seed(evaluation_seed)
+            if cuda_device is not None:
+                torch.cuda.manual_seed(evaluation_seed)
+            module.model.eval()
+            module.vae.eval()
+            with module.use_ema_parameters():
+                yield
+        finally:
+            module.model.train(model_training)
+            module.vae.train(vae_training)
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state(cuda_state, cuda_device)
+
+    def _run_startup_yaw_videos(self, module, *, step: int, step_tag: str) -> None:
+        """Render only the fixed paired-yaw samples at fit startup."""
+
+        validation = self.cfg.validation
+        config = self._generation_config(validation)
+        dense = validation.dense_xz
+        yaw_degrees = self._yaw_video_config(dense)
+        probe = str(dense.probe)
+        samples, _ = self._selected_sample_shard(
+            module,
+            dataset=self._probe_dataset(probe),
+            limit=0,
+        )
+        maximum_frames = int(self.cfg.data.max_frames)
+        base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
+
+        for mode in config["modes"]:
+            local_videos: list[str] = []
+            for _, sample in samples:
+                frames = _frame_count(sample, maximum_frames)
+                seed = _stable_seed(
+                    base_seed,
+                    sample["dataset"],
+                    sample["name"],
+                    0,
+                )
+                generated = generate_evaluation_sequence(
+                    module,
+                    sample,
+                    mode=mode,
+                    seed=seed,
+                    frame_count=frames,
+                    dense_xz=True,
+                    rolling_window_tokens=config["rolling_window_tokens"],
+                    max_horizon_token=config["max_horizon_token"],
+                    num_denoise_steps=config["num_denoise_steps"],
+                    initial_noise_yaw_degrees=0.0,
+                )
+                dirs = evaluation_artifact_dirs(
+                    self.cfg.save_dir,
+                    str(sample["dataset"]),
+                    f"dense_xz_{mode}",
+                    step_tag,
+                )
+                dirs["video"].mkdir(parents=True, exist_ok=True)
+                dirs["composite"].mkdir(parents=True, exist_ok=True)
+                try:
+                    local_videos.extend(
+                        self._render_yaw_videos(
+                            module,
+                            sample=sample,
+                            base_generated=generated,
+                            base_target_root=sample["root_motion"][:frames],
+                            base_target_body=sample["body_motion"][:frames],
+                            frame_count=frames,
+                            seed=seed,
+                            mode=mode,
+                            config=config,
+                            yaw_degrees=yaw_degrees,
+                            video_dir=dirs["video"],
+                            composite_dir=dirs["composite"],
+                        )
+                    )
+                except Exception as error:
+                    warnings.warn(
+                        "startup paired-yaw video rendering failed for "
+                        f"{sample['name']}: {error}",
+                        stacklevel=2,
+                    )
+            gathered_videos = _all_gather_objects(local_videos)
+            videos = [
+                Path(path)
+                for rank_paths in gathered_videos
+                for path in rank_paths
+            ]
+            videos.sort(key=str)
+            self._log_videos(
+                module,
+                paths=videos,
+                key=f"eval/dense_xz/{mode}/startup_videos",
+                step=step,
+            )
+            _distributed_barrier()
+
+    def run_at_start(self, module) -> bool:
+        """Consume the optional pre-fit validation with fixed yaw videos."""
+
+        if self._startup_evaluation_completed or not self.enabled:
+            return False
+        validation = self.cfg.validation
+        generation = validation.generation
+        due = (
+            bool(self.cfg.get("train", False))
+            and bool(generation.get("run_at_start", False))
+            and bool(generation.get("render", True))
+            and bool(validation.dense_xz.get("enabled", False))
+        )
+        if not due:
+            self._startup_evaluation_completed = True
+            return False
+        step = int(module.global_step)
+        _distributed_barrier()
+        with self._evaluation_context(module):
+            self._run_startup_yaw_videos(
+                module,
+                step=step,
+                step_tag="fit_start",
+            )
+        self._startup_evaluation_completed = True
+        _distributed_barrier()
+        return True
+
     def _run_dense_xz(self, module, *, step: int, step_tag: str) -> None:
         validation = self.cfg.validation
         config = self._generation_config(validation)
         dense = validation.dense_xz
         probe = str(dense.probe)
-        samples, sample_count = self._selected_sample_shard(
+        samples, _ = self._selected_sample_shard(
             module,
             dataset=self._probe_dataset(probe),
             limit=0,
         )
-        segment_frames = int(dense.get("segment_frames", 20))
-        video_samples = int(dense.get("video_samples", sample_count))
+        video_yaw_degrees = self._yaw_video_config(dense)
         maximum_frames = int(self.cfg.data.max_frames)
         base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
         rank, _ = _distributed_rank_world(module)
@@ -379,7 +583,7 @@ class LDFEvaluationRunner:
         for mode in config["modes"]:
             local_records: list[dict[str, Any]] = []
             local_videos: list[str] = []
-            for sample_index, sample in samples:
+            for _, sample in samples:
                 frames = _frame_count(sample, maximum_frames)
                 target_root = sample["root_motion"][:frames]
                 target_body = sample["body_motion"][:frames]
@@ -400,11 +604,13 @@ class LDFEvaluationRunner:
                         rolling_window_tokens=config["rolling_window_tokens"],
                         max_horizon_token=config["max_horizon_token"],
                         num_denoise_steps=config["num_denoise_steps"],
+                        initial_noise_yaw_degrees=(
+                            0.0 if config["render"] and run_index == 0 else None
+                        ),
                     )
                     record = compute_dense_xz_metrics(
                         generated.root_motion,
                         target_root,
-                        segment_frames=segment_frames,
                     )
                     record["foot_skating_ratio"] = compute_foot_skating_ratio(
                         generated.root_motion,
@@ -415,6 +621,7 @@ class LDFEvaluationRunner:
                         predicted_root=generated.root_motion[None],
                         target_root=target_root.to(generated.root_motion)[None],
                         predicted_body=generated.body_motion[None],
+                        target_body=target_body.to(generated.body_motion)[None],
                         frame_mask=torch.ones(
                             1,
                             frames,
@@ -451,11 +658,6 @@ class LDFEvaluationRunner:
                     if config["num_runs"] > 1:
                         sample_id = f"{sample_id}_run{run_index}"
                     probe = f"dense_xz_{mode}"
-                    should_render = bool(
-                        config["render"]
-                        and sample_index < video_samples
-                        and run_index == 0
-                    )
                     dirs = save_dense_xz_sample(
                         save_dir=self.cfg.save_dir,
                         dataset=str(sample["dataset"]),
@@ -475,25 +677,28 @@ class LDFEvaluationRunner:
                         render=False,
                         fps=float(module.model.fps),
                     )
-                    if should_render:
+                    if config["render"] and run_index == 0:
                         try:
-                            render_comparison_video(
-                                target_root=target_root,
-                                target_body=target_body,
-                                predicted_root=generated.root_motion,
-                                predicted_body=generated.body_motion,
-                                predicted_video_path=dirs["video"] / f"{sample_id}.mp4",
-                                composite_path=dirs["composite"] / f"{sample_id}.mp4",
-                                caption=generated.prompt.caption,
-                                fps=float(module.model.fps),
-                            )
-                            local_videos.append(
-                                str(dirs["composite"] / f"{sample_id}.mp4")
+                            local_videos.extend(
+                                self._render_yaw_videos(
+                                    module,
+                                    sample=sample,
+                                    base_generated=generated,
+                                    base_target_root=target_root,
+                                    base_target_body=target_body,
+                                    frame_count=frames,
+                                    seed=seed,
+                                    mode=mode,
+                                    config=config,
+                                    yaw_degrees=video_yaw_degrees,
+                                    video_dir=dirs["video"],
+                                    composite_dir=dirs["composite"],
+                                )
                             )
                         except Exception as error:
                             warnings.warn(
-                                f"dense XZ artifacts saved but video rendering failed for "
-                                f"{sample_id}: {error}",
+                                "dense XZ artifacts saved but paired yaw video rendering "
+                                f"failed for {sample_id}: {error}",
                                 stacklevel=2,
                             )
 
@@ -533,12 +738,16 @@ class LDFEvaluationRunner:
                         f"[dense-xz][{mode}][{dataset}][{step_tag}] "
                         f"ADE={summary.get('ade_mean', float('nan')):.4f} "
                         f"FDE={summary.get('fde_mean', float('nan')):.4f} "
-                        f"root-GT-heading="
-                        f"{summary.get('root_gt_heading_angle_deg_mean', float('nan')):.2f}deg "
-                        f"root-GT-trajectory-heading="
-                        f"{summary.get('root_gt_trajectory_heading_angle_deg_mean', float('nan')):.2f}deg "
+                        f"root-GT-root="
+                        f"{summary.get('root_gt_root_heading_angle_deg_mean', float('nan')):.2f}deg "
+                        f"body-GT-body="
+                        f"{summary.get('body_gt_body_heading_angle_deg_mean', float('nan')):.2f}deg "
+                        f"feet-GT-feet="
+                        f"{summary.get('feet_gt_feet_heading_angle_deg_mean', float('nan')):.2f}deg "
                         f"root-body-heading="
-                        f"{summary.get('root_body_heading_angle_deg_mean', float('nan')):.2f}deg"
+                        f"{summary.get('root_body_heading_angle_deg_mean', float('nan')):.2f}deg "
+                        f"root-feet-heading="
+                        f"{summary.get('root_feet_heading_angle_deg_mean', float('nan')):.2f}deg"
                     )
                 videos = [
                     Path(path)
@@ -664,37 +873,11 @@ class LDFEvaluationRunner:
         step_tag = f"step_{step:06d}"
         _distributed_barrier()
 
-        python_state = random.getstate()
-        numpy_state = np.random.get_state()
-        torch_state = torch.random.get_rng_state()
-        cuda_device = module.device if module.device.type == "cuda" else None
-        cuda_state = (
-            torch.cuda.get_rng_state(cuda_device) if cuda_device is not None else None
-        )
-        model_training = bool(module.model.training)
-        vae_training = bool(module.vae.training)
-        try:
-            evaluation_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
-            random.seed(evaluation_seed)
-            np.random.seed(evaluation_seed % (2**32))
-            torch.random.default_generator.manual_seed(evaluation_seed)
-            if cuda_device is not None:
-                torch.cuda.manual_seed(evaluation_seed)
-            module.model.eval()
-            module.vae.eval()
-            with module.use_ema_parameters():
-                if generation_due:
-                    self._run_dense_xz(module, step=step, step_tag=step_tag)
-                if t2m_due:
-                    self._run_t2m(module, step=step, step_tag=step_tag)
-        finally:
-            module.model.train(model_training)
-            module.vae.train(vae_training)
-            random.setstate(python_state)
-            np.random.set_state(numpy_state)
-            torch.random.set_rng_state(torch_state)
-            if cuda_state is not None:
-                torch.cuda.set_rng_state(cuda_state, cuda_device)
+        with self._evaluation_context(module):
+            if generation_due:
+                self._run_dense_xz(module, step=step, step_tag=step_tag)
+            if t2m_due:
+                self._run_t2m(module, step=step, step_tag=step_tag)
 
 
 __all__ = ["LDFEvaluationRunner"]

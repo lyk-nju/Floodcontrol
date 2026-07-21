@@ -23,10 +23,10 @@ validation:
 
   generation:
     enabled: true
+    run_at_start: true
     steps: 5000
     modes: [stream]
     num_runs: 3
-    video_samples: 4
     render: true
     num_denoise_steps: 10
     max_horizon_token: 10
@@ -36,11 +36,10 @@ validation:
   dense_xz:
     enabled: true
     probe: dense_xz
-    video_samples: ${validation.generation.video_samples}
-    segment_frames: 20
+    video_yaw_degrees: [0, 90, 180]
 
   t2m:
-    enabled: true
+    enabled: false
     steps: 10000
     cfg_mode: nocfg
 

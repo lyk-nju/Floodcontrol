@@ -34,6 +34,7 @@ import numpy as np
 from datasets.babel import BABELDataset
 from datasets.humanml3d import HumanML3DDataset
 from tools.build_motion_artifact import atomic_write_text
+from tools.compute_ldf_root_stats import root_statistics_recipe
 from utils.initialize import load_config
 from utils.training.ldf.text import TextEmbeddingLookup
 
@@ -248,13 +249,7 @@ def _validate_root_statistics(path: Path, cfg) -> dict[str, object]:
         if "metadata" not in values:
             raise ValueError("root statistics have no frozen sampling metadata")
         metadata = json.loads(str(np.asarray(values["metadata"]).item()))
-    expected = {
-        "window_tokens": int(cfg.root_statistics.window_tokens),
-        "generation_tokens": int(cfg.root_statistics.generation_tokens),
-        "anchor_sampling": str(cfg.root_statistics.anchor_sampling),
-        "random_yaw": bool(cfg.root_statistics.random_yaw),
-        "windows_per_sample": int(cfg.root_statistics.windows_per_sample),
-    }
+    expected = root_statistics_recipe(cfg)
     if metadata != expected:
         raise ValueError(
             f"root statistics contract mismatch: saved={metadata}, expected={expected}"
@@ -407,6 +402,7 @@ def _prepare_statistics(args, paths: AssetPaths, report: PreparationReport) -> N
         )
 
     cfg = load_config(args.ldf_config, _overrides(paths))
+    root_recipe = root_statistics_recipe(cfg)
     pending = _pending_path(paths.root_stats, ".npz")
     root_command = [
         sys.executable,
@@ -423,14 +419,16 @@ def _prepare_statistics(args, paths: AssetPaths, report: PreparationReport) -> N
         "--min-frames",
         str(cfg.data.min_frames),
         "--max-frames",
-        str(int(cfg.root_statistics.window_tokens) * 4),
+        str(int(root_recipe["window_tokens"]) * 4),
         "--windows-per-sample",
-        str(cfg.root_statistics.windows_per_sample),
+        str(root_recipe["windows_per_sample"]),
         "--active-tokens",
-        str(cfg.root_statistics.generation_tokens),
+        str(root_recipe["generation_tokens"]),
         "--seed",
         str(args.root_seed),
     ]
+    if not bool(root_recipe["random_yaw"]):
+        root_command.append("--no-random-yaw")
     _stage(
         report,
         "ldf_root_statistics",

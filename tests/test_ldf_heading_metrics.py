@@ -52,23 +52,45 @@ def test_heading_metrics_measure_root_target_and_rendered_body_angles():
             (0.0, -1.0),
         ]
     )
+    predicted_body = _set_feet_facing(
+        predicted_body,
+        [(0.0, 1.0), (0.0, 1.0), (0.0, -1.0)],
+    )
+    target_body = _body_facing([(0.0, 1.0)] * 3)
+    target_body = _set_feet_facing(target_body, [(0.0, 1.0)] * 3)
     metrics = compute_heading_metrics(
         predicted_root=predicted_root,
         target_root=target_root,
         predicted_body=predicted_body,
+        target_body=target_body,
         frame_mask=torch.ones(1, 3, dtype=torch.bool),
     )
 
     assert torch.allclose(
-        metrics["root_gt_heading_angle_deg"], torch.tensor(90.0), atol=1e-5
+        metrics["root_gt_root_heading_angle_deg"], torch.tensor(90.0), atol=1e-5
     )
     assert torch.allclose(
-        metrics["root_gt_trajectory_heading_angle_deg"],
+        metrics["root_trajectory_heading_angle_deg"],
         torch.tensor(0.0),
         atol=1e-5,
     )
     assert torch.allclose(
         metrics["root_body_heading_angle_deg"], torch.tensor(30.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["root_feet_heading_angle_deg"], torch.tensor(30.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["body_gt_body_heading_angle_deg"], torch.tensor(60.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["feet_gt_feet_heading_angle_deg"], torch.tensor(60.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["gt_root_body_heading_angle_deg"], torch.tensor(0.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["gt_root_feet_heading_angle_deg"], torch.tensor(0.0), atol=1e-5
     )
 
 
@@ -77,18 +99,20 @@ def test_heading_metrics_respect_frame_mask_and_ignore_degenerate_body_axis():
     target_root = _root([0.0, 0.0, 0.0])
     predicted_body = _body_facing([(0.0, 1.0), (0.0, 1.0), (0.0, 1.0)])
     predicted_body[:, 1, :63] = 0.0
+    target_body = _body_facing([(0.0, 1.0)] * 3)
     metrics = compute_heading_metrics(
         predicted_root=predicted_root,
         target_root=target_root,
         predicted_body=predicted_body,
+        target_body=target_body,
         frame_mask=torch.tensor([[True, True, False]]),
     )
 
     assert torch.allclose(
-        metrics["root_gt_heading_angle_deg"], torch.tensor(45.0), atol=1e-5
+        metrics["root_gt_root_heading_angle_deg"], torch.tensor(45.0), atol=1e-5
     )
     assert torch.allclose(
-        metrics["root_gt_trajectory_heading_angle_deg"],
+        metrics["root_trajectory_heading_angle_deg"],
         torch.tensor(0.0),
         atol=1e-5,
     )
@@ -102,10 +126,12 @@ def test_trajectory_heading_uses_backward_gt_xz_and_filters_stationary_frames():
     target_root = _root([0.0, 0.0, 0.0, 0.0])
     target_root[0, :, 0] = torch.tensor([0.0, 0.1, 0.1, 0.2])
     predicted_body = _body_facing([(0.0, 1.0)] * 4)
+    target_body = _body_facing([(0.0, 1.0)] * 4)
     metrics = compute_heading_metrics(
         predicted_root=predicted_root,
         target_root=target_root,
         predicted_body=predicted_body,
+        target_body=target_body,
         frame_mask=torch.ones(1, 4, dtype=torch.bool),
         frame_valid_mask=torch.ones(1, 4, dtype=torch.bool),
         fps=20.0,
@@ -114,13 +140,13 @@ def test_trajectory_heading_uses_backward_gt_xz_and_filters_stationary_frames():
     # Frames 1 and 3 move toward +X while frame 0 has no predecessor and frame
     # 2 is stationary. A +Z root heading is therefore 90 degrees away.
     assert torch.allclose(
-        metrics["root_gt_trajectory_heading_angle_deg"],
+        metrics["root_trajectory_heading_angle_deg"],
         torch.tensor(90.0),
         atol=1e-5,
     )
 
 
-def test_feet_root_reverse_ratio_uses_ankle_to_toe_geometry():
+def test_root_feet_reverse_ratio_uses_ankle_to_toe_geometry():
     root = _root([0.0, 0.0])
     body = _body_facing([(0.0, 1.0), (0.0, 1.0)])
     body = _set_feet_facing(body, [(0.0, 1.0), (0.0, -1.0)])
@@ -129,9 +155,42 @@ def test_feet_root_reverse_ratio_uses_ankle_to_toe_geometry():
         predicted_root=root,
         target_root=root,
         predicted_body=body,
+        target_body=body,
         frame_mask=torch.ones(1, 2, dtype=torch.bool),
     )
 
     assert torch.allclose(
-        metrics["feet_root_reverse_ratio"], torch.tensor(0.5), atol=1e-6
+        metrics["root_feet_reverse_ratio"], torch.tensor(0.5), atol=1e-6
+    )
+
+
+def test_heading_metrics_compare_generated_body_and_feet_to_gt_geometry():
+    root = _root([0.0])
+    predicted_body = _body_facing([(1.0, 0.0)])
+    predicted_body = _set_feet_facing(predicted_body, [(0.0, -1.0)])
+    target_body = _body_facing([(0.0, 1.0)])
+    target_body = _set_feet_facing(target_body, [(0.0, 1.0)])
+
+    metrics = compute_heading_metrics(
+        predicted_root=root,
+        target_root=root,
+        predicted_body=predicted_body,
+        target_body=target_body,
+        frame_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+
+    assert torch.allclose(
+        metrics["body_gt_body_heading_angle_deg"], torch.tensor(90.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["feet_gt_feet_heading_angle_deg"], torch.tensor(180.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["root_body_heading_angle_deg"], torch.tensor(90.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["root_feet_heading_angle_deg"], torch.tensor(180.0), atol=1e-5
+    )
+    assert torch.allclose(
+        metrics["root_feet_reverse_ratio"], torch.tensor(1.0), atol=1e-6
     )

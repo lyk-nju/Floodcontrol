@@ -17,6 +17,48 @@ from utils.token_frame import FRAMES_PER_TOKEN
 from utils.training.ldf.data import create_dataset
 
 
+def root_statistics_recipe(cfg) -> dict[str, object]:
+    """Resolve the offline root-statistics recipe from the current LDF config.
+
+    ``root_statistics`` remains an optional tool-specific override.  When the
+    formal training config omits it, the recipe follows the same window,
+    generation band, and yaw policy already declared by the data/training
+    contract instead of requiring duplicate configuration.
+    """
+
+    statistics = cfg.get("root_statistics") or {}
+    training = cfg.get("training") or {}
+    window = training.get("window") or {}
+    window_tokens = int(
+        statistics.get(
+            "window_tokens",
+            window.get("max_tokens", int(cfg.data.max_frames) // FRAMES_PER_TOKEN),
+        )
+    )
+    generation_tokens = int(
+        statistics.get(
+            "generation_tokens",
+            window.get("generation_tokens", cfg.model.params.chunk_size),
+        )
+    )
+    recipe = {
+        "window_tokens": window_tokens,
+        "generation_tokens": generation_tokens,
+        "anchor_sampling": str(
+            statistics.get("anchor_sampling", "uniform_legal_history")
+        ),
+        "random_yaw": bool(
+            statistics.get("random_yaw", cfg.data.get("random_yaw", True))
+        ),
+        "windows_per_sample": int(statistics.get("windows_per_sample", 1)),
+    }
+    if recipe["anchor_sampling"] != "uniform_legal_history":
+        raise ValueError(
+            "root statistics only support uniform_legal_history anchors"
+        )
+    return recipe
+
+
 class RootAccumulator:
     def __init__(self):
         self.total = torch.zeros(ROOT_DIM, dtype=torch.float64)
@@ -132,33 +174,27 @@ def main() -> None:
     if args.config:
         cfg = load_config(args.config)
         dataset = create_dataset(cfg, "train")
-        statistics = cfg.get("root_statistics")
-        if statistics is None:
-            raise ValueError("root_statistics configuration is required")
-        if str(statistics.anchor_sampling) != "uniform_legal_history":
-            raise ValueError(
-                "root statistics only support uniform_legal_history anchors"
-            )
+        statistics = root_statistics_recipe(cfg)
         min_frames = int(
             cfg.data.min_frames if args.min_frames is None else args.min_frames
         )
         max_frames = int(
-            int(statistics.window_tokens) * FRAMES_PER_TOKEN
+            int(statistics["window_tokens"]) * FRAMES_PER_TOKEN
             if args.max_frames is None
             else args.max_frames
         )
         active_tokens = int(
-            statistics.generation_tokens
+            statistics["generation_tokens"]
             if args.active_tokens is None
             else args.active_tokens
         )
         windows_per_sample = int(
-            statistics.windows_per_sample
+            statistics["windows_per_sample"]
             if args.windows_per_sample is None
             else args.windows_per_sample
         )
         random_yaw = bool(
-            statistics.random_yaw
+            statistics["random_yaw"]
             if args.random_yaw is None
             else args.random_yaw
         )

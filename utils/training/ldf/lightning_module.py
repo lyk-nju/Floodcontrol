@@ -559,6 +559,7 @@ class LDFLightningModule(BasicLightningModule):
             self._last_heading_metrics = self._observe_heading(
                 result,
                 token_valid_mask=token_valid,
+                target_body=batch["body_motion"],
             )
         weights = self.cfg.get("loss") or {}
         if result.is_rollout:
@@ -620,6 +621,7 @@ class LDFLightningModule(BasicLightningModule):
         result,
         *,
         token_valid_mask: torch.Tensor,
+        target_body: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Recover the current clean endpoint and measure physical headings."""
 
@@ -653,6 +655,7 @@ class LDFLightningModule(BasicLightningModule):
             predicted_root=predicted_root,
             target_root=target_root,
             predicted_body=predicted_body,
+            target_body=target_body,
             frame_mask=metric_frames,
             frame_valid_mask=frame_valid,
             fps=float(self.model.fps),

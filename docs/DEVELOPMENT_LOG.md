@@ -5446,3 +5446,187 @@
 
 - 尚未在真实GPU checkpoint上比较四个persistent-cold phase的validation曲线；本轮只证明接口、指标和训练/runtime数值合同成立。
 - `feet_root_reverse_ratio`不作为checkpoint选择指标；需结合动作类别和固定坏例判断，不能把合法倒走误判为模型失败。
+
+## 2026-07-21 · 远端Self-Forcing课程配置对齐
+
+改动类型：正式远端训练配置修复
+
+实际改动内容：
+
+- 保留远端`configs/ldf.yaml`当前`K=1→2→5`绝对步数课程。
+- 从`teacher_replay`删除课程中不存在的`K=3`死键，使replay键严格对应实际`K>1={2,5}`。
+
+改动理由：
+
+- `teacher_replay`只定义“当前处于某个K阶段时退回K=1”的概率；不存在K=3阶段时，`3: 0.1`永远不可达，并会触发训练入口的配置合同错误。
+- 保留严格校验可以尽早发现课程与replay配置漂移，不应通过放宽校验隐藏死配置。
+
+验证：
+
+- 使用最终解析后的远端配置运行`validate_self_forcing_config()`通过。
+
+涉及文件：
+
+- `configs/ldf.yaml`
+- `docs/DEVELOPMENT_LOG.md`
+
+## 2026-07-22 · 固定样本Paired-Yaw训练期视频
+
+改动类型：LDF内联生成评测 / 可视化配置 / yaw等变性诊断
+
+实际改动内容：
+
+- 删除按probe顺序选择前`video_samples`条样本的视频策略，固定只为HumanML3D `000021`和`001168`生成训练期视频。
+- 每个固定样本只使用`run_index=0`，分别渲染原始朝向、全局`+90°`和`+180°`三组dense-XZ stream结果；其他probe样本和其余run继续参与数值指标，但不产出视频。
+- 三组旋转同步作用于physical root5、body265和dense world-XZ route；latent source逐元素共享，root source在physical root5空间执行相同yaw变换后重新归一化，避免把三个无关随机样本误作yaw等变性对照。
+- 视频文件使用`<sample>_yaw_000deg.mp4`、`<sample>_yaw_090deg.mp4`和`<sample>_yaw_180deg.mp4`命名，并继续写入既有FloodNet风格`video/composite`目录及W&B视频面板。
+- 配置改为`validation.dense_xz.video_sample_ids`和`video_yaw_degrees`；同步更新训练配置与评测设计文档。
+
+改动理由：
+
+- 当前需要长期观察的是固定坏例的轨迹跟踪、身体朝向和全局yaw等变性，按列表顺序渲染其他样本会增加评测与存储成本，却不利于跨checkpoint纵向比较。
+- 旋转目标而不旋转root source会混入初始随机状态差异；paired-noise合同使三组视频主要反映模型对全局yaw变换的响应。
+
+验证：
+
+- `tests/test_ldf_evaluation.py -q`：`16 passed`。
+- 正式`configs/ldf.yaml`解析检查通过：固定sample ID、三种yaw及旧`video_samples`删除均符合预期。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+- 全仓测试：`317 passed, 6 skipped, 4 failed`。四项失败均来自本轮前已有的工作区配置/测试漂移：两项冻结recipe仍期待`K=1→2→3→5`而当前远端正式配置为用户已选定的`K=1→2→5`；两项训练资产测试仍读取已从训练配置移除的`root_statistics`块。本轮新增视频配置断言在失败点前已经通过。
+
+涉及文件：
+
+- `utils/training/ldf/evaluation/generation.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `configs/ldf.yaml`
+- `configs/ldf_base.yaml`
+- `tests/test_ldf_evaluation.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 尚未等待真实训练在下一个5,000-step评测点渲染六个paired-yaw视频；本轮验证覆盖配置、数据旋转、source配对、生成接口和渲染调度。
+- 当前正式配置仅启用`stream`视频；rolling模式追加新frontier noise时若要做严格逐source yaw配对，需要另行冻结rolling birth-noise变换合同。
+
+## 2026-07-22 · Heading优先评测与训练启动视频
+
+改动类型：LDF训练期评测 / heading诊断 / 配置与离线工具合同清理
+
+实际改动内容：
+
+- 将dense-XZ数值指标收缩为`ADE/FDE/max_error`三项核心控制误差；删除重复表达同一XZ偏差的MSE、阈值失败率、segment/prefix MSE、path arclength、Chamfer和trajectory jitter聚合。
+- 扩展physical heading诊断，同时记录预测`root/body/feet`内部关系、GT `root/body/feet`内部关系，以及`root↔GT root`、`body↔GT body`、`feet↔GT feet`对应角误差；保留root相对GT轨迹切线和root/feet反向比例。
+- 训练期heading观测现在显式接收GT body265，不再只能比较预测root与预测body；dense-XZ生成评测将同一组heading指标写入sample JSON、summary、控制台和W&B scalar。
+- 正式配置默认关闭高成本T2M/FID，但保留完整validation split的显式启用能力；dense-XZ评测继续启用。
+- 新增fit-start生成钩子：checkpoint、EMA和sanity validation恢复完成后，在首个optimizer step前只为`000021`、`001168`生成0°/90°/180°六个paired-yaw视频。启动输出使用`fit_start_step_<global_step>`目录标签，适用于从头训练和resume，并在完成后恢复模型模式与Python/NumPy/Torch/CUDA RNG状态。
+- 启动评测和周期评测复用同一个EMA/RNG作用域；周期评测仍按完整probe和全部run计算数值指标，固定视频仍只取run 0。
+- 删除训练入口对已移除`segment_frames/video_samples`配置的校验，改为校验固定sample ID和yaw列表。root-statistics生成/资产工具在正式配置没有`root_statistics`块时，从现有window/chunk/yaw合同推导离线recipe，消除旧配置残留。
+- 将迁移测试对齐当前远端`K=1→2→5`resume recipe及当前heading/body loss配置；未回滚用户正在使用的resume路径、validation cadence或batch设置。
+
+改动理由：
+
+- 当前主要故障是人物root、身体几何和脚朝向不一致，过多同质XZ标量与完整FID不能直接解释该问题；对应方向之间的角度更适合跨checkpoint定位root正确但body/feet反向的mode。
+- 固定坏例的三个全局yaw视图比随机sample视频更适合在训练刚开始及后续checkpoint间检查heading等变性、cold-start反向和轨迹跟踪。
+- T2M/FID生成耗时高且当前不是主要训练反馈，因此改为按需启用，而不是删除评测能力。
+
+验证：
+
+- heading、generation evaluation和LDF training定向测试：`51 passed, 1 skipped`。
+- 配置迁移与训练资产流水线测试：`49 passed`。
+- 全仓测试：`323 passed, 6 skipped`。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `metrics/trajectory.py`
+- `utils/training/ldf/metrics.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/evaluation/{generation,runner}.py`
+- `eval/ldf_training.py`
+- `train_ldf.py`
+- `tools/{compute_ldf_root_stats,prepare_training_assets}.py`
+- `configs/{ldf,ldf_base}.yaml`
+- `tests/{test_ldf_evaluation,test_ldf_heading_metrics,test_ldf_training,test_migration_guards}.py`
+- `docs/rearchitecture/{05_TRAINING_CONFIG,07_LDF_TRAINING_EVALUATION}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮未在真实GPU训练作业中实际渲染fit-start六个视频；接口、调度、paired-noise和渲染测试已覆盖，真实耗时与W&B展示需在下一次启动训练时确认。
+- heading角度是无符号二维诊断；合法倒走动作可能产生较大root/body或root/feet角，仍需结合caption、GT内部基线和固定视频解释，不能单独作为checkpoint淘汰标准。
+- T2M/FID代码仍保留且默认关闭；需要测无轨迹生成分布时显式开启，不应与dense-XZ控制指标混合解读。
+
+## 2026-07-22 · 启动评测生命周期简化
+
+改动类型：训练入口简化 / validation调度修正
+
+实际改动内容：
+
+- 撤销上一条“Heading优先评测与训练启动视频”中通过`on_train_start`触发启动视频的做法。
+- 参考FloodDiffusion，在`trainer.fit()`之前直接执行一次`trainer.validate()`；resume checkpoint显式传给这次validation，避免先用未恢复权重评测。
+- 启动validation的epoch-end复用现有评测callback，只额外生成六个固定paired-yaw视频并跳过同一轮周期性完整dense评测；后续validation恢复正常周期调度。
+- 将文本表覆盖检查移到`on_validation_start`，确保独立prefit validation也能在生成前fail-fast。
+- 启动artifact目录统一命名为`fit_start`，不把Lightning standalone validation未恢复的fit-loop global step误写入目录名。
+
+改动理由：
+
+- “首个step前跑一次validation”本质上属于训练入口顺序，不需要维护独立的train-start生命周期。
+- Lightning standalone validation会加载模型与EMA checkpoint，但不会恢复fit-loop global step；使用固定`fit_start`标签比伪造step编号更准确。
+
+验证：
+
+- callback、启动顺序与配置迁移定向测试：`63 passed, 1 skipped`。
+- 全仓测试：`323 passed, 6 skipped`。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `train_ldf.py`
+- `eval/ldf_training.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `tests/{test_ldf_evaluation,test_migration_guards}.py`
+- `docs/rearchitecture/{05_TRAINING_CONFIG,07_LDF_TRAINING_EVALUATION}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 尚未在真实DDP训练作业中测量prefit validation和六个视频的实际启动耗时。
+
+## 2026-07-22 · Dense-XZ Probe单一样本来源
+
+改动类型：评测配置简化 / 冗余筛选删除 / Lightning职责审计
+
+实际改动内容：
+
+- 删除`validation.dense_xz.video_sample_ids`，`data.test_probe_meta_paths.dense_xz`指向的TXT成为dense-XZ数值评测与视频评测的唯一sample来源。
+- 周期评测对probe中的每条sample运行全部`num_runs`数值评测，并只为run 0渲染0°/90°/180°三组paired-yaw视频；prefit validation同样遍历该probe，不再做第二次ID筛选。
+- 删除runner选择函数中仅为视频子集存在的`sample_ids`参数、missing-ID检查和跨rank视频ID聚合。
+- 删除训练入口对`video_sample_ids`的配置校验，只保留probe路径与yaw列表校验。
+- 审计`LDFLightningModule`：其中没有prefit/startup视频专用函数；`_should_observe_heading/_observe_heading/_log_heading_metrics`及`_last_heading_metrics`均由当前训练与validation heading诊断实际使用，因此未做误删。启动调度仍完全位于入口/callback/evaluation runner层。
+
+改动理由：
+
+- probe TXT与`video_sample_ids`同时存在会形成两个互相覆盖的样本合同；当目标就是只评测`000021/001168`时，直接维护两行TXT更清晰。
+- 移除重复筛选后，配置、DDP分片、数值summary和视频产出天然使用同一组样本，不会出现TXT包含样本但没有视频或video ID不在TXT中的分叉。
+
+验证：
+
+- evaluation callback与配置迁移定向测试：`63 passed, 1 skipped`。
+- 全仓测试：`323 passed, 6 skipped`。
+- 相关Python文件`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `configs/{ldf,ldf_base}.yaml`
+- `train_ldf.py`
+- `utils/training/ldf/evaluation/runner.py`
+- `tests/{test_ldf_evaluation,test_migration_guards}.py`
+- `docs/rearchitecture/{05_TRAINING_CONFIG,07_LDF_TRAINING_EVALUATION}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 当前本机`/data1/.../HumanML3D_motion/test_min.txt`仍包含8个sample ID；在它被改为只含`000021`与`001168`前，代码会按唯一来源原则为8条sample都生成三种yaw视频。
