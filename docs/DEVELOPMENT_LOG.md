@@ -4870,3 +4870,287 @@
 后续事项：
 
 - `tools/compute_ldf_root_stats.py`和资产准备工具仍可用`root_statistics`块复现统计采样；本轮不改变统计生成算法。
+
+## 2026-07-21 · Step 130k Heading Loss完整对照评测
+
+改动类型：LDF诊断 / checkpoint评测 / debug loader维护
+
+实际改动内容：
+
+- 使用EMA权重，在相同`ldf_s5.yaml`、固定noise和当前统一文本表下，对普通`step_130000.ckpt`与新增heading监督的`step_130000_headingloss.ckpt`执行成对评测。
+- 完成000021/001168完整dense-XZ三seed Root通道消融、000021完整90度旋转三seed测评、1,450个validation样本的六beta Body生命周期FID、GT-root persistent Body FID及四分支Root通道FID。
+- 将debug checkpoint loader改为复用正式`LDFLightningModule.on_load_checkpoint()`，使诊断脚本同时支持旧`ldf_training_contract`和新`ldf_resume_contract`，不再维护第二套已过期的资产迁移判断。
+- 新增本地汇总报告`debug/results/step130000_headingloss_comparison.md`；`debug/`按既有约定不进入Git。
+
+改动理由：
+
+- 单看训练loss或单个生成视频不能判断heading辅助目标是否真正改善Root、是否影响Body，以及改善能否转化为FID；需要固定协议的干预实验分离这些因素。
+- 新checkpoint采用收口后的resume合同，旧debug loader只识别历史字段，会在模型推理前错误拒绝合法checkpoint。
+
+验证：
+
+- 两个单样本、三组90度旋转、六beta全validation、GT-root全validation和Root通道全validation任务均完成并写出JSON结果。
+- 全集baseline Root heading MAE由`89.72°`降到`85.49°`，但FID由`2.6908`变为`2.7978`；GT-root Body FID保持在`0.52`附近。
+- `py_compile debug/compare_cfg_modes.py`与`git diff --check`通过。
+
+涉及文件：
+
+- `debug/compare_cfg_modes.py`（本地ignored诊断代码）
+- `debug/results/step130000_headingloss_comparison.md`（本地ignored评测报告）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- heading辅助目标已有正向信号但10k步尚未改善整体FID；后续应以固定全集heading MAE、nocfg FID及separated三seed稳定性共同决定是否延长微调或调整权重。
+
+## 2026-07-21 · Step 160k Heading Loss延长训练复评
+
+改动类型：LDF checkpoint评测 / 训练趋势分析
+
+实际改动内容：
+
+- 对`step_160000.ckpt`完整复跑与130k对照相同的评测协议：000021/001168 joint dense-XZ三seed消融、000021 separated完整90度旋转三seed、六beta全validation Body生命周期FID、GT-root persistent Body FID和四分支Root通道全validation FID。
+- 所有全量指标使用EMA、固定seed 4321、1,450个validation样本和最多200帧；单样本与旋转测试沿用相同sample、noise、route、CFG及完整帧长。
+- 扩展本地ignored汇总报告，增加original 130k、heading-loss 130k和heading-loss 160k三点趋势表。
+
+改动理由：
+
+- 130k已显示heading监督有正向信号但未改善整体FID；继续训练30k后需要判断目标指标是否持续改善、是否出现Body退化，以及separated CFG稳定性是否同步改善。
+
+验证：
+
+- 所有单样本、三seed和全validation任务均成功完成；checkpoint EMA/state/statistics严格加载，无OOM、NaN或合同错误。
+- 全集Root heading MAE从原130k的`89.72°`、heading 130k的`85.49°`继续降到`84.00°`；正常FID为`2.7900`，相对heading 130k的`2.7978`基本持平，仍差于原130k的`2.6908`。
+- joint hard-case Root/GT继续改善：000021为`75.60°→61.04°→52.39°`，001168为`126.20°→59.78°→36.21°`；separated旋转等变误差则从heading 130k的`73.01°`回升到`89.24°`。
+- GT-root Body控制与六beta生命周期保持健康；`git diff --check`通过。
+
+涉及文件：
+
+- `debug/results/`下step160000各项ignored JSON/视频产物
+- `debug/results/step130000_headingloss_comparison.md`（本地ignored汇总报告）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 160k适合作为joint dense-XZ Root能力更强的checkpoint，但不是aggregate FID或separated旋转稳定性最优点；继续训练前应分别处理separated CFG等变性和Root/Body分布质量，而非只延长同一heading-loss recipe。
+
+## 2026-07-21 · Root逐帧XZ朝向可视化
+
+改动类型：LDF heading诊断 / debug可视化
+
+实际改动内容：
+
+- 新增本地debug脚本`debug/plot_root_heading_xz.py`，直接读取任意NPZ中的root5数组，在world XZ平面为每一帧绘制显式root heading箭头。
+- 图中用时间颜色编码生成轨迹和逐帧箭头，可选叠加GT XZ轨迹，并标记序列起点、终点、root/path平均角度和root/GT-heading平均角度。
+- 对`step_160000.ckpt`、样本000021、separated CFG、seed 4321的完整90度旋转结果生成176帧朝向图`stream_rotated_plus90_root_heading_xz.png`。
+
+改动理由：
+
+- 视频中的人物朝向会同时受到Root Stage、Body latent和渲染几何影响；把root5逐帧箭头直接画在XZ轨迹上，可以隔离观察RootTransformer是否在轨迹已经准确时仍预测错误heading。
+
+验证：
+
+- 绘图脚本成功读取现有`stream_pair.npz`并生成376KB PNG；人工检查确认176个root点均有对应heading箭头，GT轨迹、起终点和时间颜色正常。
+- 该样本测得`root/path=55.3°`、`root/GT-heading=49.9°`，显示XZ轨迹贴合目标但root heading存在持续偏移。
+- `py_compile debug/plot_root_heading_xz.py`通过。
+
+涉及文件：
+
+- `debug/plot_root_heading_xz.py`（本地ignored诊断代码）
+- `debug/README.md`（本地ignored说明）
+- `debug/results/yaw_equivariance_000021_step160000_headingloss_full_separated_seed4321/stream_rotated_plus90_root_heading_xz.png`（本地ignored产物）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 当前图只诊断既有单次separated生成；后续可用相同脚本对joint、nocfg和不同checkpoint生成同协议对照图，不需要重新实现heading提取。
+
+## 2026-07-21 · Rendered Body逐帧XZ朝向可视化
+
+改动类型：LDF Root/Body heading诊断 / debug可视化
+
+实际改动内容：
+
+- 扩展`debug/plot_root_heading_xz.py`，允许从body265的髋部与肩部位置恢复实际渲染人物朝向，并在每一帧root XZ位置绘制人物朝向箭头。
+- 人物朝向模式额外报告body/path、body/root及body/GT-heading平均角度；不使用具有HumanML IK gauge语义的pelvis rotation通道。
+- 为000021、step160000、separated CFG、seed4321的完整90度旋转生成176帧人物朝向图`stream_rotated_plus90_body_heading_xz.png`。
+
+改动理由：
+
+- Root heading图只能说明显式root5的预测方向；需要独立可视化实际渲染身体朝向，才能判断错误主要来自RootTransformer，还是Body latent/decoder没有跟随Root条件。
+
+验证：
+
+- 生成391KB PNG并人工检查逐帧箭头、时间颜色、目标轨迹和起终点显示正常。
+- 完整序列测得`body/root=16.9°`、`body/path=70.3°`、`body/GT-heading=65.2°`；人物明显更接近生成Root而非路径或GT heading，支持“Body大体跟随错误Root”的判断。
+- `py_compile debug/plot_root_heading_xz.py`通过。
+
+涉及文件：
+
+- `debug/plot_root_heading_xz.py`（本地ignored诊断代码）
+- `debug/README.md`（本地ignored说明）
+- `debug/results/yaw_equivariance_000021_step160000_headingloss_full_separated_seed4321/stream_rotated_plus90_body_heading_xz.png`（本地ignored产物）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 若要量化Root是否是主要瓶颈，应在相同checkpoint/noise下继续对joint CFG生成同格式Root/Body成对图，避免将separated CFG的分支组合误差归因于主模型。
+
+## 2026-07-21 · 人物朝向诊断拆分为Torso与Feet
+
+改动类型：heading诊断修复 / 表征语义澄清 / debug可视化
+
+实际改动内容：
+
+- 修复`debug/heading_metrics.py`中髋部横轴符号：HumanML髋部与肩部现在统一使用right-minus-left，避免旧实现的left-minus-right hip与right-minus-left shoulder互相抵消。
+- 新增基于HumanML左右脚`ankle→toe`线段的`foot_geometry_heading()`，用于检测髋肩方向正常但双脚/步态整体反转的生成姿态。
+- 扩展逐帧XZ绘图支持root、torso和feet三种heading source；重新生成修正后的torso图，并新增完整176帧feet图。
+- 修正本地合成测试的HumanML左右髋索引，并增加ankle-to-toe方向测试。
+
+改动理由：
+
+- 用户从视频首帧观察到人物明显反向，而旧body图却显示与Root接近。审计发现旧图只表示髋肩torso proxy，不能代表脚与步态；同时本地debug helper还存在髋部符号错误。
+- 对同一生成张量直接检查显示，首帧双脚方向与Root相差`175.5°`，而对应GT仅差`2.3°`。因此视频观察是真实的Body内部朝向不一致，不能仅由root5或torso heading解释。
+
+验证：
+
+- `debug/test_heading_metrics.py`：5项测试全部通过。
+- `py_compile debug/heading_metrics.py debug/test_heading_metrics.py debug/plot_root_heading_xz.py`通过。
+- 修正后的完整生成序列为：torso/root=`15.5°`，feet/root=`139.6°`；GT样本feet/root首帧=`2.3°`、全序列均值=`8.3°`。
+- 新增`stream_rotated_plus90_feet_heading_xz.png`并人工确认逐帧脚方向箭头与视频中的反向步态一致。
+
+涉及文件：
+
+- `debug/heading_metrics.py`（本地ignored诊断代码）
+- `debug/test_heading_metrics.py`（本地ignored测试）
+- `debug/plot_root_heading_xz.py`（本地ignored诊断代码）
+- `debug/README.md`（本地ignored说明）
+- `debug/results/yaw_equivariance_000021_step160000_headingloss_full_separated_seed4321/stream_rotated_plus90_body_heading_xz.png`（本地ignored修正产物）
+- `debug/results/yaw_equivariance_000021_step160000_headingloss_full_separated_seed4321/stream_rotated_plus90_feet_heading_xz.png`（本地ignored新增产物）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 正式`utils/training/ldf/metrics.py`当前的`root_body_heading_angle_deg`实际只表示torso/root；应在决定训练loss前将其命名语义澄清，并考虑增加独立foot/root与foot/path观测指标。
+- 旧debug报告中由旧`body_geometry_heading()`产生的body相关数值需要视为历史诊断，不能与修正后的torso指标直接混用；正式Torch指标不受该本地髋符号bug影响。
+
+## 2026-07-21 · Root Experiment固定噪声旋转消融工具
+
+改动类型：LDF Root条件消融 / 完整stream评测工具 / debug测试
+
+实际改动内容：
+
+- 新增本地`debug/root_experiment.py`，将Root消融正式命名为`root experiment`，默认执行样本000021/001168、全局旋转0/45/90/180度、dense XZ与dense XZ+GT heading两种条件、seed 4321/4322/4323，共48次完整样本stream生成。
+- 两种条件使用同一正式`InferenceSession`、Dynamic Future、persistent noisy-state、commit/rebase和VAE stream decode；`xz_heading`只通过逐帧`RootObservation`额外提供`[cos(yaw), sin(yaw)]`，明确不提供root height。
+- 相同sample/rotation/seed下，两种条件严格复用相同root/latent初始噪声；旋转实验同步旋转目标root/body和normalized root source，latent source保持一致。
+- 每次run输出`feature.npz`、完整motion视频、root/torso/feet三张逐帧XZ朝向图和分层metrics；顶层写manifest、48-run明细及每组三seed的mean/std/min/max汇总，并支持`--resume-existing`断点续跑和`--no-render`快速审计。
+- 新增`debug/test_root_experiment.py`，验证heading observation不暴露XZ/Y、180度反向统计以及稳定的旋转目录命名；更新debug README说明实验合同和执行命令。
+
+改动理由：
+
+- 当前证据同时指向Root heading预测和Body脚部/步态朝向不一致。该消融需要在完全相同的文本、XZ、噪声和stream事务下，只改变GT heading是否可见，才能判断显式heading能否消除旋转与cold-start错误。
+- 使用正式runtime compiler而不是debug自建condition，可以保证尚未成为motion query的active token仍通过Dynamic Future获得条件，避免再次引入训练/runtime可见性协议差异。
+
+验证：
+
+- `python -m py_compile debug/root_experiment.py debug/test_root_experiment.py debug/plot_root_heading_xz.py debug/heading_metrics.py`通过。
+- `python debug/test_root_experiment.py`：3项测试全部通过。
+- `python debug/test_heading_metrics.py`：5项测试全部通过。
+- `python debug/root_experiment.py --help`成功，完整显示sample、rotation、condition、seed、CFG、horizon、denoise和断点续跑参数。
+- `git diff --check`通过。
+- 未运行48次完整GPU实验：本轮用户尚未为该新实验指定checkpoint；工具默认保留EMA、separated CFG和正式validation horizon/denoise参数，待指定checkpoint后执行。
+
+涉及文件：
+
+- `debug/root_experiment.py`（本地ignored实验代码）
+- `debug/test_root_experiment.py`（本地ignored测试）
+- `debug/README.md`（本地ignored说明）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 使用用户选定checkpoint执行完整48-run矩阵；先比较同一rotation/seed下`xz`与`xz_heading`的root/GT、feet/root和ADE，再比较旋转角度之间的等变稳定性。
+- 若GT heading明显修复Root但feet/root仍高，下一步应独立处理Body latent与Root条件的一致性；若GT heading也不能稳定Root，则应继续审计Root condition注入和stream off-path状态，而不是先改VAE。
+
+## 2026-07-21 · Root Experiment输入/输出Heading可视化澄清
+
+改动类型：实验中止 / 可视化合同修复 / 数值核验
+
+实际改动内容：
+
+- 在完成130k基线48次生成、开始130k-headingloss生成后，依据用户对`rotation_+045deg/xz_heading/seed_4321`的反馈立即停止后续GPU批量任务。
+- 核对该run的真实target张量：+45度目标首帧root/torso/feet heading分别为`45.0°/45.0°/42.66°`，同步旋转本身正确；原图彩色箭头实际表示生成feet，而非模型收到的GT heading。
+- 扩展`plot_root_heading_xz.py`，可在生成root/torso/feet箭头之外，以独立黑色箭头叠加GT/condition root heading并明确标注其身份。
+- Root experiment后续每个run额外输出`condition_heading_xz.png`，单独显示提供给`xz_heading`分支的GT heading；XZ-only分支将同一信息明确标为hidden GT reference。
+- 重绘用户指出的130k/000021/+45度/xz_heading/seed4321四张heading图，使提供的GT heading与生成feet的巨大偏差可直接区分。
+
+改动理由：
+
+- 旧图只叠加target XZ虚线，标题中的`feet/GT-heading`只是数值指标，彩色箭头仍全部来自生成feet。这会让观察者误以为错误的生成feet箭头就是实验提供的heading，无法审计condition本身。
+- 更重要的是，当前LDF训练只采样XZ constraint mask，没有学习heading constraint通道；即使几何输入正确，将GT heading作为soft condition也属于分布外测试，不能等价于“predicted XZ + hard GT heading”的Root因果干预。继续批量测试前必须先确认用户希望哪一种实验语义。
+
+验证：
+
+- 指定run的提供heading与目标轨迹平均角度为约`18.0°`，目标torso/root和feet/root均约`8.3°`；生成feet/root则为`131.2°`，说明错误来自生成输出而不是+45度GT heading张量。
+- `python -m py_compile debug/plot_root_heading_xz.py debug/root_experiment.py`通过。
+- `python debug/test_root_experiment.py`：3项测试全部通过。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `debug/plot_root_heading_xz.py`（本地ignored可视化）
+- `debug/root_experiment.py`（本地ignored实验代码）
+- `debug/root_experiment1/step_130000/.../seed_4321/*.png`（本地ignored重绘产物）
+- `docs/DEVELOPMENT_LOG.md`
+
+后续事项：
+
+- 130k基线已完成48次；130k-headingloss在第8次生成期间中止；160k尚未启动。
+- 在继续之前确认`XZ+heading`是未经训练的soft heading observation，还是用于锁定Root因果贡献的hard GT heading intervention。若目标是后者，应改用已验证的`predicted_xz_gt_heading`microstep/commit干预，不应继续解释当前soft-condition结果。
+
+## 2026-07-21 · Root Experiment改为完整GT Root5硬替换并完成三Checkpoint实验
+
+改动类型：错误实验撤销 / Root因果消融修复 / GPU全量评测 / 跨Checkpoint汇总
+
+实际改动内容：
+
+- 将历史目录标签`xz_heading`的最终实验语义修正为完整GT root5硬替换：每个microstep均用GT `[x,y,z,cos(yaw),sin(yaw)]`替换RootTransformer clean-root输出来构造Body条件，并在每次commit前写入完整GT root patch；它不再表示soft heading observation或仅替换heading通道。
+- 为硬替换分支增加强数值断言，要求最终完整序列XYZ最大误差不超过1cm、heading最大误差不超过0.5度；三组实验实际最大误差分别只有`1.49e-8 m`和`5.12e-6 deg`。
+- 修正root/torso/feet图的语义：彩色箭头始终表示生成输出，黑色箭头表示GT root heading；另写`condition_heading_xz.png`显示纯GT reference，避免将feet输出误认成条件输入。
+- 将此前错误的soft-heading和GT-heading-only产物分别归档到带`invalid_*`名称的目录；重新生成正确的`debug/root_experiment1`。
+- 对`step_130000.ckpt`、`step_130000_headingloss.ckpt`和`step_160000.ckpt`分别完成000021/001168、0/45/90/180度、三seed、baseline与hard-GT-root5两分支的48-run矩阵，共144个完整视频。
+- 新增`debug/compare_root_experiment.py`，在读取结果时再次验证hard-GT-root5合同，并生成跨checkpoint的`comparison.json`与`comparison.md`，包含全局、逐样本配对和残余Body失败汇总。
+- 更新debug README，明确`xz_heading`只是保留的历史文件夹名称，其真实含义为完整GT root5替换。
+
+改动理由：
+
+- 用户要求的`XZ+heading`是因果消融：完整GT root5取代RootTransformer输出，再观察BodyTransformer与VAE decode是否恢复，而不是给未训练过heading constraint的模型增加一个输入。此前两种实现不能回答“Root是否为主要上游瓶颈”，必须物理隔离并重跑。
+- 对完整root5进行逐帧硬断言可以防止世界/模型坐标rebase、commit投影或绘图再次将GT条件与预测输出混淆。
+
+验证：
+
+- 三个checkpoint各写48个run和summary；`find debug/root_experiment1 -name motion.mp4 -type f | wc -l`返回`144`。
+- 全局baseline Root/GT heading误差依次为`97.03/85.21/72.40 deg`，尽管XZ ADE仅为`0.59/0.56/0.41 cm`；hard-GT-root5分支Root/GT与ADE均为数值零，证明轨迹位置准确并不代表Root heading准确。
+- hard-GT-root5将001168的feet/root降至三个checkpoint上的`4.56/4.70/5.45 deg`；000021平均也明显改善，但seed4322仍在部分旋转出现`97–124 deg`残余feet/root错误，说明Root是主要上游问题但Body latent仍存在独立的噪声相关绝对朝向mode。
+- 人工检查用户指出的`step_130000/000021/rotation_+045deg/xz_heading/seed_4321`：root图显示Root/GT=`0.0 deg`且轨迹完全重合，feet图显示feet/root=`7.2 deg`。
+- `debug/test_root_experiment.py`：5项通过；`debug/test_heading_metrics.py`：5项通过。
+- `py_compile`通过：root experiment、comparison、两套ablation helper、绘图、heading metrics及对应测试。
+- `git diff --check`通过。
+- 全仓`pytest tests -q`结果为`304 passed, 3 failed`；失败是当前工作区既有的远端`resume_ckpt`配置期望以及`prepare_training_assets.py`仍读取已移除`root_statistics`字段，与本次ignored debug消融代码无关，未在本任务中扩展修改范围。
+
+涉及文件：
+
+- `debug/root_experiment.py`（本地ignored实验代码）
+- `debug/audit_dense_xz_root_ablation.py`（本地ignored共享rollout）
+- `debug/audit_root_channel_ablation_t2m_fid.py`（本地ignored Root intervention）
+- `debug/plot_root_heading_xz.py`（本地ignored可视化）
+- `debug/test_root_experiment.py`（本地ignored测试）
+- `debug/compare_root_experiment.py`（本地ignored汇总工具）
+- `debug/README.md`（本地ignored说明）
+- `debug/root_experiment1/`（本地ignored 144-run正式产物及汇总）
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- Root heading仍是当前首要优化目标；heading auxiliary虽然使平均Root/GT误差下降，但到160k仍有`72.40 deg`，没有解决噪声相关的错误mode。
+- 对000021/seed4322在完整GT root5下仍出现的Body/feet反向mode，需要作为独立Body Stage消融处理，不能再归因给RootTransformer。
