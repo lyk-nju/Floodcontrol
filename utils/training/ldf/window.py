@@ -16,6 +16,19 @@ DEFAULT_K_SCHEDULE = ((0, 1), (100_000, 2), (200_000, 5))
 DEFAULT_TEACHER_REPLAY = {2: 0.5, 5: 0.2}
 
 
+@dataclass(frozen=True)
+class ColdStartObjective:
+    """One global-batch cold objective sampled from the frozen mixture."""
+
+    persistent: bool
+    rollout_commits: int
+    supervised_microstep: int | None
+
+    @property
+    def is_ideal(self) -> bool:
+        return not self.persistent
+
+
 def _require_integer(name: str, value: object) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
@@ -104,6 +117,39 @@ def validate_self_forcing_config(
     if not math.isfinite(cold_start_replay) or not 0.0 <= cold_start_replay <= 1.0:
         raise ValueError("self_forcing.cold_start_replay must lie in [0,1]")
 
+    cold_config = dict(config.get("cold_start") or {})
+    if cold_start_replay > 0.0 and not cold_config:
+        raise ValueError(
+            "self_forcing.cold_start is required when cold_start_replay is positive"
+        )
+    if cold_config:
+        unknown = set(cold_config) - {
+            "persistent_probability",
+            "rollout_commits",
+        }
+        if unknown:
+            raise ValueError(
+                "unknown self_forcing.cold_start fields: "
+                f"{sorted(unknown)}"
+            )
+        persistent_probability = float(
+            cold_config.get("persistent_probability", -1.0)
+        )
+        if not math.isfinite(persistent_probability) or not (
+            0.0 <= persistent_probability <= 1.0
+        ):
+            raise ValueError(
+                "self_forcing.cold_start.persistent_probability must lie in [0,1]"
+            )
+        rollout_commits = _require_integer(
+            "self_forcing.cold_start.rollout_commits",
+            cold_config.get("rollout_commits", 0),
+        )
+        if rollout_commits < 1:
+            raise ValueError(
+                "self_forcing.cold_start.rollout_commits must be at least 1"
+            )
+
     generation_tokens = _require_integer(
         "training.window.generation_tokens", generation_tokens
     )
@@ -115,6 +161,11 @@ def validate_self_forcing_config(
     maximum_rollout = max(rollout_steps for _, rollout_steps in schedule)
     if generation_tokens + maximum_rollout - 1 > max_window_tokens:
         raise ValueError("self-forcing rollout cannot fit inside the training window")
+    if cold_config and (
+        generation_tokens + int(cold_config["rollout_commits"]) - 1
+        > max_window_tokens
+    ):
+        raise ValueError("persistent cold rollout cannot fit inside the training window")
 
     max_steps = _require_integer("trainer.max_steps", max_steps)
     if max_steps <= 0:
@@ -124,6 +175,61 @@ def validate_self_forcing_config(
             "self-forcing schedule start steps must be smaller than trainer.max_steps"
         )
     return schedule
+
+
+def sample_cold_start_objective(
+    *,
+    persistent_probability: float,
+    rollout_commits: int,
+    noise_steps: int,
+    active_tokens: int,
+    generator: torch.Generator,
+) -> ColdStartObjective:
+    """Sample one rank-independent ideal/persistent cold objective.
+
+    Persistent supervision selects one differentiable microstep from the full
+    cold lifecycle.  The solver executes every preceding microstep under
+    ``no_grad`` so the selected input remains a genuinely evolved off-path
+    state without retaining the complete backward graph.
+    """
+
+    probability = float(persistent_probability)
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise ValueError("persistent_probability must lie in [0,1]")
+    commits = _require_integer("cold rollout_commits", rollout_commits)
+    noise_steps = _require_integer("model.noise_steps", noise_steps)
+    active_tokens = _require_integer("model.chunk_size", active_tokens)
+    if commits < 1 or noise_steps <= 0 or active_tokens <= 0:
+        raise ValueError("cold rollout geometry must be positive")
+    if noise_steps % active_tokens:
+        raise ValueError("noise_steps must be divisible by active_tokens")
+    if generator is None or torch.device(generator.device).type != "cpu":
+        raise ValueError("cold objective sampling requires a CPU generator")
+
+    persistent = bool(torch.rand((), generator=generator).item() < probability)
+    if not persistent:
+        return ColdStartObjective(
+            persistent=False,
+            rollout_commits=1,
+            supervised_microstep=None,
+        )
+
+    lifecycle_microsteps = noise_steps + (
+        commits - 1
+    ) * (noise_steps // active_tokens)
+    supervised = int(
+        torch.randint(
+            0,
+            lifecycle_microsteps,
+            (),
+            generator=generator,
+        ).item()
+    )
+    return ColdStartObjective(
+        persistent=True,
+        rollout_commits=commits,
+        supervised_microstep=supervised,
+    )
 
 
 @dataclass(frozen=True)
@@ -327,14 +433,19 @@ def sample_window_plan(
             "context_token_count and previous_root_valid_mask must be [B]"
         )
     maximum_history = span_count - active_tokens - (rollout_steps - 1)
-    # Persistent solver rollout models steady-state continuation transactions.
-    # True cold start has a longer first warm-up transaction and is admitted only
-    # by the explicit K=1 cold-start replay path.
+    # Ordinary persistent sampling models steady-state continuation.  An
+    # explicit H=0 override may request the separate persistent-cold lifecycle;
+    # it starts at diffusion step zero and is handled by the solver.
     minimum_history = torch.maximum(
         (source_start > 0).to(dtype=torch.long),
         torch.full_like(
             source_start,
-            1 if rollout_steps > 1 or not bool(allow_cold_start) else 0,
+            1
+            if (
+                not bool(allow_cold_start)
+                or (rollout_steps > 1 and initial_history_tokens is None)
+            )
+            else 0,
         ),
     )
     if initial_history_tokens is None:
@@ -436,10 +547,12 @@ def sample_window_plan(
 
 
 __all__ = [
+    "ColdStartObjective",
     "DEFAULT_K_SCHEDULE",
     "DEFAULT_TEACHER_REPLAY",
     "LDFWindowPlan",
     "resolve_self_forcing_k",
+    "sample_cold_start_objective",
     "sample_rollout_steps",
     "sample_window_plan",
 ]

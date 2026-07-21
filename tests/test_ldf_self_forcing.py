@@ -25,6 +25,7 @@ from utils.training.ldf.flow import (
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import (
     resolve_self_forcing_k,
+    sample_cold_start_objective,
     sample_rollout_steps,
     sample_window_plan,
 )
@@ -116,6 +117,55 @@ def test_true_cold_plan_requires_sequence_start_and_uses_frame_zero_anchor():
     assert plan.cold_start_mask.tolist() == [True, True]
     assert plan.translation_anchor_frame.tolist() == [0, 0]
     assert plan.translation_anchor_xz.tolist() == [[0.0, 0.0], [0.0, 0.0]]
+
+
+def test_explicit_true_cold_plan_can_reserve_two_persistent_commits():
+    plan = sample_window_plan(
+        physical_batch(cold=True),
+        active_tokens=5,
+        rollout_steps=2,
+        latent_dim=4,
+        initial_history_tokens=0,
+        phase_offset=torch.zeros(2),
+        allow_cold_start=True,
+        generator=torch.Generator().manual_seed(2),
+    )
+
+    plan.validate()
+    assert plan.initial_history_tokens.tolist() == [0, 0]
+    assert plan.frontier_tokens.tolist() == [5, 5]
+
+
+def test_cold_objective_samples_the_frozen_ideal_persistent_mixture():
+    ideal = sample_cold_start_objective(
+        persistent_probability=0.0,
+        rollout_commits=2,
+        noise_steps=10,
+        active_tokens=5,
+        generator=torch.Generator().manual_seed(9),
+    )
+    assert ideal.is_ideal
+    assert ideal.rollout_commits == 1
+    assert ideal.supervised_microstep is None
+
+    first = sample_cold_start_objective(
+        persistent_probability=1.0,
+        rollout_commits=2,
+        noise_steps=10,
+        active_tokens=5,
+        generator=torch.Generator().manual_seed(9),
+    )
+    second = sample_cold_start_objective(
+        persistent_probability=1.0,
+        rollout_commits=2,
+        noise_steps=10,
+        active_tokens=5,
+        generator=torch.Generator().manual_seed(9),
+    )
+    assert first == second
+    assert first.persistent
+    assert first.rollout_commits == 2
+    assert 0 <= first.supervised_microstep < 12
 
 
 def test_explicit_cold_replay_contract_removes_accidental_h_zero_sampling():
@@ -495,6 +545,7 @@ class RecordingModel(nn.Module):
         self.calls: list[tuple[bool, bool, int]] = []
         self.noisy_inputs: list[HybridMotion] = []
         self.beta_inputs: list[torch.Tensor] = []
+        self.future_position_inputs: list[list[list[int]] | None] = []
         self.noise_steps = 10
         self.chunk_size = 5
         self.register_buffer("root_mean", torch.zeros(5))
@@ -536,6 +587,17 @@ class RecordingModel(nn.Module):
         )
         self.noisy_inputs.append(inputs.noisy_motion.clone(detach=True))
         self.beta_inputs.append(inputs.beta.detach().clone())
+        future_mask = inputs.future_attention_mask()
+        if future_mask is None:
+            self.future_position_inputs.append(None)
+        else:
+            positions = inputs.condition.future_timeline_position_ids
+            self.future_position_inputs.append(
+                [
+                    positions[index][future_mask[index]].tolist()
+                    for index in range(positions.shape[0])
+                ]
+            )
         root_velocity = torch.ones_like(inputs.noisy_motion.root_motion) * self.scale
         body_velocity = torch.ones_like(inputs.noisy_motion.latent_motion) * self.scale
         clean_root = recover_clean_for_self_forcing(
@@ -559,6 +621,191 @@ class RecordingModel(nn.Module):
             inputs.noisy_motion.latent_motion
             + delta[..., None] * prediction.velocity.latent_motion,
         ), prediction
+
+
+def test_persistent_cold_runs_ten_plus_two_microsteps_with_one_fixed_source(
+    monkeypatch,
+):
+    import utils.training.ldf.solver as solver_module
+
+    mix_calls = 0
+    original_mix = solver_module.mix_fixed_noise
+
+    def counted_mix(*args, **kwargs):
+        nonlocal mix_calls
+        mix_calls += 1
+        return original_mix(*args, **kwargs)
+
+    monkeypatch.setattr(solver_module, "mix_fixed_noise", counted_mix)
+    plan = sample_window_plan(
+        physical_batch(cold=True),
+        active_tokens=5,
+        rollout_steps=2,
+        latent_dim=3,
+        initial_history_tokens=0,
+        phase_offset=torch.zeros(2),
+        allow_cold_start=True,
+        generator=torch.Generator().manual_seed(17),
+    )
+    clean = HybridMotion(
+        torch.zeros(2, 10, 4, 5),
+        torch.zeros(2, 10, 3),
+    )
+    model = RecordingModel().train()
+    views = []
+
+    def condition_builder(view, _clean_motion):
+        views.append(view)
+        return empty_condition(2)(view)
+
+    result = run_training_solver(
+        model,
+        clean,
+        plan,
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition_builder=condition_builder,
+        cold_persistent_microstep=11,
+    )
+
+    assert mix_calls == 1
+    assert len(model.calls) == 12
+    assert [grad for grad, _training, _visible in model.calls] == [False] * 11 + [
+        True
+    ]
+    assert [visible for _grad, _training, visible in model.calls] == [
+        2,
+        2,
+        4,
+        4,
+        6,
+        6,
+        8,
+        8,
+        10,
+        10,
+        10,
+        10,
+    ]
+    assert len(views) == 2
+    assert [view.active_start.tolist() for view in views] == [[0, 0], [1, 1]]
+    assert len(result.replacements) == 2
+    assert result.is_rollout
+    assert result.persistent_state is not None
+    assert result.persistent_state.completed_commits == 2
+    assert result.persistent_state.current_denoise_step.tolist() == [12, 12]
+    for step_index, beta in enumerate(model.beta_inputs):
+        expected = model.triangular_beta(
+            timeline_position_ids=torch.arange(10)[None].expand(2, -1),
+            diffusion_time=torch.full((2,), step_index / 10.0),
+        )
+        assert torch.equal(beta, expected)
+
+    losses = compute_offpath_loss(
+        result.prediction,
+        result.final_step,
+        root_mean=model.root_mean,
+        root_std=model.root_std,
+    )
+    losses["total"].backward()
+    assert model.scale.grad is not None
+
+
+def test_persistent_cold_can_supervise_an_early_evolved_phase():
+    plan = sample_window_plan(
+        physical_batch(cold=True),
+        active_tokens=5,
+        rollout_steps=2,
+        latent_dim=3,
+        initial_history_tokens=0,
+        phase_offset=torch.zeros(2),
+        allow_cold_start=True,
+        generator=torch.Generator().manual_seed(19),
+    )
+    clean = HybridMotion(
+        torch.zeros(2, 10, 4, 5),
+        torch.zeros(2, 10, 3),
+    )
+    model = RecordingModel().train()
+    result = run_training_solver(
+        model,
+        clean,
+        plan,
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition_builder=empty_condition(2),
+        cold_persistent_microstep=4,
+    )
+
+    assert len(model.calls) == 5
+    assert [grad for grad, _training, _visible in model.calls] == [False] * 4 + [True]
+    assert int(result.final_step.loss_mask.sum()) == 6
+    assert result.replacements == ()
+    assert result.persistent_state is not None
+    assert result.persistent_state.completed_commits == 0
+    assert result.persistent_state.current_denoise_step.tolist() == [5, 5]
+
+
+def test_persistent_cold_dynamic_future_tracks_the_evolved_visible_boundary():
+    root = torch.zeros(1, 10, 4, 5)
+    root[..., 3] = 1.0
+    batch = {
+        "root_motion": root.flatten(1, 2),
+        "source_start_token": torch.zeros(1, dtype=torch.long),
+        "span_token_count": torch.tensor([10]),
+        "context_token_count": torch.zeros(1, dtype=torch.long),
+        "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
+    }
+    plan = sample_window_plan(
+        batch,
+        active_tokens=5,
+        rollout_steps=2,
+        latent_dim=3,
+        initial_history_tokens=0,
+        phase_offset=torch.zeros(1),
+        allow_cold_start=True,
+        generator=torch.Generator().manual_seed(23),
+    )
+    clean = HybridMotion(root, torch.zeros(1, 10, 3))
+    valid = torch.ones(1, 10, dtype=torch.bool)
+    constraint_mask = torch.zeros_like(root, dtype=torch.bool)
+    constraint_mask[:, :8, :, 0] = True
+    constraint_mask[:, :8, :, 2] = True
+
+    def condition_builder(view, clean_motion):
+        return create_xz_condition(
+            clean_root_motion=clean_motion.root_motion,
+            token_valid_mask=valid,
+            constraint_mask=constraint_mask,
+            view=view,
+            text_context=[torch.zeros(1, 1) for _ in range(10)],
+            text_null_context=[torch.zeros(1, 1)],
+            future_horizon_tokens=torch.tensor([3]),
+        )
+
+    model = RecordingModel().train()
+    run_training_solver(
+        model,
+        clean,
+        plan,
+        previous_root_frame=None,
+        previous_root_valid_mask=None,
+        condition_builder=condition_builder,
+        cold_persistent_microstep=9,
+    )
+
+    assert model.future_position_inputs == [
+        [[1, 2, 3]],
+        [[1, 2, 3]],
+        [[2, 3, 4]],
+        [[2, 3, 4]],
+        [[3, 4, 5]],
+        [[3, 4, 5]],
+        [[4, 5, 6]],
+        [[4, 5, 6]],
+        [[5, 6, 7]],
+        [[5, 6, 7]],
+    ]
 
 
 def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
@@ -857,6 +1104,64 @@ def test_root_heading_vector_retains_gradient_at_exact_antipode():
     assert vector_grad.abs().sum().item() > 0.0
     assert vector_losses["root_heading_raw_norm_mean"].item() == pytest.approx(1.0)
     assert vector_losses["root_heading_antipodal_ratio"].item() == pytest.approx(1.0)
+
+
+def test_zero_norm_heading_uses_bounded_vector_gradient_without_cosine():
+    beta = torch.tensor([[0.1]])
+    root_velocity = torch.zeros(1, 1, 4, 5, requires_grad=True)
+    body_velocity = torch.zeros(1, 1, 3)
+    target_root = torch.zeros_like(root_velocity)
+    target_root[..., 3] = 1.0
+    local = torch.zeros(1, 1, 4, 4)
+    prediction = LDFPrediction(
+        velocity=HybridMotion(root_velocity, body_velocity),
+        clean_root_motion=target_root,
+        local_root_motion=local,
+        local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
+    )
+    step = type(
+        "ZeroNormHeadingStep",
+        (),
+        {
+            "loss_mask": torch.ones(1, 1, dtype=torch.bool),
+            "target_velocity": HybridMotion(
+                root_velocity.detach(), torch.zeros_like(body_velocity)
+            ),
+            "clean_motion": HybridMotion(
+                target_root, torch.zeros_like(body_velocity)
+            ),
+            "inputs": type(
+                "ZeroNormHeadingInputs",
+                (),
+                {
+                    "noisy_motion": HybridMotion(
+                        torch.zeros_like(root_velocity),
+                        torch.zeros_like(body_velocity),
+                    ),
+                    "beta": beta,
+                },
+            )(),
+        },
+    )()
+    losses = compute_velocity_loss(
+        prediction,
+        step,
+        root_mean=torch.zeros(5),
+        root_std=torch.ones(5),
+        root_heading_cosine_weight=1.0,
+        root_heading_vector_weight=1.0,
+        root_heading_beta_min=0.1,
+        root_heading_cosine_min_norm=0.05,
+    )
+
+    assert all(torch.isfinite(value) for value in losses.values())
+    assert losses["root_heading_cosine_weighted"].item() == pytest.approx(0.0)
+    assert losses["root_heading_low_norm_ratio"].item() == pytest.approx(1.0)
+    losses["total"].backward()
+    heading_gradient = root_velocity.grad[..., 3:5]
+    assert torch.isfinite(heading_gradient).all()
+    assert heading_gradient.abs().sum().item() > 0.0
+    assert heading_gradient.abs().max().item() <= 1.0
 
 
 def test_root_heading_beta_compensation_equalizes_velocity_gradients():

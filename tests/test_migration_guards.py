@@ -87,6 +87,8 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert "phase_start_step" not in cfg.self_forcing
     assert "phase_steps" not in cfg.self_forcing
     assert cfg.self_forcing.cold_start_replay == pytest.approx(0.1)
+    assert cfg.self_forcing.cold_start.persistent_probability == pytest.approx(0.5)
+    assert cfg.self_forcing.cold_start.rollout_commits == 2
     assert list(cfg.self_forcing.k_schedule) == [
         [0, 1],
         [100000, 2],
@@ -107,6 +109,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.loss.root_heading_cosine_weight == pytest.approx(0.1)
     assert cfg.loss.root_heading_vector_weight == pytest.approx(0.1)
     assert cfg.loss.root_heading_beta_min == pytest.approx(0.1)
+    assert cfg.loss.root_heading_cosine_min_norm == pytest.approx(0.05)
     assert cfg.loss.body_weight == pytest.approx(3.0)
     assert cfg.model.params.cfg_mode == "joint"
     assert cfg.root_statistics.window_tokens == 50
@@ -363,6 +366,13 @@ def test_training_entry_rejects_invalid_heading_loss_beta_floor():
         _validate_training_config(cfg)
 
 
+def test_training_entry_rejects_invalid_heading_cosine_norm_floor():
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
+    cfg.config.loss.root_heading_cosine_min_norm = 0.0
+    with pytest.raises(ValueError, match="root_heading_cosine_min_norm"):
+        _validate_training_config(cfg)
+
+
 def test_training_entry_rejects_invalid_constraint_sampling():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_sampling.goal_probability = 0.5
@@ -394,6 +404,16 @@ def test_training_entry_rejects_self_forcing_that_exceeds_window_budget():
         ("teacher_replay", {2: 2.0, 5: 0.1}, "probabilities"),
         ("teacher_replay", {2: 0.2, 4: 0.1}, "exactly match"),
         ("cold_start_replay", 1.1, "cold_start_replay"),
+        (
+            "cold_start",
+            {"persistent_probability": 1.1, "rollout_commits": 2},
+            "persistent_probability",
+        ),
+        (
+            "cold_start",
+            {"persistent_probability": 0.5, "rollout_commits": 0},
+            "rollout_commits",
+        ),
     ],
 )
 def test_training_entry_rejects_invalid_self_forcing_contract(

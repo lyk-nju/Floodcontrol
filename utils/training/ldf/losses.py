@@ -17,6 +17,7 @@ def _root_heading_losses(
     root_mean: torch.Tensor,
     root_std: torch.Tensor,
     beta_min: float,
+    cosine_min_norm: float,
 ) -> dict[str, torch.Tensor]:
     """Supervise the pre-projection physical heading with beta compensation.
 
@@ -29,6 +30,8 @@ def _root_heading_losses(
 
     if float(beta_min) <= 0.0:
         raise ValueError("root_heading_beta_min must be positive")
+    if float(cosine_min_norm) <= 0.0:
+        raise ValueError("root_heading_cosine_min_norm must be positive")
     noisy_root = training_step.inputs.noisy_motion.root_motion
     velocity = prediction.velocity.root_motion
     target = training_step.clean_motion.root_motion
@@ -49,11 +52,9 @@ def _root_heading_losses(
         dim=-1,
         eps=1e-6,
     )
-    projected_heading = F.normalize(
-        raw_heading,
-        dim=-1,
-        eps=1e-6,
-    )
+    raw_norm = raw_heading.norm(dim=-1, keepdim=True)
+    safe_norm = raw_norm.clamp_min(float(cosine_min_norm))
+    projected_heading = raw_heading / safe_norm
     cosine = (projected_heading * target_heading).sum(dim=-1).clamp(-1.0, 1.0)
     cosine_error = 1.0 - cosine
     vector_error = F.smooth_l1_loss(
@@ -63,11 +64,14 @@ def _root_heading_losses(
     ).mean(dim=-1)
 
     frame_mask = training_step.loss_mask[..., None].expand_as(cosine_error)
+    cosine_valid = raw_norm.squeeze(-1).detach() >= float(cosine_min_norm)
+    cosine_error = cosine_error * cosine_valid.to(cosine_error)
     beta_weight = beta.float().clamp_min(float(beta_min)).reciprocal()[..., None]
     beta_weight = beta_weight.expand_as(cosine_error)
-    raw_norm = raw_heading.norm(dim=-1)
+    raw_norm = raw_norm.squeeze(-1)
     selected_norm = raw_norm[frame_mask]
     selected_cosine = cosine[frame_mask]
+    selected_cosine_valid = cosine_valid[frame_mask]
     return {
         "cosine": cosine_error[frame_mask].mean(),
         "cosine_weighted": (cosine_error * beta_weight)[frame_mask].mean(),
@@ -75,7 +79,10 @@ def _root_heading_losses(
         "vector_weighted": (vector_error * beta_weight)[frame_mask].mean(),
         "raw_norm_mean": selected_norm.detach().mean(),
         "raw_norm_p10": torch.quantile(selected_norm.detach(), 0.1),
-        "antipodal_ratio": (selected_cosine.detach() < -0.9).float().mean(),
+        "low_norm_ratio": (~selected_cosine_valid).float().mean(),
+        "antipodal_ratio": (
+            (selected_cosine.detach() < -0.9) & selected_cosine_valid
+        ).float().mean(),
     }
 
 
@@ -90,6 +97,7 @@ def compute_velocity_loss(
     root_heading_cosine_weight: float = 0.0,
     root_heading_vector_weight: float = 0.0,
     root_heading_beta_min: float = 0.1,
+    root_heading_cosine_min_norm: float = 0.05,
 ) -> dict[str, torch.Tensor]:
     """Compute root/body flow-v MSE only on the active band."""
 
@@ -115,6 +123,7 @@ def compute_velocity_loss(
         root_mean=root_mean,
         root_std=root_std,
         beta_min=float(root_heading_beta_min),
+        cosine_min_norm=float(root_heading_cosine_min_norm),
     )
     total = (
         float(root_weight) * root_loss
@@ -140,6 +149,7 @@ def compute_velocity_loss(
         "root_heading_vector_weighted": heading["vector_weighted"],
         "root_heading_raw_norm_mean": heading["raw_norm_mean"],
         "root_heading_raw_norm_p10": heading["raw_norm_p10"],
+        "root_heading_low_norm_ratio": heading["low_norm_ratio"],
         "root_heading_antipodal_ratio": heading["antipodal_ratio"],
         "root_boundary_displacement": zero,
         "total": total,
@@ -205,6 +215,7 @@ def compute_offpath_loss(
     root_heading_cosine_weight: float = 0.0,
     root_heading_vector_weight: float = 0.0,
     root_heading_beta_min: float = 0.1,
+    root_heading_cosine_min_norm: float = 0.05,
 ) -> dict[str, torch.Tensor]:
     """Stabilize the clean endpoint from a persistent off-path solver state."""
 
@@ -256,6 +267,7 @@ def compute_offpath_loss(
         root_mean=root_mean,
         root_std=root_std,
         beta_min=float(root_heading_beta_min),
+        cosine_min_norm=float(root_heading_cosine_min_norm),
     )
     if float(root_boundary_weight) != 0.0:
         boundary_loss = _root_boundary_displacement_loss(
@@ -291,6 +303,7 @@ def compute_offpath_loss(
         "root_heading_vector_weighted": heading["vector_weighted"],
         "root_heading_raw_norm_mean": heading["raw_norm_mean"],
         "root_heading_raw_norm_p10": heading["raw_norm_p10"],
+        "root_heading_low_norm_ratio": heading["low_norm_ratio"],
         "root_heading_antipodal_ratio": heading["antipodal_ratio"],
         "root_boundary_displacement": boundary_loss,
         "total": total,

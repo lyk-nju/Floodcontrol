@@ -104,6 +104,16 @@ def _validate_training_config(cfg) -> None:
         raise ValueError(
             "loss.root_heading_beta_min must be finite and positive"
         )
+    heading_cosine_min_norm = float(
+        loss.get("root_heading_cosine_min_norm", 0.05)
+    )
+    if (
+        not math.isfinite(heading_cosine_min_norm)
+        or heading_cosine_min_norm <= 0.0
+    ):
+        raise ValueError(
+            "loss.root_heading_cosine_min_norm must be finite and positive"
+        )
     sampling = training.get("constraint_sampling") or {}
     probabilities = [
         float(sampling.get(name, -1.0))

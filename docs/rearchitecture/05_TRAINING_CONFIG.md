@@ -31,6 +31,9 @@ model.params:
 
 self_forcing:
   cold_start_replay: 0.1
+  cold_start:
+    persistent_probability: 0.5
+    rollout_commits: 2
   k_schedule: [[0, 1], [100000, 2], [200000, 3], [300000, 5]]
   teacher_replay: {2: 0.1, 3: 0.1, 5: 0.1}
 
@@ -76,7 +79,7 @@ validation:
     steps: 10000
 ```
 
-`max_frames=200`与`window.max_tokens=50`共同定义每个sample最多10秒的parent窗口；短动作保留自然长度，长动作随机裁50 tokens，batch仅右padding。`chunk_size`与`window.generation_tokens`必须同为5。每个sample独立采样generation start，由此得到`H_i`和`F_i`，唯一预算是`H_i+5+F_i<=50`；不再存在独立history上限。`H=0`严格表示true cold start，只允许parent从真实序列第0 token开始，并要求VAE context为0、previous-root无效；中间parent的合法范围从`H=1`开始。`max_horizon_token=45`是future XZ采样上限，而不是固定长度：每个sample从0到扣除`K-1` rollout余量后的真实可用上限均匀采样，并在整次rollout内保持不变；因此K=1的完整cold窗口覆盖0～45，而靠近末端或K更大的窗口自动使用更小上限。`self_forcing`块是全部训练唯一的K课程入口：普通训练显式写成K=1，不再由`enabled`或phase字段切出另一条入口。`cold_start_replay=0.1`在K选择前独立应用于整个训练过程，使用K=1 ideal target并覆盖首次commit全部runtime denoise阶段与动态1–5 token visibility；它不执行前置no-grad solver rollout。K>1阶段会从同一预算预留`K-1`个rollout token，并自动过滤短于`5+K-1` tokens的训练sample。正式baseline使用dense XZ采样；constraint dropout与text dropout保持独立，从而覆盖joint/text/constraint/history四种条件组合。
+`max_frames=200`与`window.max_tokens=50`共同定义每个sample最多10秒的parent窗口；短动作保留自然长度，长动作随机裁50 tokens，batch仅右padding。`chunk_size`与`window.generation_tokens`必须同为5。每个sample独立采样generation start，由此得到`H_i`和`F_i`，唯一预算是`H_i+5+F_i<=50`；不再存在独立history上限。`H=0`严格表示true cold start，只允许parent从真实序列第0 token开始，并要求VAE context为0、previous-root无效；中间parent的合法范围从`H=1`开始。`max_horizon_token=45`是future XZ采样上限，而不是固定长度：每个sample从0到扣除rollout余量后的真实可用上限均匀采样，并在整次rollout内保持不变。`self_forcing`块是全部训练唯一的K课程入口：普通训练显式写成K=1，不再由`enabled`或phase字段切出另一条入口。`cold_start_replay=0.1`在K选择前独立应用于整个训练过程；cold内部50%保留随机beta的ideal flow-v目标，50%从`H=0,current_step=0`用同一fixed source执行persistent solver。正式`noise_steps=10,C=5,rollout_commits=2`时cold生命周期最多为`10+2=12`个microsteps，均匀采样一个可微监督点，此前步骤只用`no_grad`推进真实off-path state。K>1普通阶段和persistent cold都会从同一窗口预算预留必要rollout token。正式baseline使用dense XZ采样；constraint dropout与text dropout保持独立，从而覆盖joint/text/constraint/history四种条件组合。
 
 正式validation的rolling buffer同样固定为50 tokens，使训练parent与训练期部署模拟使用同一容量。独立Web/runtime实验若覆盖其他buffer长度，必须在专用配置和报告中明确标记，不能反向改变50-token训练合同。
 

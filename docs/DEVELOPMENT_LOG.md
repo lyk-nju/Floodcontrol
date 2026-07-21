@@ -5239,3 +5239,168 @@
 - 尚未启动新的GPU微调；恢复120k后应分别跟踪weighted/unweighted heading loss、raw norm、antipodal ratio、Root/GT heading和joint/separated CFG结果。
 - 新loss解决训练侧beta衰减与antipodal零梯度，不解决separated CFG在线性组合cos/sin velocity时可能产生的圆周外插不稳定；该问题仍需独立消融。
 - 全仓三项既有失败应由后续配置/asset工具一致性任务处理，本轮未为通过测试而覆盖当前实验resume与loss配置。
+
+## 2026-07-21 · Root Heading零模长Cosine梯度保护
+
+改动类型：LDF数值稳定性 / loss配置 / 单元测试 / 设计文档
+
+实际改动内容：
+
+- 新增`loss.root_heading_cosine_min_norm: 0.05`并接入K=1与K>1两条heading辅助路径；训练入口要求该阈值finite且严格为正。
+- 投影前raw heading的cosine归一化分母改为`norm.clamp_min(0.05)`，并用detach的norm mask排除低于阈值的frame参与cosine；这些frame只由raw-vector SmoothL1恢复模长与方向。
+- 保留所有frame的raw-vector与倒beta监督，不在低norm区域制造监督空洞；精确180度但norm正常的heading仍由vector提供非零梯度。
+- 新增`root_heading_low_norm_ratio`训练日志，和既有raw norm mean/p10、antipodal ratio共同区分“方向反转”与“向量塌缩”。
+- 更新正式HumanML、共享base配置、启动校验、loss键合同和训练设计文档。
+
+改动理由：
+
+- `F.normalize(...,eps=1e-6)`在raw heading接近零时具有约`1e6`量级Jacobian，再与最多10倍的倒beta权重叠加，可能产生瞬时异常梯度。
+- heading模长低于0.05时方向本身尚不可靠；由vector项先恢复到有效圆周邻域，再启用cosine，比继续放大未定义方向的角度梯度更稳定。
+
+验证：
+
+- 新增零模长测试：`raw_heading=[0,0]`时cosine贡献为零，total loss、所有指标与梯度finite，vector梯度非零且最大绝对值不超过1。
+- LDF定向测试（排除既有过期正式配置冻结断言）：`105 passed, 1 deselected`。
+- 全仓测试：`309 passed, 3 failed`；仍为此前相同的正式resume/test/body-weight断言漂移及两项training-assets缺少`root_statistics`字段，与本次loss稳定性修改无关。
+- 相关文件`py_compile`和`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/losses.py`
+- `utils/training/ldf/lightning_module.py`
+- `train_ldf.py`
+- `configs/ldf.yaml`
+- `configs/ldf_base.yaml`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 新训练中需要观察`root_heading_low_norm_ratio`与raw norm p10；若大量frame长期低于0.05，应优先检查Root endpoint尺度或提高vector权重，而不是降低阈值重新开放高增益cosine。
+- 尚未执行GPU微调或测量真实梯度norm分布。
+
+## 2026-07-21 · Body Cold-Start Latent前缀与脚部FK定位实验
+
+改动类型：本地ignored诊断工具 / GPU固定噪声消融 / VAE表示审计
+
+实际改动内容：
+
+- 新增`debug/body_prefix_oracle_experiment.py`，固定使用完整GT root5、joint CFG、dense XZ和同一初始Root/Body噪声，对普通Body rollout、前1/2/5个committed GT body latent、active阶段GT token钳制及全GT latent进行完整stream对照。
+- 对`step_160000.ckpt`运行`000021`的seed 4321/4322/4323及`001168`的seed 4322全长实验，每个variant保存feature NPZ、视频、逐token feet/root角度、逐token normalized latent RMSE和首次反向token。
+- 新增`debug/direct_vs_fk_foot_audit.py`，使用body265 direct positions与child-global rotations分别恢复ankle-to-toe方向，同时独立报告当前可选VAE FK loss采用的parent-global公式。
+- 结果写入`debug/results/body_prefix_oracle_step160000_joint_seed4322/`；debug目录继续由Git忽略，不修改训练、模型、checkpoint或正式配置。
+
+改动理由：
+
+- 完整GT root5下仍存在`000021/seed4322`的反脚状态，需要区分VAE position/rotation不一致、Body latent整体错误mode和cold-start历史传播三种来源。
+- 直接打开现有`lambda_fk`之前必须先验证其FK公式与converter保存的global rotations语义一致。
+
+验证：
+
+- 普通`000021` rollout从token 0即反向：feet/root均值`122.50 deg`、反向帧比例`0.517`、latent RMSE`1.278`。
+- 仅在第1个token commit后替换GT仍有明显错误（`87.18 deg`，首次反向token 2）；前2个committed token换GT后整段恢复为`7.69 deg`且无反向帧；只将第1个token在active生命周期内钳制为GT也恢复为`8.76 deg`。这定位到cold active band的早期下肢latent mode选择及其传播，而不是后半段随机翻转。
+- 正常对照`001168`普通rollout为`12.84 deg`且无反向帧；所有前缀oracle均保持正常。
+- `000021`的正常seed 4321/4323普通rollout分别为`6.88/8.44 deg`，GT前缀干预后继续保持正常；异常只出现在同样本的seed 4322，排除了GT前缀本身普遍强行动作转向的解释。
+- seed 4321普通rollout虽正常，latent RMSE为`1.361`，反而高于反脚seed 4322的`1.278`；全局平均latent RMSE不能识别这个离散下肢mode，后续监督/指标必须读取脚部几何。
+- `000021`坏例中direct-position和child-global-FK均反向（分别`122.50/124.67 deg`），二者相互角度仅`17.85 deg`；前2-token GT恢复后二者均正常（`7.69/12.21 deg`）。因此不是单独position head与rotation head符号相反，而是生成latent选择了整体错误下肢mode。
+- 当前parent-global FK公式在GT近似输出上造成约`0.275 m`全关节MPJPE，并使`000021`脚方向约`76 deg`；不能直接启用现有`lambda_fk`，应先修正/冻结HumanML global-rotation FK合同。
+- 代码复核确认当前`cold_start_replay`只用`mix_fixed_noise(clean,noise,beta)`构造一个独立ideal cold phase；K>1 persistent rollout则明确拒绝`H=0`。因此训练覆盖了“cold的所有beta”但从未覆盖“从cold真实积分后形成的persistent off-path active state”，与本次前缀干预定位到的缺口一致。
+- `py_compile`通过：两个新增debug脚本；GPU实验正常完成并生成28个完整视频与三个seed summary；未运行全仓pytest，因为本轮未修改正式代码路径。
+
+涉及文件：
+
+- `debug/body_prefix_oracle_experiment.py`（本地ignored）
+- `debug/direct_vs_fk_foot_audit.py`（本地ignored）
+- `debug/README.md`（本地ignored）
+- `debug/results/body_prefix_oracle_step160000_joint_seed4322/`（本地ignored）
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 需要将cold-start下肢latent初始化修复设计为训练合同；优先比较active-token body auxiliary或更强cold persistent rollout，不能继续只加强Root heading。
+- 在任何VAE FK/position-consistency重训前，必须先把现有parent rotation FK改为与body265 global-rotation合同一致的公式，并验证GT基线误差。
+
+## 2026-07-21 · Persistent Cold训练合同与实验依据冻结
+
+改动类型：训练设计文档 / 实验结论固化（未修改实现）
+
+实际改动内容：
+
+- 在LDF训练方法文档中完整记录`step_160000.ckpt`的Body cold-prefix oracle、正常seed/sample对照、direct-position与child-global-FK审计，以及当前训练代码缺少`H=0` persistent solver-state覆盖的事实。
+- 将下一轮cold训练协议冻结为：全程10% global batch进入cold；cold内部50%保留随机beta ideal bridge、50%从`H=0,current_step=0`执行persistent cold；首次commit走10个microsteps，第二次commit走2个microsteps，并始终复用同一fixed noise。
+- 冻结显存策略：在最多12-step的cold生命周期内采样可微监督点，此前步骤以`no_grad`真实推进并产生detached off-path state；可微步使用现有endpoint-stabilizing loss。训练与runtime必须共用Dynamic Future、Euler update、commit与rebase原语。
+- 明确标记该合同为`LOCKED / NOT_IMPLEMENTED`。当前代码仍是随机beta的单步ideal cold replay，本轮没有修改模型、solver、配置、loss或checkpoint。
+
+改动理由：
+
+- `000021/seed4322`在完整GT root5下从token 0开始出现反脚mode；只在第1个token commit后换GT仍有`87.18°`feet/root误差，而前2个committed GT tokens或active阶段钳制第1个GT token可将其恢复到`7.69°/8.76°`。这说明错误在cold active生命周期内形成并传播，commit后修补已经偏晚。
+- 正常sample/seed保持正常，且坏例的平均latent RMSE并不更高；问题不能由继续降低全维latent loss解释。
+- direct position和child-global FK在坏例中同时反向，主要定位为Body latent整体lower-body mode，而不是单一VAE输出头符号冲突。当前parent-global FK公式又尚未满足HumanML rotation合同，不能直接开启FK loss替代solver-state分布修复。
+- 当前训练只覆盖ideal cold和`H>0` persistent rollout，缺失实际部署首次生成的`H=0` persistent off-path状态；冻结的新合同直接补齐该分布空洞，同时保留ideal bridge锚定原flow目标。
+
+验证：
+
+- 本轮只修改Markdown设计与开发日志，未修改或运行Python代码。
+- 通过`rg`复核训练文档已同时保留“当前实现”和“冻结待实现”两种状态，避免把设计误写成已落地功能。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 尚未实现`H=0` persistent cold solver、生命周期监督点采样、对应DDP静态图与训练/runtime parity测试。
+- 实现后需要用相同`000021/001168`固定噪声矩阵复测，并报告cold首token feet/root反向比例、stream FID、吞吐和峰值显存。
+
+## 2026-07-21 · H=0 Persistent Cold Rollout实现
+
+改动类型：LDF训练solver / cold curriculum / 配置 / 单元测试 / 设计文档
+
+实际改动内容：
+
+- 为`self_forcing.cold_start`增加`persistent_probability`与`rollout_commits`，正式配置冻结为`0.5/2`；已有`cold_start_replay=0.1`继续决定全训练过程中的cold global-batch比例。
+- 新增rank-independent `ColdStartObjective`采样：cold batch以1:1选择ideal或persistent；persistent在首次10步与第二commit 2步组成的12-step生命周期内均匀选择一个可微microstep。
+- 扩展统一persistent solver以支持两种起点：`H>0`继续从steady commit boundary开始，`H=0`严格从`current_step=0`和同一fixed Gaussian source开始。persistent路径只在起点调用一次`mix_fixed_noise()`，随后连续复用`LDF.denoise_step()`输出。
+- persistent cold在第10步完成首次commit并执行与runtime相同的heading投影、token提取和translation rebase；第二commit继续走2步。可微监督点之前的步骤均在`no_grad`下真实推进，到监督点后结束本次训练rollout，避免保留完整12-step反向图。
+- `build_ldf_rollout_step()`的loss mask改为模型实际`generation_mask`，因此early cold按`1,1,2,2,3,3,4,4,5,5`可见性监督，而不是提前监督全部5个active tokens。
+- DataLoader最短样本预算同时考虑普通课程最大K和persistent cold commit数；窗口plan仅允许显式true-cold override在K>1时使用H=0，普通随机K>1采样仍保持H>=1。
+- 更新正式远端/共享base配置、训练方法和可执行配置文档。
+
+改动理由：
+
+- Body cold-prefix oracle已定位到第一个active生命周期内的错误lower-body mode及其传播，而当前训练此前只覆盖ideal cold与`H>0` persistent state。
+- 只增加普通静态loss不能让模型看到自身前序Euler更新产生的部署态输入；新的persistent cold直接补齐`H=0` solver-state分布，同时用50% ideal cold保留原flow vector field锚点。
+- 生命周期监督点采样使早期、中期、commit前和第二commit状态都能获得梯度，而不承担完整BPTT的激活显存。
+
+验证：
+
+- LDF self-forcing与Lightning训练定向测试：`67 passed`。
+- 新测试确认：cold plan可为H=0预留2 commits；ideal/persistent选择确定；source只混合一次；microstep序列严格为10+2；前11步无梯度而选中步有梯度；early监督点按真实可见mask归约；Dynamic Future按当前可见末端从token 1逐步移动到token 5；第二commit完成commit/rebase并可反传。
+- 全仓测试：`317 passed, 3 failed`。三项失败均为本轮前已有的工作区漂移：远端正式配置当前显式resume 120k但旧测试期待null，以及`prepare_training_assets`两项测试读取当前不含`root_statistics`的配置。
+- 相关Python文件`py_compile`通过。
+
+涉及文件：
+
+- `utils/training/ldf/window.py`
+- `utils/training/ldf/steps.py`
+- `utils/training/ldf/solver.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/data.py`
+- `configs/ldf_base.yaml`
+- `configs/ldf.yaml`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/05_TRAINING_CONFIG.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 尚未用真实GPU checkpoint启动persistent cold微调；必须复用`000021/001168`固定噪声实验矩阵测量反脚率、FID、吞吐与峰值显存。
+- 当前策略每个persistent cold batch只对一个生命周期点保留梯度；是否需要phase重加权或decoded foot auxiliary应等待首轮微调结果，不能同时引入。

@@ -150,9 +150,13 @@ loss:
   root_heading_cosine_weight: 0.1
   root_heading_vector_weight: 0.1
   root_heading_beta_min: 0.1
+  root_heading_cosine_min_norm: 0.05
 
 self_forcing:
   cold_start_replay: 0.1
+  cold_start:
+    persistent_probability: 0.5
+    rollout_commits: 2
   k_schedule:
     - [0, 1]
     - [100000, 2]

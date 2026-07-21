@@ -26,7 +26,7 @@ from utils.training.ldf.lightning_module import (
     _file_sha256,
 )
 from utils.training.ldf.solver import run_training_solver
-from utils.training.ldf.window import sample_window_plan
+from utils.training.ldf.window import ColdStartObjective, sample_window_plan
 from utils.training.ldf.text import create_text_embedding_content_id
 
 
@@ -195,6 +195,10 @@ def test_cold_start_replay_bypasses_the_unified_k_curriculum(
 ):
     cfg = _make_config(tmp_path)
     cfg.self_forcing.cold_start_replay = 0.1
+    cfg.self_forcing.cold_start = {
+        "persistent_probability": 0.5,
+        "rollout_commits": 2,
+    }
     module = LDFLightningModule(cfg).train()
     batch = _make_step_batch()
     batch["cold_start_replay"] = True
@@ -205,6 +209,10 @@ def test_cold_start_replay_bypasses_the_unified_k_curriculum(
     monkeypatch.setattr(
         "utils.training.ldf.lightning_module.sample_rollout_steps",
         fail_if_sampled,
+    )
+    monkeypatch.setattr(
+        "utils.training.ldf.lightning_module.sample_cold_start_objective",
+        lambda **_kwargs: ColdStartObjective(False, 1, None),
     )
     from utils.training.ldf import lightning_module as ldf_lightning
 
@@ -220,6 +228,9 @@ def test_cold_start_replay_bypasses_the_unified_k_curriculum(
 
     def record_rollout(*args, **kwargs):
         seen["cold_denoise_step"] = kwargs.get("cold_denoise_step")
+        seen["cold_persistent_microstep"] = kwargs.get(
+            "cold_persistent_microstep"
+        )
         return original_rollout(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -235,6 +246,54 @@ def test_cold_start_replay_bypasses_the_unified_k_curriculum(
     assert torch.equal(seen["phase_offset"], torch.zeros(1))
     assert seen["cold_denoise_step"].shape == (1,)
     assert 0 <= int(seen["cold_denoise_step"][0]) < module.model.noise_steps
+    assert seen["cold_persistent_microstep"] is None
+    assert torch.isfinite(losses["total"])
+
+
+def test_cold_start_replay_can_select_the_persistent_h_zero_solver(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _make_config(tmp_path)
+    cfg.self_forcing.cold_start_replay = 0.1
+    cfg.self_forcing.cold_start = {
+        "persistent_probability": 0.5,
+        "rollout_commits": 2,
+    }
+    module = LDFLightningModule(cfg).train()
+    batch = _make_step_batch()
+    batch["cold_start_replay"] = True
+    monkeypatch.setattr(
+        "utils.training.ldf.lightning_module.sample_cold_start_objective",
+        lambda **_kwargs: ColdStartObjective(True, 2, 1),
+    )
+
+    from utils.training.ldf import lightning_module as ldf_lightning
+
+    original_plan = ldf_lightning.sample_window_plan
+    original_solver = ldf_lightning.run_training_solver
+    seen = {}
+
+    def record_plan(*args, **kwargs):
+        seen.update(kwargs)
+        return original_plan(*args, **kwargs)
+
+    def record_solver(*args, **kwargs):
+        seen["cold_denoise_step"] = kwargs.get("cold_denoise_step")
+        seen["cold_persistent_microstep"] = kwargs.get(
+            "cold_persistent_microstep"
+        )
+        return original_solver(*args, **kwargs)
+
+    monkeypatch.setattr(ldf_lightning, "sample_window_plan", record_plan)
+    monkeypatch.setattr(ldf_lightning, "run_training_solver", record_solver)
+    losses = module._step(batch, is_training=True)
+
+    assert seen["rollout_steps"] == 2
+    assert seen["initial_history_tokens"] == 0
+    assert seen["allow_cold_start"] is True
+    assert seen["cold_denoise_step"] is None
+    assert seen["cold_persistent_microstep"] == 1
     assert torch.isfinite(losses["total"])
 
 
@@ -636,6 +695,7 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         "root_heading_vector_weighted",
         "root_heading_raw_norm_mean",
         "root_heading_raw_norm_p10",
+        "root_heading_low_norm_ratio",
         "root_heading_antipodal_ratio",
         "root_boundary_displacement",
         "total",

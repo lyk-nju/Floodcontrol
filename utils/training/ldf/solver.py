@@ -155,16 +155,19 @@ def run_persistent_rollout(
     previous_root_frame: torch.Tensor | None,
     previous_root_valid_mask: torch.Tensor | None,
     condition_builder: ConditionBuilder,
+    supervised_microstep: int | None = None,
 ):
-    """Roll K commits while preserving actual root and latent solver states.
+    """Evolve a steady or true-cold persistent solver state.
 
-    Conditions are compiled once per commit.  All denoise steps except the last
-    step of the final commit run under ``no_grad``; the final prediction is
-    returned for the endpoint-stabilizing loss.
+    Conditions are compiled once per commit.  Steady-state rollouts supervise
+    the final update as before.  A true-cold rollout starts at diffusion step
+    zero and may supervise any microstep in its first two-commit lifecycle;
+    preceding updates run under ``no_grad`` and are never reconstructed from an
+    ideal bridge.
     """
 
-    if plan.rollout_steps <= 1:
-        raise ValueError("persistent rollout requires K > 1")
+    if plan.rollout_steps <= 0:
+        raise ValueError("persistent rollout requires at least one commit")
     noise_steps = int(model.noise_steps)
     active_tokens = int(plan.active_tokens)
     if active_tokens != int(model.chunk_size):
@@ -173,17 +176,43 @@ def run_persistent_rollout(
         raise ValueError(
             "persistent rollout currently requires noise_steps divisible by active_tokens"
         )
-    if bool((plan.initial_history_tokens <= 0).any()):
-        raise ValueError("persistent rollout requires at least one real history token")
     if bool((plan.phase_offset != 0).any()):
         raise ValueError("persistent rollout must start at a runtime commit boundary")
 
     device = clean_motion.root_motion.device
     history = plan.initial_history_tokens.to(device=device, dtype=torch.long)
+    cold_mask = history == 0
+    if bool(cold_mask.any()) and not bool(cold_mask.all()):
+        raise ValueError("persistent rollout cannot mix cold and steady samples")
+    is_cold = bool(cold_mask.all())
+    if is_cold:
+        if bool((plan.source_start_token != 0).any()):
+            raise ValueError("persistent cold rollout requires the true sequence start")
+        if previous_root_valid_mask is not None and bool(
+            previous_root_valid_mask.any()
+        ):
+            raise ValueError("persistent cold rollout requires no previous root")
+    elif supervised_microstep is not None:
+        raise ValueError("supervised_microstep is only valid for persistent cold")
+    elif plan.rollout_steps <= 1:
+        raise ValueError("steady persistent rollout requires K > 1")
+
     steps_per_commit = noise_steps // active_tokens
-    current_step = (
-        (history - 1 + active_tokens) * steps_per_commit
-    )
+    microsteps_per_commit = [steps_per_commit] * int(plan.rollout_steps)
+    if is_cold:
+        current_step = torch.zeros_like(history)
+        microsteps_per_commit[0] = noise_steps
+    else:
+        current_step = (history - 1 + active_tokens) * steps_per_commit
+    total_microsteps = sum(microsteps_per_commit)
+    if supervised_microstep is None:
+        differentiable_microstep = total_microsteps - 1
+    else:
+        differentiable_microstep = int(supervised_microstep)
+        if not 0 <= differentiable_microstep < total_microsteps:
+            raise ValueError(
+                "persistent cold supervised_microstep lies outside its lifecycle"
+            )
     beta = _scheduler_beta(
         model=model,
         token_length=clean_motion.token_length,
@@ -214,8 +243,10 @@ def run_persistent_rollout(
     replacements: list[HybridMotion] = []
     final_step: LDFTrainingStep | None = None
     final_prediction = None
+    flat_microstep = 0
+    stop_after_step = False
 
-    for commit_offset in range(plan.rollout_steps):
+    for commit_offset, commit_microsteps in enumerate(microsteps_per_commit):
         history_end = history + int(commit_offset)
         view = _make_view(
             source_start_token=plan.source_start_token.to(device=device),
@@ -229,7 +260,7 @@ def run_persistent_rollout(
         if not isinstance(condition, LDFCondition):
             raise TypeError("condition_builder must return LDFCondition")
 
-        for denoise_offset in range(steps_per_commit):
+        for denoise_offset in range(commit_microsteps):
             next_step = state.current_denoise_step + 1
             next_beta = _scheduler_beta(
                 model=model,
@@ -254,11 +285,8 @@ def run_persistent_rollout(
                 previous_root_valid_mask=state.previous_root_valid_mask,
                 condition=condition,
             )
-            is_final = (
-                commit_offset == plan.rollout_steps - 1
-                and denoise_offset == steps_per_commit - 1
-            )
-            if is_final:
+            is_supervised = flat_microstep == differentiable_microstep
+            if is_supervised:
                 next_motion, prediction = model.denoise_step(
                     training_step.inputs,
                     next_beta,
@@ -276,16 +304,24 @@ def run_persistent_rollout(
             state.noisy_motion = next_motion
             state.beta = next_beta
             state.current_denoise_step = next_step
+            flat_microstep += 1
+            if is_supervised:
+                stop_after_step = True
+                break
 
-        commit_index = history_end
-        state, committed = _commit_and_rebase(
-            model,
-            state,
-            token_index=commit_index,
-            next_motion=state.noisy_motion,
-            next_beta=state.beta,
-        )
-        replacements.append(committed)
+        reached_commit_boundary = denoise_offset == commit_microsteps - 1
+        if reached_commit_boundary:
+            commit_index = history_end
+            state, committed = _commit_and_rebase(
+                model,
+                state,
+                token_index=commit_index,
+                next_motion=state.noisy_motion,
+                next_beta=state.beta,
+            )
+            replacements.append(committed)
+        if stop_after_step:
+            break
 
     if final_step is None or final_prediction is None:
         raise RuntimeError("persistent rollout did not produce a differentiable final step")
@@ -301,6 +337,7 @@ def run_training_solver(
     previous_root_valid_mask: torch.Tensor | None,
     condition_builder: ConditionBuilder,
     cold_denoise_step: torch.Tensor | None = None,
+    cold_persistent_microstep: int | None = None,
 ) -> LDFSolverResult:
     """Run the canonical K=1, cold-start or persistent K>1 objective."""
 
@@ -310,6 +347,9 @@ def run_training_solver(
         raise ValueError("clean motion does not match the rollout span")
     if clean_motion.batch_size != plan.root_noise.shape[0]:
         raise ValueError("clean motion does not match the rollout batch")
+
+    if cold_denoise_step is not None and cold_persistent_microstep is not None:
+        raise ValueError("cold objective cannot be both ideal and persistent")
 
     if cold_denoise_step is not None:
         if plan.rollout_steps != 1 or not bool(plan.cold_start_mask.all()):
@@ -331,6 +371,27 @@ def run_training_solver(
             prediction=model(training_step.inputs),
             clean_motion=clean_motion,
             replacements=(),
+        )
+
+    if cold_persistent_microstep is not None:
+        if plan.rollout_steps < 1 or not bool(plan.cold_start_mask.all()):
+            raise ValueError("persistent cold requires an all-H=0 plan")
+        final_step, prediction, state, replacements = run_persistent_rollout(
+            model,
+            clean_motion,
+            plan,
+            previous_root_frame=previous_root_frame,
+            previous_root_valid_mask=previous_root_valid_mask,
+            condition_builder=condition_builder,
+            supervised_microstep=cold_persistent_microstep,
+        )
+        return LDFSolverResult(
+            final_step=final_step,
+            prediction=prediction,
+            clean_motion=state.clean_motion,
+            replacements=replacements,
+            is_rollout=True,
+            persistent_state=state,
         )
 
     if plan.rollout_steps > 1:

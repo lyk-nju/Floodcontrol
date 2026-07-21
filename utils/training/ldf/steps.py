@@ -333,11 +333,6 @@ def build_ldf_rollout_step(
     timeline = source_start[:, None] + positions
     valid = positions < span_count[:, None]
     active_end = history_end + int(active_tokens)
-    loss_mask = (
-        valid
-        & (positions >= history_end[:, None])
-        & (positions < active_end[:, None])
-    )
     rope = positions - history_end[:, None]
     view = LDFStepView(
         step_index=int(step_index),
@@ -360,6 +355,10 @@ def build_ldf_rollout_step(
         previous_root_frame=previous_root_frame,
         previous_root_valid_mask=previous_root_valid_mask,
     )
+    # At a steady-state commit boundary all C active tokens are visible.  A
+    # true cold rollout instead reveals them progressively (1,1,2,...,5,5 for
+    # C=5/N=10), so its endpoint loss must follow the exact model query mask.
+    loss_mask = inputs.generation_mask & valid
     return LDFTrainingStep(
         inputs=inputs,
         target_velocity=flow_velocity_target(clean_motion, noise),

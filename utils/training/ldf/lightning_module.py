@@ -32,6 +32,7 @@ from utils.training.ldf.losses import compute_offpath_loss, compute_velocity_los
 from utils.training.ldf.metrics import compute_heading_metrics
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import (
+    sample_cold_start_objective,
     sample_rollout_steps,
     sample_window_plan,
 )
@@ -329,10 +330,25 @@ class LDFLightningModule(BasicLightningModule):
         cold_start_replay = bool(
             is_training and batch.get("cold_start_replay", False)
         )
+        cold_objective = None
         if cold_start_replay:
             if rollout_steps_override not in (None, 1):
                 raise ValueError("cold-start replay requires K=1")
-            rollout_steps = 1
+            if self_forcing is None:
+                raise ValueError("cold-start replay requires self_forcing config")
+            cold_config = self_forcing.get("cold_start") or {}
+            cold_objective = sample_cold_start_objective(
+                persistent_probability=float(
+                    cold_config.get("persistent_probability", 0.0)
+                ),
+                rollout_commits=int(cold_config.get("rollout_commits", 1)),
+                noise_steps=int(self.model.noise_steps),
+                active_tokens=int(self.model.chunk_size),
+                generator=_create_curriculum_generator(
+                    int(self.cfg.get("seed", 0)), int(self.global_step)
+                ),
+            )
+            rollout_steps = int(cold_objective.rollout_commits)
             initial_history_tokens = 0
         elif (
             rollout_steps_override is None
@@ -368,16 +384,28 @@ class LDFLightningModule(BasicLightningModule):
                 "training generation window must equal the model active chunk size"
             )
         cold_denoise_step = None
+        cold_persistent_microstep = None
         cold_phase_offset = None
         if cold_start_replay:
             root_motion = batch["root_motion"]
-            cold_denoise_step = torch.randint(
-                0,
-                int(self.model.noise_steps),
-                (int(root_motion.shape[0]),),
-                device=root_motion.device,
-                generator=generator,
-            )
+            if cold_objective is None:
+                raise RuntimeError("cold objective was not sampled")
+            if cold_objective.persistent:
+                if cold_objective.supervised_microstep is None:
+                    raise RuntimeError(
+                        "persistent cold objective has no supervised microstep"
+                    )
+                cold_persistent_microstep = int(
+                    cold_objective.supervised_microstep
+                )
+            else:
+                cold_denoise_step = torch.randint(
+                    0,
+                    int(self.model.noise_steps),
+                    (int(root_motion.shape[0]),),
+                    device=root_motion.device,
+                    generator=generator,
+                )
             # The ordinary phase_offset describes only a steady-state commit.
             # Cold replay owns its runtime denoise phase explicitly instead.
             cold_phase_offset = torch.zeros(
@@ -474,6 +502,7 @@ class LDFLightningModule(BasicLightningModule):
             ),
             condition_builder=condition_builder,
             cold_denoise_step=cold_denoise_step,
+            cold_persistent_microstep=cold_persistent_microstep,
         )
         if validate_contract:
             result.final_step.inputs.validate()
@@ -505,6 +534,9 @@ class LDFLightningModule(BasicLightningModule):
                 root_heading_beta_min=float(
                     weights.get("root_heading_beta_min", 0.1)
                 ),
+                root_heading_cosine_min_norm=float(
+                    weights.get("root_heading_cosine_min_norm", 0.05)
+                ),
             )
         return compute_velocity_loss(
             result.prediction,
@@ -520,6 +552,9 @@ class LDFLightningModule(BasicLightningModule):
                 weights.get("root_heading_vector_weight", 0.0)
             ),
             root_heading_beta_min=float(weights.get("root_heading_beta_min", 0.1)),
+            root_heading_cosine_min_norm=float(
+                weights.get("root_heading_cosine_min_norm", 0.05)
+            ),
         )
 
     def _should_observe_heading(self, *, is_training: bool) -> bool:

@@ -768,7 +768,12 @@ def create_dataloaders(
         max_steps=int(cfg.trainer.max_steps),
     )
     cold_start_replay = float(self_forcing.get("cold_start_replay", 0.0))
-    maximum_rollout = max(rollout_steps for _, rollout_steps in schedule)
+    cold_config = self_forcing.get("cold_start") or {}
+    cold_rollout_commits = int(cold_config.get("rollout_commits", 1))
+    maximum_rollout = max(
+        max(rollout_steps for _, rollout_steps in schedule),
+        cold_rollout_commits,
+    )
     if train_dataset is not None:
         train_dataset = MinimumFrameDataset(
             train_dataset,
