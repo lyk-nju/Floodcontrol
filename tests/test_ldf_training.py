@@ -631,6 +631,12 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         "anchor_root_offpath_heading",
         "latent_body_offpath_endpoint",
         "root_heading_cosine",
+        "root_heading_cosine_weighted",
+        "root_heading_vector",
+        "root_heading_vector_weighted",
+        "root_heading_raw_norm_mean",
+        "root_heading_raw_norm_p10",
+        "root_heading_antipodal_ratio",
         "root_boundary_displacement",
         "total",
     }
@@ -753,7 +759,8 @@ def test_ldf_resume_accepts_changed_training_and_cfg_policy(tmp_path):
     resumed_cfg.self_forcing.teacher_replay = {2: 0.75}
     resumed_cfg.self_forcing.cold_start_replay = 0.25
     resumed_cfg.loss.root_weight = 3.0
-    resumed_cfg.loss.root_heading_weight = 0.2
+    resumed_cfg.loss.root_heading_cosine_weight = 0.2
+    resumed_cfg.loss.root_heading_vector_weight = 0.3
     resumed_cfg.model.params.cfg_mode = "separated"
     resumed_cfg.model.params.cfg_scale_text = 2.0
     resumed_cfg.model.params.cfg_scale_constraint = 3.0

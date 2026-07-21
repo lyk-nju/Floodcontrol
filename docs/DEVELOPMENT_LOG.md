@@ -5154,3 +5154,88 @@
 
 - Root heading仍是当前首要优化目标；heading auxiliary虽然使平均Root/GT误差下降，但到160k仍有`72.40 deg`，没有解决噪声相关的错误mode。
 - 对000021/seed4322在完整GT root5下仍出现的Body/feet反向mode，需要作为独立Body Stage消融处理，不能再归因给RootTransformer。
+
+## 2026-07-21 · Root Experiment统一Joint CFG并重跑三Checkpoint
+
+改动类型：评测CFG合同统一 / GPU全量重跑 / Joint-Separated对比
+
+实际改动内容：
+
+- 将`debug/root_experiment.py`默认CFG从`separated`改为`joint`；`separated`仅保留为显式历史诊断选项。
+- 更新debug README，将joint声明为Root消融的正式模式；训练/dense-XZ正式配置原本已经使用joint，因此未修改模型或训练配置。T2M仍保持此前单独冻结的nocfg合同。
+- 使用与上一轮完全相同的两个样本、四个旋转、三个seed、初始Root/Body噪声、完整stream长度及GT-root5硬替换合同，分别重跑`step_130000.ckpt`、`step_130000_headingloss.ckpt`和`step_160000.ckpt`。
+- 将三组joint结果写入`debug/root_experiment1_joint`，每个checkpoint 48 runs，共144个完整视频；生成joint内部汇总及与上一轮separated结果的对照报告。
+
+改动理由：
+
+- separated CFG将text与constraint分支差分独立相加，可能引入未联合学习的组合误差；当前正式dense-XZ任务应使用模型训练时的joint text+constraint语义。
+- 保持完整配对矩阵不变，才能将结果差异唯一归因于CFG组合方式，而不是噪声、样本或旋转变化。
+
+验证：
+
+- 三个joint manifest均记录`cfg_mode: joint`与`root_intervention: full_gt_root5_every_microstep_and_commit`。
+- joint普通Root分支的Root/GT heading误差相较separated分别从`97.03→72.96 deg`、`85.21→52.10 deg`、`72.40→54.27 deg`；XZ ADE分别从`0.59→0.50 cm`、`0.56→0.49 cm`、`0.41→0.34 cm`。
+- joint普通Root分支的feet/root均值相较separated分别从`50.94→32.77 deg`、`46.08→25.82 deg`、`68.79→31.50 deg`，说明joint明显减小了分支组合误差。
+- 即使使用joint，普通Root的平均heading误差仍为`52.10–72.96 deg`，因此Root heading瓶颈结论不变；joint改善了结果但没有解决错误mode。
+- 完整GT-root5分支在joint与separated间数值一致。原因是Body Stage不读取raw XZ constraint；Root被GT完整替换后，Body在两种模式下获得相同文本及clean-root-derived条件。残余失败仍只集中于`000021/seed4322`的Body latent mode。
+- `find debug/root_experiment1_joint -name motion.mp4 -type f | wc -l`返回`144`。
+- `debug/test_root_experiment.py`：5项通过；joint comparison合同校验、`py_compile`和`git diff --check`通过。
+
+涉及文件：
+
+- `debug/root_experiment.py`（本地ignored实验代码）
+- `debug/README.md`（本地ignored说明）
+- `debug/root_experiment1_joint/`（本地ignored joint实验与汇总）
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 后续Root/dense-XZ诊断统一使用joint；历史separated目录仅用于本次CFG消融对照。
+- Root heading仍需新的建模或监督改进；joint只移除了额外的CFG组合误差。
+
+## 2026-07-21 · Root Heading Beta补偿与Antipodal向量监督
+
+改动类型：LDF训练loss / 配置合同 / 单元测试 / 设计文档
+
+实际改动内容：
+
+- 将原单一`root_heading_weight`拆为`root_heading_cosine_weight`、`root_heading_vector_weight`和`root_heading_beta_min`；正式HumanML与共享base配置默认分别为`0.1/0.1/0.1`。
+- heading辅助不再读取已经单位圆投影的`prediction.clean_root_motion`，而是按唯一endpoint公式`raw_x0=x_current+beta*v_pred`恢复投影前normalized root，再用root statistics转到physical heading。
+- cosine与raw-vector SmoothL1均乘`1/max(beta,root_heading_beta_min)`，抵消endpoint恢复到velocity的一次beta链式缩放；raw-vector项直接回归GT单位heading，因此精确180度反向时仍有非零梯度并同时约束投影前向量模长。
+- 保留现有ideal flow-v MSE、K>1 off-path endpoint平方beta补偿和Root/Body权重，不修改solver、persistent rollout、commit、CFG或checkpoint参数结构。
+- 新增未加权/加权cosine与vector日志，以及raw heading norm mean/p10和`dot<-0.9` antipodal ratio；未加权指标用于跨checkpoint比较，加权指标反映实际训练目标。
+- `train_ldf.py`启动时校验两个新权重非负且finite，并要求`root_heading_beta_min`为正数。
+- 更新LDF训练设计文档，明确两项heading辅助的职责、公式及其与主flow/off-path loss的边界。
+
+改动理由：
+
+- K=2最终可微denoise step的五个active beta约为`0.1/0.3/0.5/0.7/0.9`，旧endpoint cosine对即将commit token的velocity梯度只剩约10%；显式倒beta权重恢复各phase相近的辅助梯度。
+- `1-cos`在精确antipodal方向的方向梯度为零，单纯提高旧loss权重无法消除150–180度危险mode；投影前raw-vector SmoothL1提供独立的非零逃逸梯度。
+- 公式一类的`v+epsilon`恢复只对ideal bridge成立，不能安全用于K>1 off-path state；本实现统一使用对ideal与persistent state均合法的`x_current+beta*v_pred`。
+
+验证：
+
+- 新增测试确认：90度误差同时产生cosine/vector梯度；精确180度时cosine梯度为零而vector梯度非零；beta为`0.1`和`0.9`时补偿后的velocity梯度在`1e-6`容差内一致；raw endpoint而非已投影prediction被监督。
+- LDF self-forcing、training与migration定向测试（排除已知过期正式配置冻结断言）：`103 passed, 1 deselected`。
+- 全仓测试：`307 passed, 3 failed`；三项失败均为本轮前已存在的配置/工具漂移：正式`ldf.yaml`已设置120k的resume/test checkpoint且`body_weight=1`，旧测试仍期待null与3；training-assets工具仍从不含`root_statistics`的当前配置读取该字段。
+- `py_compile`通过：loss、Lightning接线、训练入口及相关测试文件。
+- `git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/ldf/losses.py`
+- `utils/training/ldf/lightning_module.py`
+- `train_ldf.py`
+- `configs/ldf.yaml`
+- `configs/ldf_base.yaml`
+- `tests/test_ldf_self_forcing.py`
+- `tests/test_ldf_training.py`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 尚未启动新的GPU微调；恢复120k后应分别跟踪weighted/unweighted heading loss、raw norm、antipodal ratio、Root/GT heading和joint/separated CFG结果。
+- 新loss解决训练侧beta衰减与antipodal零梯度，不解决separated CFG在线性组合cos/sin velocity时可能产生的圆周外插不稳定；该问题仍需独立消融。
+- 全仓三项既有失败应由后续配置/asset工具一致性任务处理，本轮未为通过测试而覆盖当前实验resume与loss配置。

@@ -496,8 +496,14 @@ class LDFLightningModule(BasicLightningModule):
                 root_boundary_weight=float(
                     weights.get("root_boundary_weight", 0.0)
                 ),
-                root_heading_weight=float(
-                    weights.get("root_heading_weight", 0.0)
+                root_heading_cosine_weight=float(
+                    weights.get("root_heading_cosine_weight", 0.0)
+                ),
+                root_heading_vector_weight=float(
+                    weights.get("root_heading_vector_weight", 0.0)
+                ),
+                root_heading_beta_min=float(
+                    weights.get("root_heading_beta_min", 0.1)
                 ),
             )
         return compute_velocity_loss(
@@ -507,7 +513,13 @@ class LDFLightningModule(BasicLightningModule):
             root_std=self.model.root_std,
             root_weight=float(weights.get("root_weight", 1.0)),
             body_weight=float(weights.get("body_weight", 1.0)),
-            root_heading_weight=float(weights.get("root_heading_weight", 0.0)),
+            root_heading_cosine_weight=float(
+                weights.get("root_heading_cosine_weight", 0.0)
+            ),
+            root_heading_vector_weight=float(
+                weights.get("root_heading_vector_weight", 0.0)
+            ),
+            root_heading_beta_min=float(weights.get("root_heading_beta_min", 0.1)),
         )
 
     def _should_observe_heading(self, *, is_training: bool) -> bool:

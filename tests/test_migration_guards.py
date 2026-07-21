@@ -104,7 +104,9 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.loss.rollout_weight == pytest.approx(1.0)
     assert cfg.loss.offpath_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_boundary_weight == pytest.approx(0.0)
-    assert cfg.loss.root_heading_weight == pytest.approx(0.1)
+    assert cfg.loss.root_heading_cosine_weight == pytest.approx(0.1)
+    assert cfg.loss.root_heading_vector_weight == pytest.approx(0.1)
+    assert cfg.loss.root_heading_beta_min == pytest.approx(0.1)
     assert cfg.loss.body_weight == pytest.approx(3.0)
     assert cfg.model.params.cfg_mode == "joint"
     assert cfg.root_statistics.window_tokens == 50
@@ -351,6 +353,13 @@ def test_training_entry_rejects_invalid_constraint_dropout():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_dropout = 1.1
     with pytest.raises(ValueError, match="constraint_dropout"):
+        _validate_training_config(cfg)
+
+
+def test_training_entry_rejects_invalid_heading_loss_beta_floor():
+    cfg = load_config(str(LOCAL_LDF_CONFIG))
+    cfg.config.loss.root_heading_beta_min = 0.0
+    with pytest.raises(ValueError, match="root_heading_beta_min"):
         _validate_training_config(cfg)
 
 

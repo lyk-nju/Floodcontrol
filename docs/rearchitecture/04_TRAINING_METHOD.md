@@ -66,6 +66,8 @@ L_offpath = SmoothL1(x0_hat, x0) / max(beta, 0.1)^2
 
 root与latent分别按现有权重归约，`rollout_weight`控制整条off-path监督。该目标在ideal bridge上退化到原v-predict误差，在off-path区域是显式的endpoint-stabilizing extension；`offpath_beta_min`避免小beta放大异常target。physical XZ boundary displacement辅助loss覆盖history→active、active内部及Patch4边界，但`root_boundary_weight`默认0，不改变正式主loss。
 
+Root heading额外使用两项互补的physical-space监督。两项都从投影前endpoint `raw_x0=x_current+beta*v_pred`读取heading，并乘`1/max(beta,root_heading_beta_min)`，抵消endpoint恢复对velocity梯度的一次beta缩放：`root_heading_cosine_weight`控制单位圆角度loss，`root_heading_vector_weight`控制raw heading到GT单位向量的SmoothL1。后者在精确180度反向mode仍有非零梯度并约束投影前模长；cosine保留圆周几何。训练日志同时保存未加权/加权loss、raw norm均值与p10及`dot<-0.9`的antipodal ratio。现有ideal flow-v和K>1 beta平方补偿off-path主loss保持不变；heading两项是辅助监督，不替代主目标。
+
 Validation整轮只在开始时把EMA shadow换入模型一次，所有loss probe和inline generation复用这组参数，并在epoch-end恢复训练参数。临时`collected_params`恢复后立即释放且不进入checkpoint；异常由统一callback回滚，checkpoint若在EMA参数仍激活时触发会fail-fast，避免把EMA权重误写成主训练state。
 
 计算层保持相同可见性语义但压缩无效工作：Root在有future约束时向量化打包`visible motion | future root`，无future时只运行batch内最大visible prefix；Body同样只运行最大visible prefix并把尾部补零。FlashAttention varlen打包与恢复使用布尔prefix mask，不再逐row执行Python scalar读取。pure-noise frontier仍保留在persistent state且不进入本步Transformer，compact只删除已被mask排除的pointwise/FFN计算，不改变non-causal visible attention。

@@ -90,7 +90,8 @@ def _validate_training_config(cfg) -> None:
         "body_weight",
         "rollout_weight",
         "root_boundary_weight",
-        "root_heading_weight",
+        "root_heading_cosine_weight",
+        "root_heading_vector_weight",
     ):
         value = float(loss.get(name, 0.0))
         if not math.isfinite(value) or value < 0.0:
@@ -98,6 +99,11 @@ def _validate_training_config(cfg) -> None:
     beta_min = float(loss.get("offpath_beta_min", 0.1))
     if not math.isfinite(beta_min) or beta_min <= 0.0:
         raise ValueError("loss.offpath_beta_min must be finite and positive")
+    heading_beta_min = float(loss.get("root_heading_beta_min", 0.1))
+    if not math.isfinite(heading_beta_min) or heading_beta_min <= 0.0:
+        raise ValueError(
+            "loss.root_heading_beta_min must be finite and positive"
+        )
     sampling = training.get("constraint_sampling") or {}
     probabilities = [
         float(sampling.get(name, -1.0))
