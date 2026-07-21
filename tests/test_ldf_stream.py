@@ -5,6 +5,8 @@ import torch
 from models.diffusion_forcing_wan import LDF
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFPrediction
 from utils.training.ldf.flow import mix_fixed_noise
+from utils.training.ldf.solver import run_persistent_rollout
+from utils.training.ldf.window import sample_window_plan
 
 
 def make_model():
@@ -189,6 +191,136 @@ def test_stream_updates_both_fields_and_snapshot_restore_is_deterministic():
     assert torch.equal(committed_a.root_motion, committed_b.root_motion)
     assert torch.equal(committed_a.latent_motion, committed_b.latent_motion)
     assert torch.equal(continued.noisy_motion.root_motion, replayed.noisy_motion.root_motion)
+
+
+def test_real_ldf_persistent_cold_matches_two_runtime_commits():
+    torch.manual_seed(19)
+    model = make_model().eval()
+    tokens = 6
+    clean = HybridMotion(
+        torch.randn(1, tokens, 4, 5),
+        torch.randn(1, tokens, model.latent_dim),
+    )
+    clean.root_motion[..., 3] = 1.0
+    clean.root_motion[..., 4] = 0.0
+    plan = sample_window_plan(
+        {
+            "root_motion": clean.root_motion.flatten(1, 2),
+            "source_start_token": torch.zeros(1, dtype=torch.long),
+            "span_token_count": torch.full((1,), tokens, dtype=torch.long),
+            "context_token_count": torch.zeros(1, dtype=torch.long),
+            "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
+        },
+        active_tokens=model.chunk_size,
+        rollout_steps=2,
+        latent_dim=model.latent_dim,
+        initial_history_tokens=0,
+        phase_offset=torch.zeros(1),
+        allow_cold_start=True,
+        generator=torch.Generator().manual_seed(23),
+    )
+    condition = stream_condition(tokens)
+
+    with torch.no_grad():
+        _, _, training_first_state, training_first_commits = run_persistent_rollout(
+            model,
+            clean,
+            plan,
+            previous_root_frame=None,
+            previous_root_valid_mask=None,
+            condition_builder=lambda _view, _clean: condition,
+            supervised_microstep=model.noise_steps - 1,
+        )
+        _, _, training_state, training_commits = run_persistent_rollout(
+            model,
+            clean,
+            plan,
+            previous_root_frame=None,
+            previous_root_valid_mask=None,
+            condition_builder=lambda _view, _clean: condition,
+            supervised_microstep=5,
+        )
+        runtime_state = model.init_stream_state(
+            batch_size=1,
+            window_tokens=tokens,
+            initial_noise=plan.noise,
+            generator=torch.Generator().manual_seed(29),
+        )
+        runtime_commits = []
+        runtime_state, committed = model.stream_generate_step(
+            runtime_state,
+            condition,
+            roll_window=False,
+            cfg_mode="nocfg",
+        )
+        runtime_commits.append(committed)
+        runtime_first_state = runtime_state
+        runtime_state, committed = model.stream_generate_step(
+            runtime_state,
+            condition,
+            roll_window=False,
+            cfg_mode="nocfg",
+        )
+        runtime_commits.append(committed)
+
+    assert len(training_first_commits) == 1
+    assert torch.allclose(
+        training_first_commits[0].root_motion,
+        runtime_commits[0].root_motion,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.allclose(
+        training_first_state.noisy_motion.root_motion,
+        runtime_first_state.noisy_motion.root_motion,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.allclose(
+        training_first_state.noisy_motion.latent_motion,
+        runtime_first_state.noisy_motion.latent_motion,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert training_first_state.current_denoise_step.tolist() == [
+        runtime_first_state.current_step
+    ]
+    assert len(training_commits) == len(runtime_commits) == 2
+    for trained, runtime in zip(training_commits, runtime_commits):
+        assert torch.allclose(
+            trained.root_motion, runtime.root_motion, atol=1e-6, rtol=1e-6
+        )
+        assert torch.allclose(
+            trained.latent_motion, runtime.latent_motion, atol=1e-6, rtol=1e-6
+        )
+    assert torch.allclose(
+        training_state.noisy_motion.root_motion,
+        runtime_state.noisy_motion.root_motion,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.allclose(
+        training_state.noisy_motion.latent_motion,
+        runtime_state.noisy_motion.latent_motion,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert training_state.current_denoise_step.tolist() == [runtime_state.current_step]
+    runtime_beta = model.triangular_beta(
+        timeline_position_ids=torch.arange(tokens)[None],
+        diffusion_time=runtime_state.current_step / float(model.noise_steps),
+    )
+    assert torch.equal(training_state.beta, runtime_beta)
+    runtime_origin = sum(
+        (
+            model.denormalize_root(committed.root_motion)[:, 0, -1, [0, 2]]
+            for committed in runtime_commits
+        ),
+        torch.zeros(1, 2),
+    )
+    assert torch.allclose(
+        training_state.origin_xz, runtime_origin, atol=1e-6, rtol=1e-6
+    )
 
 
 def test_stream_roll_keeps_boundary_and_advances_origin():

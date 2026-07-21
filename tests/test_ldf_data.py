@@ -533,6 +533,11 @@ def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
             "self_forcing": {
                 "k_schedule": [[0, 1], [5, 2], [14, 5]],
                 "teacher_replay": {2: 0.2, 5: 0.1},
+                "cold_start_replay": 0.0,
+                "cold_start": {
+                    "persistent_probability": 0.5,
+                    "rollout_commits": 2,
+                },
             },
             "trainer": {"max_steps": 20},
             "training": {
@@ -561,9 +566,13 @@ def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
     validation_batches = [next(iter(loader)) for loader in validation]
     assert [batch["validation_probe"] for batch in validation_batches] == [
         "teacher_cold",
+        "persistent_cold",
         "teacher_continuation",
         "self_forcing",
     ]
     assert validation_batches[0]["source_start_token"].tolist() == [0]
     assert validation_batches[0]["context_token_count"].tolist() == [0]
     assert not validation_batches[0]["previous_root_valid_mask"].any()
+    assert validation_batches[1]["source_start_token"].tolist() == [0]
+    assert validation_batches[1]["context_token_count"].tolist() == [0]
+    assert not validation_batches[1]["previous_root_valid_mask"].any()

@@ -22,6 +22,10 @@ _RIGHT_HIP = 2
 _LEFT_HIP = 1
 _RIGHT_SHOULDER = 17
 _LEFT_SHOULDER = 16
+_LEFT_ANKLE = 7
+_RIGHT_ANKLE = 8
+_LEFT_TOE = 10
+_RIGHT_TOE = 11
 
 
 def _validate_inputs(
@@ -101,6 +105,40 @@ def _body_forward_direction(
     return forward, valid
 
 
+def _foot_forward_directions(
+    root_motion: torch.Tensor,
+    body_motion: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return direct-position ankle-to-toe directions for both feet."""
+
+    joints = recover_joint_positions(root_motion, body_motion)
+    directions = torch.stack(
+        [
+            joints[..., _LEFT_TOE, [0, 2]]
+            - joints[..., _LEFT_ANKLE, [0, 2]],
+            joints[..., _RIGHT_TOE, [0, 2]]
+            - joints[..., _RIGHT_ANKLE, [0, 2]],
+        ],
+        dim=-2,
+    ).float()
+    valid = torch.isfinite(directions).all(dim=-1) & (
+        directions.norm(dim=-1) > 1e-6
+    )
+    return directions, valid
+
+
+def _reverse_ratio(
+    first_direction: torch.Tensor,
+    second_direction: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    first = torch.nn.functional.normalize(first_direction.float(), dim=-1)
+    second = torch.nn.functional.normalize(second_direction.float(), dim=-1)
+    reverse = ((first * second).sum(dim=-1) < 0.0).float()
+    weight = mask.to(dtype=reverse.dtype)
+    return (reverse * weight).sum() / weight.sum().clamp_min(1.0)
+
+
 def _trajectory_forward_direction(
     target_root: torch.Tensor,
     frame_valid_mask: torch.Tensor,
@@ -158,6 +196,9 @@ def compute_heading_metrics(
     body_direction, body_valid = _body_forward_direction(
         predicted_root, predicted_body
     )
+    foot_direction, foot_valid = _foot_forward_directions(
+        predicted_root, predicted_body
+    )
     trajectory_direction, trajectory_valid = _trajectory_forward_direction(
         target_root,
         frame_valid_mask,
@@ -179,6 +220,11 @@ def compute_heading_metrics(
             predicted_direction,
             body_direction,
             frame_mask & body_valid,
+        ),
+        "feet_root_reverse_ratio": _reverse_ratio(
+            foot_direction,
+            predicted_direction[..., None, :].expand_as(foot_direction),
+            frame_mask[..., None] & foot_valid,
         ),
     }
 

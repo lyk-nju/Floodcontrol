@@ -96,7 +96,9 @@ L_latent_body_flow_v
 - persistent cold使用现有带`offpath_beta_min`保护的endpoint目标；ideal cold继续使用原flow-v目标。不得在每个microstep重新采样source，也不得通过decode→encode重建body latent。
 - `cold_start_replay=0.1`、cold内部`ideal:persistent=1:1`和最多2 commits是冻结的首轮训练默认；它们属于训练采样合同，不改变50-token root statistics协议，也不要求重算`root_stats.npz`。
 
-该合同目前是`LOCKED / IMPLEMENTED`：实现与合成parity测试已经落地，但尚未进行新的GPU微调，因此这里的“已实现”不等于已经证明训练收益。是否降低真实反脚率仍必须通过同一固定噪声实验矩阵验证。
+该合同目前是`LOCKED / IMPLEMENTED`：实现、结构测试与真实tiny LDF的训练/runtime数值parity测试已经落地，但尚未进行新的GPU微调，因此这里的“已实现”不等于已经证明训练收益。是否降低真实反脚率仍必须通过同一固定噪声实验矩阵验证。
+
+普通validation另外包含一个`persistent_cold`诊断loader。它固定从真实序列起点开始，并在完整cold生命周期中轮转观察四个零基solver位置：第1次update后的状态、约3个active token可见时、第一次commit边界和第二次commit边界；正式`noise_steps=10,C=5`对应索引`0/4/9/11`。每个validation batch只运行其中一个固定位置，而不是为同一batch重复四条rollout，因此能够分阶段聚合root/body off-path endpoint、Root/GT heading、Root/GT轨迹heading、Root/Body heading和feet/root reverse ratio，同时控制验证开销。该probe与`teacher_cold`职责不同：后者仍测理想bridge的H=0单步目标，前者专门测模型自身Euler状态的持续演化。
 
 K>1最终denoise step不继续使用只对ideal bridge成立的`x0-epsilon`target，而是在实际solver state上恢复：
 

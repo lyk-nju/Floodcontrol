@@ -30,6 +30,18 @@ def _body_facing(direction_xz: list[tuple[float, float]]) -> torch.Tensor:
     return body
 
 
+def _set_feet_facing(
+    body: torch.Tensor,
+    directions_xz: list[tuple[float, float]],
+) -> torch.Tensor:
+    positions = body[..., :63].reshape(body.shape[0], body.shape[1], 21, 3)
+    for frame, (direction_x, direction_z) in enumerate(directions_xz):
+        offset = torch.tensor([direction_x, 0.0, direction_z])
+        positions[0, frame, 10 - 1] = positions[0, frame, 7 - 1] + offset
+        positions[0, frame, 11 - 1] = positions[0, frame, 8 - 1] + offset
+    return body
+
+
 def test_heading_metrics_measure_root_target_and_rendered_body_angles():
     predicted_root = _root([0.0, 90.0, 180.0])
     target_root = _root([0.0, 0.0, 0.0])
@@ -105,4 +117,21 @@ def test_trajectory_heading_uses_backward_gt_xz_and_filters_stationary_frames():
         metrics["root_gt_trajectory_heading_angle_deg"],
         torch.tensor(90.0),
         atol=1e-5,
+    )
+
+
+def test_feet_root_reverse_ratio_uses_ankle_to_toe_geometry():
+    root = _root([0.0, 0.0])
+    body = _body_facing([(0.0, 1.0), (0.0, 1.0)])
+    body = _set_feet_facing(body, [(0.0, 1.0), (0.0, -1.0)])
+
+    metrics = compute_heading_metrics(
+        predicted_root=root,
+        target_root=root,
+        predicted_body=body,
+        frame_mask=torch.ones(1, 2, dtype=torch.bool),
+    )
+
+    assert torch.allclose(
+        metrics["feet_root_reverse_ratio"], torch.tensor(0.5), atol=1e-6
     )

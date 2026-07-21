@@ -8,8 +8,8 @@ seed: 1234
 debug: false
 train: true
 save_dir: ./outputs/ldf
-resume_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260719_010947_ldf_hybrid/step_120000.ckpt
-test_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260719_010947_ldf_hybrid/step_120000.ckpt
+resume_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260720_203317_ldf_hybrid/step_160000.ckpt
+test_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260720_203317_ldf_hybrid/step_160000.ckpt
 
 wandb_info:
   project: Floodcontrol
@@ -147,8 +147,8 @@ loss:
   rollout_weight: 1.0
   offpath_beta_min: 0.1
   root_boundary_weight: 0.0
-  root_heading_cosine_weight: 0.1
-  root_heading_vector_weight: 0.1
+  root_heading_cosine_weight: 0.3
+  root_heading_vector_weight: 0.3
   root_heading_beta_min: 0.1
   root_heading_cosine_min_norm: 0.05
 
@@ -160,8 +160,7 @@ self_forcing:
   k_schedule:
     - [0, 1]
     - [100000, 2]
-    - [200000, 3]
-    - [300000, 5]
+    - [200000, 5]
   teacher_replay:
     2: 0.1
     3: 0.1

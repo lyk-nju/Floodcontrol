@@ -406,7 +406,10 @@ class LDFSpanCollator:
         maximum = available_tokens - span_tokens
         if maximum <= 0:
             return 0
-        if force_sequence_start or self.validation_probe == "teacher_cold":
+        if force_sequence_start or self.validation_probe in {
+            "teacher_cold",
+            "persistent_cold",
+        }:
             return 0
         if self.training:
             return rng.randint(0, maximum)
@@ -815,6 +818,12 @@ def create_dataloaders(
         val_dataset,
         min_frames=required_tokens * FRAMES_PER_TOKEN,
     )
+    persistent_cold_dataset = MinimumFrameDataset(
+        val_dataset,
+        min_frames=(
+            generation_tokens + cold_rollout_commits
+        ) * FRAMES_PER_TOKEN,
+    )
 
     def validation_loader(
         name: str,
@@ -841,6 +850,7 @@ def create_dataloaders(
 
     val_loaders = [
         validation_loader("teacher_cold", dataset=val_dataset),
+        validation_loader("persistent_cold", dataset=persistent_cold_dataset),
         validation_loader(
             "teacher_continuation",
             dataset=continuation_dataset,

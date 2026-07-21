@@ -32,6 +32,7 @@ from utils.training.ldf.losses import compute_offpath_loss, compute_velocity_los
 from utils.training.ldf.metrics import compute_heading_metrics
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import (
+    ColdStartObjective,
     sample_cold_start_objective,
     sample_rollout_steps,
     sample_window_plan,
@@ -81,6 +82,37 @@ def _create_curriculum_generator(seed: int, global_step: int) -> torch.Generator
         int(seed) + int(global_step) * 1_000_003 + 0x5E1F_F0CE
     ) % (2**63 - 1)
     return torch.Generator(device="cpu").manual_seed(mixed_seed)
+
+
+def _persistent_cold_validation_phases(
+    *,
+    noise_steps: int,
+    active_tokens: int,
+    rollout_commits: int,
+) -> tuple[tuple[str, int], ...]:
+    """Resolve stable observation points in one true-cold lifecycle."""
+
+    noise_steps = int(noise_steps)
+    active_tokens = int(active_tokens)
+    rollout_commits = int(rollout_commits)
+    if noise_steps <= 0 or active_tokens <= 0:
+        raise ValueError("persistent cold validation geometry must be positive")
+    if noise_steps % active_tokens:
+        raise ValueError(
+            "persistent cold validation requires divisible noise/active steps"
+        )
+    if rollout_commits < 2:
+        raise ValueError(
+            "persistent cold validation requires at least two rollout commits"
+        )
+    steps_per_commit = noise_steps // active_tokens
+    three_visible_index = (min(3, active_tokens) - 1) * steps_per_commit
+    return (
+        ("after_update_01", 0),
+        ("three_tokens_visible", three_visible_index),
+        ("first_commit", noise_steps - 1),
+        ("second_commit", noise_steps + steps_per_commit - 1),
+    )
 
 
 def _load_root_statistics(path: str | Path) -> tuple[torch.Tensor, torch.Tensor]:
@@ -315,6 +347,7 @@ class LDFLightningModule(BasicLightningModule):
         generator: torch.Generator | None = None,
         rollout_steps_override: int | None = None,
         initial_history_tokens: int | torch.Tensor | None = None,
+        cold_persistent_microstep_override: int | None = None,
     ):
         self._last_heading_metrics = {}
         if generator is None and is_training:
@@ -327,27 +360,43 @@ class LDFLightningModule(BasicLightningModule):
             rollout_steps_override
         )
         self_forcing = self.cfg.get("self_forcing")
+        persistent_cold_validation = cold_persistent_microstep_override is not None
+        if persistent_cold_validation and is_training:
+            raise ValueError(
+                "cold_persistent_microstep_override is only valid in validation"
+            )
         cold_start_replay = bool(
-            is_training and batch.get("cold_start_replay", False)
+            (is_training and batch.get("cold_start_replay", False))
+            or persistent_cold_validation
         )
         cold_objective = None
         if cold_start_replay:
-            if rollout_steps_override not in (None, 1):
+            if (
+                not persistent_cold_validation
+                and rollout_steps_override not in (None, 1)
+            ):
                 raise ValueError("cold-start replay requires K=1")
             if self_forcing is None:
                 raise ValueError("cold-start replay requires self_forcing config")
             cold_config = self_forcing.get("cold_start") or {}
-            cold_objective = sample_cold_start_objective(
-                persistent_probability=float(
-                    cold_config.get("persistent_probability", 0.0)
-                ),
-                rollout_commits=int(cold_config.get("rollout_commits", 1)),
-                noise_steps=int(self.model.noise_steps),
-                active_tokens=int(self.model.chunk_size),
-                generator=_create_curriculum_generator(
-                    int(self.cfg.get("seed", 0)), int(self.global_step)
-                ),
-            )
+            if persistent_cold_validation:
+                cold_objective = ColdStartObjective(
+                    persistent=True,
+                    rollout_commits=int(cold_config.get("rollout_commits", 1)),
+                    supervised_microstep=int(cold_persistent_microstep_override),
+                )
+            else:
+                cold_objective = sample_cold_start_objective(
+                    persistent_probability=float(
+                        cold_config.get("persistent_probability", 0.0)
+                    ),
+                    rollout_commits=int(cold_config.get("rollout_commits", 1)),
+                    noise_steps=int(self.model.noise_steps),
+                    active_tokens=int(self.model.chunk_size),
+                    generator=_create_curriculum_generator(
+                        int(self.cfg.get("seed", 0)), int(self.global_step)
+                    ),
+                )
             rollout_steps = int(cold_objective.rollout_commits)
             initial_history_tokens = 0
         elif (
@@ -771,11 +820,34 @@ class LDFLightningModule(BasicLightningModule):
         generator = torch.Generator(device=self.device).manual_seed(
             base_seed + int(dataloader_idx) * 1_000_003 + int(batch_idx)
         )
+        persistent_microstep = None
+        metric_probe = probe
         if probe == "teacher_cold":
             rollout_steps = 1
             history_tokens: int | torch.Tensor = torch.zeros_like(
                 batch["span_token_count"]
             )
+        elif probe == "persistent_cold":
+            # Zero-based solver indices.  These correspond to the state after
+            # update 1, the first phase with roughly three visible tokens, the
+            # first commit, and the second commit respectively.  Cycling one
+            # phase per batch avoids multiplying persistent validation cost by
+            # four while keeping every phase deterministic across ranks.
+            rollout_steps = int(
+                (self.cfg.self_forcing.get("cold_start") or {}).get(
+                    "rollout_commits", 1
+                )
+            )
+            persistent_phases = _persistent_cold_validation_phases(
+                noise_steps=int(self.model.noise_steps),
+                active_tokens=int(self.model.chunk_size),
+                rollout_commits=rollout_steps,
+            )
+            phase_name, persistent_microstep = persistent_phases[
+                int(batch_idx) % len(persistent_phases)
+            ]
+            metric_probe = f"{probe}/{phase_name}"
+            history_tokens = torch.zeros_like(batch["span_token_count"])
         elif probe == "teacher_continuation":
             rollout_steps = 1
             history_tokens = self._validation_history_tokens(
@@ -794,18 +866,18 @@ class LDFLightningModule(BasicLightningModule):
             )
         else:
             raise ValueError(f"unknown validation probe {probe!r}")
-
         loss_dict = self._step(
             batch,
             is_training=False,
             generator=generator,
             rollout_steps_override=rollout_steps,
             initial_history_tokens=history_tokens,
+            cold_persistent_microstep_override=persistent_microstep,
         )
         batch_size = int(batch["body_motion"].shape[0])
         for key, value in loss_dict.items():
             self.log(
-                f"val_loss/{probe}/{key}",
+                f"val_loss/{metric_probe}/{key}",
                 value,
                 on_step=False,
                 on_epoch=True,
@@ -814,7 +886,7 @@ class LDFLightningModule(BasicLightningModule):
                 add_dataloader_idx=False,
             )
         self._log_heading_metrics(
-            f"val_metric/{probe}",
+            f"val_metric/{metric_probe}",
             batch_size=batch_size,
             on_step=False,
             on_epoch=True,

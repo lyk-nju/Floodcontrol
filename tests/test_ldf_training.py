@@ -24,6 +24,7 @@ from utils.training.ldf.lightning_module import (
     LDFLightningModule,
     _create_curriculum_generator,
     _file_sha256,
+    _persistent_cold_validation_phases,
 )
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import ColdStartObjective, sample_window_plan
@@ -297,11 +298,76 @@ def test_cold_start_replay_can_select_the_persistent_h_zero_solver(
     assert torch.isfinite(losses["total"])
 
 
+def test_validation_can_force_a_deterministic_persistent_cold_microstep(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _make_config(tmp_path)
+    cfg.self_forcing.cold_start_replay = 0.1
+    cfg.self_forcing.cold_start = {
+        "persistent_probability": 0.5,
+        "rollout_commits": 2,
+    }
+    module = LDFLightningModule(cfg).eval()
+    batch = _make_step_batch()
+
+    def fail_if_sampled(*_args, **_kwargs):
+        pytest.fail("persistent cold validation must not sample its objective")
+
+    monkeypatch.setattr(
+        "utils.training.ldf.lightning_module.sample_cold_start_objective",
+        fail_if_sampled,
+    )
+    from utils.training.ldf import lightning_module as ldf_lightning
+
+    original_solver = ldf_lightning.run_training_solver
+    seen = {}
+
+    def record_solver(*args, **kwargs):
+        seen["cold_persistent_microstep"] = kwargs.get(
+            "cold_persistent_microstep"
+        )
+        result = original_solver(*args, **kwargs)
+        seen["completed_commits"] = result.persistent_state.completed_commits
+        return result
+
+    monkeypatch.setattr(ldf_lightning, "run_training_solver", record_solver)
+    losses = module._step(
+        batch,
+        is_training=False,
+        generator=torch.Generator().manual_seed(17),
+        rollout_steps_override=2,
+        initial_history_tokens=0,
+        cold_persistent_microstep_override=1,
+    )
+
+    assert seen == {
+        "cold_persistent_microstep": 1,
+        "completed_commits": 2,
+    }
+    assert "anchor_root_offpath_endpoint" in losses
+    assert "latent_body_offpath_endpoint" in losses
+    assert torch.isfinite(losses["total"])
+
+
 def test_curriculum_generator_is_global_step_deterministic_and_rank_independent():
     first = _create_curriculum_generator(1234, 200_000)
     second = _create_curriculum_generator(1234, 200_000)
     assert first.device == second.device == torch.device("cpu")
     assert torch.equal(torch.rand(8, generator=first), torch.rand(8, generator=second))
+
+
+def test_persistent_cold_validation_phases_match_formal_solver_geometry():
+    assert _persistent_cold_validation_phases(
+        noise_steps=10,
+        active_tokens=5,
+        rollout_commits=2,
+    ) == (
+        ("after_update_01", 0),
+        ("three_tokens_visible", 4),
+        ("first_commit", 9),
+        ("second_commit", 11),
+    )
 
 
 def test_ldf_training_bridge_uses_frozen_ema_vae_and_shared_statistics(tmp_path):
@@ -705,6 +771,7 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         "root_gt_heading_angle_deg",
         "root_gt_trajectory_heading_angle_deg",
         "root_body_heading_angle_deg",
+        "feet_root_reverse_ratio",
     }
     assert all(
         torch.isfinite(value) for value in module._last_heading_metrics.values()

@@ -2,7 +2,7 @@
 
 状态：`IMPLEMENTED`
 
-本文只说明训练过程中如何观察完整生成质量，不重新定义训练loss。普通validation仍负责`teacher_cold`、`teacher_continuation`和self-forcing probe的确定性loss；生成评测由独立runner按较低频率执行。
+本文只说明训练过程中如何观察完整生成质量，不重新定义训练loss。普通validation负责`teacher_cold`、`persistent_cold`、`teacher_continuation`和self-forcing probe的确定性loss；生成评测由独立runner按较低频率执行。`persistent_cold`按batch确定性轮转cold生命周期的第1次update、约3-token可见、首次commit和第二次commit四个位置，分别记录root/body off-path endpoint及Root/Body/feet朝向诊断；它不再用teacher-cold单步结果代替真实persistent状态。
 
 ## 两种生成模式
 

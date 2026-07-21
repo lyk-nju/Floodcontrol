@@ -5404,3 +5404,45 @@
 
 - 尚未用真实GPU checkpoint启动persistent cold微调；必须复用`000021/001168`固定噪声实验矩阵测量反脚率、FID、吞吐与峰值显存。
 - 当前策略每个persistent cold batch只对一个生命周期点保留梯度；是否需要phase重加权或decoded foot auxiliary应等待首轮微调结果，不能同时引入。
+
+## 2026-07-21 · Persistent Cold分阶段Validation与真实Runtime Parity
+
+改动类型：validation诊断 / 脚部观测指标 / solver数值回归测试
+
+实际改动内容：
+
+- 新增`persistent_cold` validation loader，严格从真实序列第0 token开始，不复用`teacher_cold`的ideal K=1路径。
+- 正式`noise_steps=10,C=5`下按validation batch确定性轮转零基microstep `0/4/9/11`，分别对应第1次update后、约3个token可见、首次commit和第二次commit；每个batch只运行一个phase，避免四条完整loader重复计算。
+- validation可显式指定persistent cold监督点，不再采样train-time ideal/persistent mixture；各phase分别记录root/body off-path endpoint和全部heading观测指标。
+- heading指标新增`feet_root_reverse_ratio`，从decoded body direct-position的左右ankle-to-toe方向计算，并排除退化或非finite脚向量。它只作为诊断，不加入loss。
+- 新增真实tiny `LDF` parity测试：相同权重、initial noise、condition、nocfg且禁止rolling时，逐项比较训练persistent cold与`stream_generate_step()`的首次commit、首次commit后noisy root/body state、第二次commit、最终state、current step、beta、rebase结果和累计XZ原点。
+
+改动理由：
+
+- 旧`teacher_cold`固定`H=0,K=1`但只读取ideal bridge，无法反映persistent cold在早期phase、首次commit或第二token处变好/变坏。
+- 原有`RecordingModel`测试锁定了结构和调用次数，却不能证明真实Root/Body Transformer、CFG nocfg分支和runtime事务在浮点数值上等价。
+- feet/root反向是本轮persistent cold的直接目标现象，只记录torso式Root/Body heading不足以定位下肢mode是否改善。
+
+验证：
+
+- 真实tiny LDF训练/runtime两次commit数值parity在`atol=rtol=1e-6`内通过。
+- LDF data/training/self-forcing/stream/heading/forward回归：`120 passed`。
+- 定向persistent validation、phase几何和feet/root指标测试通过。
+
+涉及文件：
+
+- `utils/training/ldf/data.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/ldf/metrics.py`
+- `tests/test_ldf_data.py`
+- `tests/test_ldf_training.py`
+- `tests/test_ldf_stream.py`
+- `tests/test_ldf_heading_metrics.py`
+- `docs/rearchitecture/04_TRAINING_METHOD.md`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 尚未在真实GPU checkpoint上比较四个persistent-cold phase的validation曲线；本轮只证明接口、指标和训练/runtime数值合同成立。
+- `feet_root_reverse_ratio`不作为checkpoint选择指标；需结合动作类别和固定坏例判断，不能把合法倒走误判为模型失败。
