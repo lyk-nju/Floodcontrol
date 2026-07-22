@@ -34,7 +34,7 @@ def _joints(frames: int = 2) -> torch.Tensor:
     return joints
 
 
-def test_visualization_public_api_is_root5_body265_only():
+def test_visualization_public_api_is_root5_body259_only():
     assert len(visualization.HUMANML22_CHAINS) == 5
     assert max(max(chain) for chain in visualization.HUMANML22_CHAINS) == 21
     assert not (ROOT / "utils" / "visualization" / "video.py").exists()
@@ -135,7 +135,7 @@ def test_motion_renderer_recovers_world_joints(monkeypatch, tmp_path):
     root = torch.tensor(
         [[2.0, 1.2, -3.0, 1.0, 0.0], [2.1, 1.2, -3.0, 1.0, 0.0]]
     )
-    body = torch.zeros(2, 265)
+    body = torch.zeros(2, 259)
     output = tmp_path / "motion.mp4"
     motion_video.render_motion_video(root, body, output, fps=24)
     assert captured["joints"].shape == (2, 22, 3)

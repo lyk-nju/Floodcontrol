@@ -165,8 +165,8 @@ def save_dense_xz_sample(
     step_tag: str,
     sample_id: str,
     caption: str,
-    normalized_root: torch.Tensor,
-    normalized_latent: torch.Tensor,
+    root_motion: torch.Tensor,
+    latent_motion: torch.Tensor,
     predicted_root: torch.Tensor,
     predicted_body: torch.Tensor,
     target_root: torch.Tensor,
@@ -184,8 +184,8 @@ def save_dense_xz_sample(
     (dirs["text"] / f"{sample_id}.txt").write_text(str(caption))
     np.savez(
         dirs["token"] / f"{sample_id}.npz",
-        root_motion=normalized_root.detach().cpu().float().numpy(),
-        latent_motion=normalized_latent.detach().cpu().float().numpy(),
+        root_motion=root_motion.detach().cpu().float().numpy(),
+        latent_motion=latent_motion.detach().cpu().float().numpy(),
     )
     np.savez(
         dirs["feature"] / f"{sample_id}.npz",

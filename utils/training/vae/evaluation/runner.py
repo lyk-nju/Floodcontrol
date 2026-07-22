@@ -126,11 +126,10 @@ def evaluate_dataset(
 
 
 def _load_model(cfg, device: torch.device) -> tuple[BodyVAE, dict[str, object]]:
-    model = BodyVAE(
-        **OmegaConf.to_container(cfg.model.params, resolve=True),
-        motion_stats_path=str(cfg.model.motion_stats_path),
+    model = load_vae_checkpoint(
+        cfg.model.checkpoint_path,
+        model_params=OmegaConf.to_container(cfg.model.params, resolve=True),
     )
-    load_vae_checkpoint(model, cfg.model.checkpoint_path)
     return model.to(device), {"path": str(cfg.model.checkpoint_path), "weights": "ema"}
 
 
@@ -175,8 +174,7 @@ def run(cfg, *, mode: str) -> dict[str, object]:
         "mode": mode,
         "root_policy": "source explicit root shared by original and reconstruction",
         "latent_policy": (
-            "deterministic raw posterior mu, streamed after LDF "
-            "unnormalization boundary"
+            "deterministic raw posterior mu with no latent whitening"
         ),
         "checkpoint": checkpoint_metadata,
         "datasets": dataset_summaries,

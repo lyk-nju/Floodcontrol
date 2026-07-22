@@ -2,7 +2,7 @@
 
 This module owns only representation-independent geometry.  It operates on
 angles, XZ points, XZ vectors and rotation matrices; it does not know about
-root5, body265, tokens, model conditions or streaming state.
+root5, body259, tokens, model conditions or streaming state.
 
 Axis convention:
     - +Y is up.

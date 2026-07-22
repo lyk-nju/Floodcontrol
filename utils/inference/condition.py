@@ -130,20 +130,10 @@ class InferenceConditionCompiler:
         self,
         *,
         text_embeddings: TextEmbeddingCache,
-        root_mean: torch.Tensor,
-        root_std: torch.Tensor,
         active_tokens: int,
         fps: float = MOTION_FPS,
         max_horizon_token: int = 0,
     ):
-        mean = torch.as_tensor(root_mean, dtype=torch.float32).reshape(-1)
-        std = torch.as_tensor(root_std, dtype=torch.float32).reshape(-1)
-        if tuple(mean.shape) != (ROOT_DIM,) or tuple(std.shape) != (ROOT_DIM,):
-            raise ValueError("root statistics must have shape [5]")
-        if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(std).all()):
-            raise ValueError("root statistics must be finite")
-        if bool((std <= 0).any()):
-            raise ValueError("root_std must be strictly positive")
         if not np.isfinite(float(fps)) or float(fps) <= 0:
             raise ValueError("fps must be finite and positive")
         if int(max_horizon_token) < 0:
@@ -151,8 +141,6 @@ class InferenceConditionCompiler:
         if int(active_tokens) <= 0:
             raise ValueError("active_tokens must be positive")
         self.text_embeddings = text_embeddings
-        self.root_mean = mean.clone()
-        self.root_std = std.clone()
         self.fps = float(fps)
         self.active_tokens = int(active_tokens)
         self.max_horizon_token = int(max_horizon_token)
@@ -210,11 +198,10 @@ class InferenceConditionCompiler:
 
         physical_tensor = torch.as_tensor(physical, device=device, dtype=dtype)
         mask_tensor = torch.as_tensor(mask, device=device, dtype=torch.bool)
-        normalized = (
-            physical_tensor - self.root_mean.to(device=device, dtype=dtype)
-        ) / self.root_std.to(device=device, dtype=dtype)
-        normalized = torch.where(mask_tensor, normalized, torch.zeros_like(normalized))
-        return normalized[None], mask_tensor[None]
+        physical_tensor = torch.where(
+            mask_tensor, physical_tensor, torch.zeros_like(physical_tensor)
+        )
+        return physical_tensor[None], mask_tensor[None]
 
     def compile(
         self,

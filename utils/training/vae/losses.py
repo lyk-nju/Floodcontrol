@@ -14,7 +14,14 @@ from utils.conditions.vae import (
     VAEInput,
     VAEPrediction,
 )
-from utils.motion_process import rotation_to_matrix
+from utils.motion_process import (
+    FOOT_JOINT_INDICES,
+    HUMANML22_PARENTS,
+    forward_kinematics_heading_frame,
+    rotation_to_matrix,
+)
+from utils.coordinate_transform import yaw_to_matrix
+from utils.motion_process import recover_root_yaw
 from utils.token_frame import MOTION_FPS, frame_valid_to_token_valid
 
 
@@ -36,7 +43,7 @@ class VAELoss(nn.Module):
         lambda_skating: float = 0.01,
         beta_kl: float = 1e-5,
         kl_warmup_steps: int = 0,
-        foot_joint_indices: tuple[int, int, int, int] = (7, 10, 8, 11),
+        foot_joint_indices: tuple[int, int, int, int] = FOOT_JOINT_INDICES,
         lambda_geodesic: float = 0.0,
         lambda_fk: float = 0.0,
         lambda_position_consistency: float = 0.0,
@@ -49,7 +56,9 @@ class VAELoss(nn.Module):
         self.register_buffer("body_cont_mean", torch.as_tensor(body_cont_mean).float())
         self.register_buffer("body_cont_std", torch.as_tensor(body_cont_std).float())
         if tuple(self.body_cont_mean.shape) != (BODY_CONTINUOUS_DIM,) or tuple(self.body_cont_std.shape) != (BODY_CONTINUOUS_DIM,):
-            raise ValueError("body continuous statistics must have shape [261]")
+            raise ValueError(
+                f"body continuous statistics must have shape [{BODY_CONTINUOUS_DIM}]"
+            )
         if bool((self.body_cont_std <= 0).any()):
             raise ValueError("body continuous std must be positive")
         self.lambda_position = float(lambda_position)
@@ -80,24 +89,30 @@ class VAELoss(nn.Module):
 
     @staticmethod
     def _global_positions(root_motion: torch.Tensor, non_root_positions: torch.Tensor) -> torch.Tensor:
-        positions = non_root_positions.clone()
-        positions[..., 0] += root_motion[..., None, 0]
-        positions[..., 2] += root_motion[..., None, 2]
+        rotation = yaw_to_matrix(recover_root_yaw(root_motion))
+        positions = torch.einsum(
+            "bfij,bfkj->bfki", rotation, non_root_positions
+        ) + root_motion[..., None, :3]
         return torch.cat([root_motion[..., None, :3], positions], dim=-2)
 
     def _forward_kinematics(
-        self, root_motion: torch.Tensor, global_rotations: torch.Tensor
+        self, root_motion: torch.Tensor, heading_frame_rotations: torch.Tensor
     ) -> torch.Tensor:
-        positions = [root_motion[..., :3]]
-        for joint in range(1, NUM_JOINTS):
-            parent = int(self.skeleton_parents[joint])
-            if parent < 0 or parent >= joint:
-                raise ValueError("skeleton parents must be topologically ordered")
-            offset = torch.einsum(
-                "...ij,j->...i", global_rotations[..., parent, :, :], self.skeleton_offsets[joint]
-            )
-            positions.append(positions[parent] + offset)
-        return torch.stack(positions, dim=-2)
+        # The public FK helper owns the Body259 cumulative-rotation convention.
+        # Custom parents are retained only as a guard against accidentally
+        # configuring a skeleton incompatible with the frozen HumanML22 order.
+        expected = torch.as_tensor(
+            HUMANML22_PARENTS,
+            dtype=self.skeleton_parents.dtype,
+            device=self.skeleton_parents.device,
+        )
+        if not torch.equal(self.skeleton_parents, expected):
+            raise ValueError("Body259 FK requires the frozen HumanML22 parent table")
+        return forward_kinematics_heading_frame(
+            root_motion,
+            heading_frame_rotations,
+            self.skeleton_offsets,
+        )
 
     def forward(
         self,
@@ -185,11 +200,11 @@ class VAELoss(nn.Module):
         if self.lambda_geodesic:
             pred_rot = rotation_to_matrix(
                 predicted[..., BODY_POSITION_DIM : BODY_POSITION_DIM + BODY_ROTATION_DIM]
-                .reshape(*predicted.shape[:2], NUM_JOINTS, 6)
+                .reshape(*predicted.shape[:2], NUM_JOINTS - 1, 6)
             )
             target_rot = rotation_to_matrix(
                 target[..., BODY_POSITION_DIM : BODY_POSITION_DIM + BODY_ROTATION_DIM]
-                .reshape(*target.shape[:2], NUM_JOINTS, 6)
+                .reshape(*target.shape[:2], NUM_JOINTS - 1, 6)
             )
             relative = pred_rot.transpose(-1, -2) @ target_rot
             cosine = ((relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) * 0.5).clamp(-1 + 1e-6, 1 - 1e-6)
@@ -201,7 +216,7 @@ class VAELoss(nn.Module):
         if self.lambda_fk or self.lambda_position_consistency:
             pred_rot = rotation_to_matrix(
                 predicted[..., BODY_POSITION_DIM : BODY_POSITION_DIM + BODY_ROTATION_DIM]
-                .reshape(*predicted.shape[:2], NUM_JOINTS, 6)
+                .reshape(*predicted.shape[:2], NUM_JOINTS - 1, 6)
             )
             fk_positions = self._forward_kinematics(inputs.root_motion, pred_rot)
             target_positions = self._global_positions(
@@ -223,6 +238,12 @@ class VAELoss(nn.Module):
             derived_velocity[:, 1:] = (
                 direct_positions[:, 1:] - direct_positions[:, :-1]
             ) * self.fps
+            root_rotation = yaw_to_matrix(recover_root_yaw(inputs.root_motion))
+            derived_velocity = torch.einsum(
+                "bfij,bfkj->bfki",
+                root_rotation.transpose(-1, -2),
+                derived_velocity,
+            )
             velocity_valid = inputs.frame_valid_mask.clone()
             velocity_valid[:, 0] = False
             velocity_valid[:, 1:] &= inputs.frame_valid_mask[:, :-1]
@@ -255,11 +276,27 @@ class VAELoss(nn.Module):
             token_mask[..., None].expand_as(prediction.posterior.mu),
         ).sqrt()
         flattened_mu = prediction.posterior.mu[token_mask]
+        flattened_logvar = prediction.posterior.logvar[token_mask]
+        losses["posterior_mu_mean"] = (
+            flattened_mu.mean() if flattened_mu.numel() else kl.new_zeros(())
+        )
+        losses["posterior_logvar_mean"] = (
+            flattened_logvar.mean()
+            if flattened_logvar.numel()
+            else kl.new_zeros(())
+        )
         if flattened_mu.shape[0] > 1:
-            active = flattened_mu.var(dim=0, unbiased=False) > 1e-2
+            channel_std = flattened_mu.std(dim=0, unbiased=False)
+            active = channel_std.square() > 1e-2
             losses["active_latent_fraction"] = active.float().mean()
+            losses["posterior_mu_channel_std_min"] = channel_std.min()
+            losses["posterior_mu_channel_std_median"] = channel_std.median()
+            losses["posterior_mu_channel_std_max"] = channel_std.max()
         else:
             losses["active_latent_fraction"] = kl.new_zeros(())
+            losses["posterior_mu_channel_std_min"] = kl.new_zeros(())
+            losses["posterior_mu_channel_std_median"] = kl.new_zeros(())
+            losses["posterior_mu_channel_std_max"] = kl.new_zeros(())
         losses["reconstruction"] = reconstruction
         losses["total"] = (
             reconstruction

@@ -28,8 +28,6 @@ from utils.inference.text import TextEmbeddingCache, TextTimeline
 def make_ldf(*, latent_dim=3):
     return LDF(
         latent_dim=latent_dim,
-        root_mean=[0] * 5,
-        root_std=[1] * 5,
         local_root_mean=[0] * 4,
         local_root_std=[1] * 4,
         hidden_dim=8,
@@ -59,10 +57,12 @@ def zero_prediction(self, inputs, **kwargs):
     local = torch.zeros(*root_velocity.shape[:3], 4, device=root_velocity.device)
     valid = torch.ones_like(local, dtype=torch.bool)
     return LDFPrediction(
-        HybridMotion(root_velocity, latent_velocity),
-        inputs.noisy_motion.root_motion,
-        local,
-        valid,
+        raw_root_output=inputs.noisy_motion.root_motion,
+        raw_body_output=latent_velocity,
+        clean_motion=inputs.noisy_motion,
+        solver_velocity=HybridMotion(root_velocity, latent_velocity),
+        local_root_motion=local,
+        local_root_feature_valid=valid,
     )
 
 
@@ -170,8 +170,6 @@ def test_condition_compiler_aligns_world_route_masks_and_future_positions():
     )
     compiler = InferenceConditionCompiler(
         text_embeddings=TextEmbeddingCache(encode_texts),
-        root_mean=ldf.root_mean,
-        root_std=ldf.root_std,
         active_tokens=ldf.chunk_size,
         max_horizon_token=2,
     )
@@ -234,7 +232,7 @@ def test_session_commits_one_token_decodes_four_frames_and_restores_snapshot():
     first = session.generate_step()
     assert first.token_index == 0
     assert first.root_motion.shape == (1, 4, 5)
-    assert first.body_prediction.continuous_body.shape == (1, 4, 261)
+    assert first.body_prediction.continuous_body.shape == (1, 4, 255)
     assert first.committed_motion is not None
     assert first.committed_motion.token_length == 1
     assert session.commit_index == 1

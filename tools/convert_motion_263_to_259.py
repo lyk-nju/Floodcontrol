@@ -1,4 +1,4 @@
-"""Offline HumanML 263D to Floodcontrol root5/body265 conversion.
+"""Offline HumanML263 to Floodcontrol root5/body259 conversion.
 
 HumanML 263D source layout (F: frame count):
     root half-angle delta                    [0]
@@ -11,23 +11,25 @@ HumanML 263D source layout (F: frame count):
 
 Floodcontrol target layout:
     root5  = [root_x, root_y, root_z, cos(yaw), sin(yaw)]
-    body265 = non-root positions [63]
-            + global joint rotation6d [132]
-            + global backward velocity [66]
+    body259 = heading-local non-root positions [63]
+            + heading-frame cumulative IK rotation6d [126]
+            + current-heading-local backward velocity [66]
             + contacts [4]
 
 This module is an offline source adapter. Runtime models and datasets consume
-only the converted root5/body265 artifact and must not import this file.
+only the converted root5/body259 artifact and must not import this file.
 """
 
 from __future__ import annotations
 
 import torch
 
-from utils.coordinate_transform import wrap_angle
+from utils.coordinate_transform import wrap_angle, yaw_to_matrix
 from utils.motion_process import (
     BODY_CONTACT_DIM,
     BODY_POSITION_DIM,
+    FOOT_JOINT_INDICES,
+    HUMANML22_PARENTS,
     NUM_JOINTS,
     build_motion,
     compute_joint_velocities,
@@ -47,32 +49,6 @@ HUMANML_ROTATION_SLICE = slice(
     HUMANML_POSITION_SLICE.stop + (NUM_JOINTS - 1) * 6,
 )
 HUMANML_CONTACT_SLICE = slice(HUMANML_DIM - BODY_CONTACT_DIM, HUMANML_DIM)
-HUMANML22_PARENTS = (
-    -1,
-    0,
-    0,
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    9,
-    9,
-    12,
-    13,
-    14,
-    16,
-    17,
-    18,
-    19,
-)
-
-
 def _root_quat_to_physical_yaw(root_quat: torch.Tensor) -> torch.Tensor:
     """Interpret HumanML's recovered root quaternion as physical yaw.
 
@@ -168,14 +144,18 @@ def recover_joint_rotations_263(
     *,
     canonical_heading: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compose HumanML IK-derived local rotations into global matrices.
+    """Compose HumanML IK-derived local rotations in the HumanML IK gauge.
+
+    These hierarchical matrices preserve the source 263D rotation channels
+    for reconstruction.  Their root convention follows HumanML's official IK
+    recovery and is not the physical-facing convention used by root5 yaw.
 
     Args:
         motion: HumanML source motion ``[F,263]`` or ``[B,F,263]``.
         canonical_heading: Optional result from :func:`recover_root_263`.
 
     Returns:
-        Global rotation matrices ``[...,F,22,3,3]``.
+        HumanML IK-gauge hierarchical matrices ``[...,F,22,3,3]``.
     """
     motion = _validate_motion_263(motion)
     if canonical_heading is None:
@@ -202,7 +182,7 @@ def detect_foot_contacts(
     global_positions: torch.Tensor,
     *,
     fps: float = 20.0,
-    foot_joint_indices: tuple[int, int, int, int] = (7, 10, 8, 11),
+    foot_joint_indices: tuple[int, int, int, int] = FOOT_JOINT_INDICES,
     height_threshold: float = 0.15,
     speed_threshold: float = 0.10,
 ) -> torch.Tensor:
@@ -217,20 +197,20 @@ def detect_foot_contacts(
     ).to(global_positions.dtype)
 
 
-def convert_motion_263_to_265(
+def convert_motion_263_to_259(
     motion: torch.Tensor,
     *,
     fps: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert HumanML 263D motion into physical root5/body265.
+    """Convert HumanML263 into physical root5/body259.
 
     Args:
         motion: HumanML source motion ``[F,263]`` or ``[B,F,263]``.
         fps: Source frame rate used to recompute global backward velocity.
 
     Returns:
-        Root5, body265 and body feature validity. Unbatched input produces
-        ``[F,5]``, ``[F,265]`` and ``[F,265]`` outputs.
+        Root5, body259 and body feature validity. Unbatched input produces
+        ``[F,5]``, ``[F,259]`` and ``[F,259]`` outputs.
     """
     motion = _validate_motion_263(motion)
     squeeze = motion.ndim == 2
@@ -243,15 +223,20 @@ def convert_motion_263_to_265(
         canonical_heading=canonical_heading,
         root_positions=root_positions,
     )
-    global_rotations = recover_joint_rotations_263(
+    humanml_cumulative_rotations = recover_joint_rotations_263(
         motion,
         canonical_heading=canonical_heading,
     )
     root_yaw = _root_quat_to_physical_yaw(canonical_heading)
+    root_rotation = yaw_to_matrix(root_yaw)
+    heading_frame_rotations = (
+        root_rotation.transpose(-1, -2)[..., None, :, :]
+        @ humanml_cumulative_rotations[..., 1:, :, :]
+    )
     contacts = motion[..., HUMANML_CONTACT_SLICE]
     root, body, feature_valid = build_motion(
         global_positions,
-        global_rotations,
+        heading_frame_rotations,
         root_positions,
         root_yaw,
         contacts,
@@ -268,7 +253,7 @@ __all__ = [
     "HUMANML_DIM",
     "HUMANML_POSITION_SLICE",
     "HUMANML_ROTATION_SLICE",
-    "convert_motion_263_to_265",
+    "convert_motion_263_to_259",
     "detect_foot_contacts",
     "recover_joint_positions_263",
     "recover_joint_rotations_263",

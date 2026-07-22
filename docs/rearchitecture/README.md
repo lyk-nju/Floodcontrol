@@ -1,6 +1,6 @@
 # Floodcontrol 新版框架讨论索引
 
-状态：`TRAJECTORY_CONDITIONED_LDF_TRAINING_READY`。Hybrid LDF、BodyVAE、唯一`humanml265`转换器、在线EMA Hybrid bridge、teacher/self-forcing训练合同、dense/sparse XZ监督、原子推理session以及训练期stream/rolling生成评测已经落地；Web模型加载等待正式LDF checkpoint。未标记为`LOCKED`的内容继续视为讨论项。
+状态：`ROOT5_BODY259_DATA_CONTRACT_READY`。Hybrid LDF、Body259 VAE接口、唯一HumanML263转换器、在线EMA Hybrid bridge、persistent训练合同、dense/sparse XZ监督、原子推理session和训练期stream/rolling评测已经落地；新Body259 VAE与LDF权重需要从头训练。未标记为`LOCKED`的内容继续视为讨论项。
 
 这个目录用于把新版 Floodcontrol 的设计讨论拆成可独立审阅的主题，避免把模型协议、数据语义、在线状态、训练目标和实验超参数混在同一份文档里。
 
@@ -11,7 +11,7 @@
 2. [`02_DATA_PIPELINE.md`](02_DATA_PIPELINE.md)
    只讨论离线表示构建、完整 clip 恢复、数据增强、window/epoch 采样、token cache 和 Dataset/DataLoader。
    [`02_VAE_AND_BODY_REPRESENTATION.md`](02_VAE_AND_BODY_REPRESENTATION.md)
-   冻结body265、四组统计、四帧VAE、loss和显式decoder state协议。
+   冻结Root5/Body259、四组physical statistics、四帧VAE、loss和显式decoder state协议。
 3. [`03_STREAMING_ACTIVE_WINDOW.md`](03_STREAMING_ACTIVE_WINDOW.md)
    只讨论推理时 authoritative world state、SessionFrame、OriginEpoch、active noisy window、buffer roll、cache 生命周期和原子更新。
 4. [`04_TRAINING_METHOD.md`](04_TRAINING_METHOD.md)

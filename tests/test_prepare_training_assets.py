@@ -59,23 +59,27 @@ def test_pre_vae_pipeline_builds_and_resumes_all_non_t5_assets(tmp_path):
 
     main(arguments)
 
-    human = raw_data / "HumanML3D_motion"
-    babel = raw_data / "BABEL_motion"
+    human = raw_data / "HumanML3D_motion_local"
+    babel = raw_data / "BABEL_motion_local"
     assert (human / "artifacts" / "human.npz").is_file()
     assert (babel / "artifacts" / "babel.npz").is_file()
     assert (human / "all.txt").read_text() == "human\n"
     assert (babel / "all.txt").read_text() == "babel\n"
-    for path, fields in (
-        (
-            human / "motion_stats.npz",
-            {"local_root_mean", "local_root_std", "body_cont_mean", "body_cont_std"},
-        ),
-        (
-            raw_data / "HumanML3D_BABEL_motion_stats.npz",
-            {"local_root_mean", "local_root_std", "body_cont_mean", "body_cont_std"},
-        ),
-        (human / "root_stats.npz", {"root_mean", "root_std"}),
-    ):
+    with np.load(human / "artifacts" / "human.npz") as human_motion, np.load(
+        babel / "artifacts" / "babel.npz"
+    ) as babel_motion:
+        assert set(human_motion.files) == {
+            "root_motion",
+            "body_motion",
+            "body_feature_valid_mask",
+        }
+        for name in human_motion.files:
+            assert np.array_equal(human_motion[name], babel_motion[name])
+        assert human_motion["root_motion"].dtype == np.float32
+        assert human_motion["body_motion"].dtype == np.float32
+        assert human_motion["body_feature_valid_mask"].dtype == np.bool_
+    fields = {"local_root_mean", "local_root_std", "body_cont_mean", "body_cont_std"}
+    for path in (human / "motion_stats.npz",):
         with np.load(path, allow_pickle=False) as values:
             assert fields <= set(values.files)
             assert set(values.files) - fields <= {"metadata"}
@@ -84,10 +88,10 @@ def test_pre_vae_pipeline_builds_and_resumes_all_non_t5_assets(tmp_path):
                 if name.endswith("std"):
                     assert (values[name] > 0).all()
 
-    report_path = raw_data / "training_assets.json"
+    assert not (raw_data / "HumanML3D_BABEL_motion_stats.npz").exists()
+    report_path = raw_data / "training_assets_local.json"
     first_report = json.loads(report_path.read_text())
     assert first_report["stages"]["humanml_motion"]["status"] == "completed"
-    assert first_report["stages"]["multi_motion_statistics"]["status"] == "completed"
     assert first_report["stages"]["pre_vae_verification"]["status"] == "completed"
 
     main(arguments)
@@ -96,13 +100,11 @@ def test_pre_vae_pipeline_builds_and_resumes_all_non_t5_assets(tmp_path):
         "humanml_motion",
         "babel_motion",
         "humanml_motion_statistics",
-        "multi_motion_statistics",
-        "ldf_root_statistics",
     ):
         assert second_report["stages"][stage]["status"] == "reused"
 
 
-def test_post_vae_pipeline_uses_ema_checkpoint_and_writes_latent_stats(tmp_path):
+def test_verify_uses_a_self_contained_ema_vae_checkpoint(tmp_path):
     raw_data = tmp_path / "raw_data"
     _write_humanml_source(raw_data / "HumanML3D")
     _write_babel_source(raw_data / "BABEL_streamed")
@@ -117,10 +119,9 @@ def test_post_vae_pipeline_uses_ema_checkpoint_and_writes_latent_stats(tmp_path)
         ]
     )
 
-    motion_stats = raw_data / "HumanML3D_motion" / "motion_stats.npz"
+    motion_stats = raw_data / "HumanML3D_motion_local" / "motion_stats.npz"
     model = BodyVAE(
         motion_stats_path=motion_stats,
-        latent_stats_path=None,
         latent_dim=4,
         hidden_dim=8,
         encoder_layers=1,
@@ -141,12 +142,12 @@ def test_post_vae_pipeline_uses_ema_checkpoint_and_writes_latent_stats(tmp_path)
         },
         checkpoint,
     )
-    config = tmp_path / "tiny_vae.yaml"
+    config = tmp_path / "tiny_ldf.yaml"
     config.write_text(
         "\n".join(
             [
-                "model:",
-                "  target: models.vae_wan_1d.BodyVAE",
+                f"base_config: {Path(__file__).resolve().parents[1] / 'configs' / 'ldf_base.yaml'}",
+                "vae:",
                 "  params:",
                 "    latent_dim: 4",
                 "    hidden_dim: 8",
@@ -154,8 +155,6 @@ def test_post_vae_pipeline_uses_ema_checkpoint_and_writes_latent_stats(tmp_path)
                 "    decoder_layers: 1",
                 "    kernel_size: 3",
                 "    dropout: 0.0",
-                f"    motion_stats_path: {motion_stats}",
-                "    latent_stats_path: null",
                 "",
             ]
         )
@@ -163,27 +162,26 @@ def test_post_vae_pipeline_uses_ema_checkpoint_and_writes_latent_stats(tmp_path)
 
     main(
         [
-            "post-vae",
+            "verify",
             "--raw-data-root",
             str(raw_data),
-            "--vae-config",
-            str(config),
             "--vae-checkpoint",
             str(checkpoint),
-            "--latent-device",
-            "cpu",
-            "--latent-batch-size",
-            "1",
+            "--ldf-config",
+            str(config),
+            "--ldf-multi-config",
+            str(config),
             "--skip-t5",
         ]
     )
 
-    latent_stats = checkpoint.parent / "latent_stats.npz"
-    with np.load(latent_stats, allow_pickle=False) as values:
-        assert values["mean"].shape == (4,)
-        assert values["std"].shape == (4,)
-        assert np.isfinite(values["mean"]).all()
-        assert (values["std"] > 0).all()
-    report = json.loads((raw_data / "training_assets.json").read_text())
-    assert report["stages"]["vae_latent_statistics"]["status"] == "completed"
+    report = json.loads((raw_data / "training_assets_local.json").read_text())
     assert report["stages"]["final_verification"]["status"] == "completed"
+    details = report["stages"]["final_verification"]["details"]
+    assert details["vae_checkpoint"]["latent_dim"] == 4
+    assert set(details["vae_checkpoint"]["physical_statistics"]) == {
+        "body_cont_mean",
+        "body_cont_std",
+        "local_root_mean",
+        "local_root_std",
+    }

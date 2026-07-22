@@ -7,6 +7,8 @@ from typing import Mapping
 
 import torch
 
+from models.vae_wan_1d import BodyVAE
+
 
 PHYSICAL_STATISTIC_BUFFERS = (
     "body_cont_mean",
@@ -25,8 +27,8 @@ def _checkpoint_state(checkpoint: Mapping[str, object]) -> dict[str, torch.Tenso
         for name, value in state.items()
         if torch.is_tensor(value)
     }
-    # Older checkpoints stored placeholder latent normalization as persistent
-    # buffers. Latent statistics now come only from latent_stats_path.
+    # Historical VAE checkpoints may contain post-hoc latent normalization.
+    # Raw posterior means are now the tokenizer space, so these are not state.
     result.pop("latent_mean", None)
     result.pop("latent_std", None)
     return result
@@ -57,28 +59,38 @@ def _apply_ema(
 
 
 def load_vae_checkpoint(
-    model,
     checkpoint_path: str | Path,
     *,
+    model_params: Mapping[str, object],
     use_ema: bool = True,
     freeze: bool = True,
-):
-    """Load one training checkpoint into ``model``.
+) -> BodyVAE:
+    """Construct a BodyVAE from one self-contained training checkpoint.
 
-    Physical statistics must match the model configuration. Latent statistics
-    are deliberately absent from checkpoint state and remain untouched.
+    Architecture parameters come from configuration. Physical body/local-root
+    statistics come only from checkpoint buffers, so LDF/runtime callers do not
+    need the VAE training statistics file.
     """
 
     checkpoint = torch.load(
         Path(checkpoint_path), map_location="cpu", weights_only=False, mmap=True
     )
     state = _checkpoint_state(checkpoint)
-    configured = model.state_dict()
+    statistics: dict[str, torch.Tensor] = {}
     for name in PHYSICAL_STATISTIC_BUFFERS:
-        if name not in state or not torch.equal(state[name], configured[name].cpu()):
-            raise RuntimeError(
-                f"VAE checkpoint statistics do not match model buffer {name!r}"
-            )
+        value = state.get(name)
+        if not torch.is_tensor(value):
+            raise RuntimeError(f"VAE checkpoint is missing physical buffer {name!r}")
+        statistics[name] = value
+    params = dict(model_params)
+    forbidden = {"motion_stats_path", "motion_statistics", "latent_stats_path"}
+    duplicated = forbidden.intersection(params)
+    if duplicated:
+        raise ValueError(
+            "checkpoint-loaded BodyVAE parameters must contain architecture only; "
+            f"remove {sorted(duplicated)}"
+        )
+    model = BodyVAE(motion_statistics=statistics, **params)
     if use_ema:
         state = _apply_ema(model, state, checkpoint)
     model.load_state_dict(state, strict=True)

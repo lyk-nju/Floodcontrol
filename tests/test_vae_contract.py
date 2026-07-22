@@ -17,7 +17,7 @@ from utils.motion_process import (
 def make_body(batch=2, frames=8):
     return pack_body(
         torch.randn(batch, frames, 21, 3),
-        torch.randn(batch, frames, 22, 6),
+        torch.randn(batch, frames, 21, 6),
         torch.randn(batch, frames, 22, 3),
         torch.randint(0, 2, (batch, frames, 4)).float(),
     )
@@ -30,9 +30,9 @@ def make_root(batch=2, frames=8):
     return root
 
 
-def test_body265_pack_unpack_roundtrip():
+def test_body259_pack_unpack_roundtrip():
     body = make_body()
-    assert body.shape[-1] == BODY_DIM == 265
+    assert body.shape[-1] == BODY_DIM == 259
     parts = unpack_body(body)
     rebuilt = pack_body(*parts.values())
     assert torch.equal(rebuilt, body)
@@ -40,7 +40,7 @@ def test_body265_pack_unpack_roundtrip():
 
 def test_contract_rejects_non_strict_frame_length():
     inputs = VAEInput(
-        body_motion=torch.zeros(1, 5, 265),
+        body_motion=torch.zeros(1, 5, 259),
         root_motion=torch.zeros(1, 5, 5),
         frame_valid_mask=torch.ones(1, 5, dtype=torch.bool),
     )
@@ -78,15 +78,14 @@ def test_local_velocity_is_invariant_to_global_yaw_rotation():
 def test_contacts_are_not_zscore_normalized():
     model = make_vae(
         latent_dim=8, hidden_dim=8, encoder_layers=1, decoder_layers=1,
-        with_latent_stats=False,
     )
     body = make_body(batch=1)
     normalized = model.normalize_body(body)
-    assert torch.equal(normalized[..., 261:], body[..., 261:])
+    assert torch.equal(normalized[..., 255:], body[..., 255:])
 
 
 def test_rotation_matrix_roundtrip_preserves_rotation():
-    rotation = torch.randn(2, 3, 22, 6)
+    rotation = torch.randn(2, 3, 21, 6)
     matrix = rotation_to_matrix(rotation)
     rebuilt = rotation_to_matrix(matrix_to_rotation(matrix))
     assert torch.allclose(rebuilt, matrix, atol=1e-6)

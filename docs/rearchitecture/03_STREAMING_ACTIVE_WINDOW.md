@@ -23,9 +23,9 @@ text / world XZ route / sparse root observations
 LDFStreamState -> LDF.stream_generate_step()
                     |
                     v
- committed normalized HybridMotion [B,1]
+ committed physical-root/raw-mu HybridMotion [B,1]
                     |
-      root denormalize + world translation
+             world translation
                     |
         backward local-root4 derivation
                     |
@@ -83,17 +83,16 @@ world_xz = model_xz + origin_xz
 yaw_model = yaw_world
 ```
 
-理由是body latent保存global rotations，模型外单独旋转root会破坏root/body一致性；XZ translation不改变global rotations或heading-local velocity。初始world位置由`origin_xz`提供，初始yaw属于显式root heading observation。
+理由是body latent保存HumanML IK-gauge rotations，模型外单独旋转root会破坏root/body一致性；XZ translation不改变该rotation block或heading-local velocity。这个block不充当physical facing；初始world位置由`origin_xz`提供，初始yaw属于显式root heading observation。
 
-world route和root observations始终是权威事实。每次condition compilation都使用当前origin重新生成normalized model-space value/mask，不缓存坐标相关embedding。
+world route和root observations始终是权威事实。每次condition compilation都使用当前origin重新生成physical model-space value/mask，不缓存坐标相关embedding。
 
 ## 6. Per-commit translation rebase与纯buffer roll
 
 训练的每个continuation窗口都以最后一帧history为局部零点。为保持同一合同，runtime每次commit后都使用该committed token最后一帧model-space physical XZ作为translation offset，并在任何buffer rolling之前调用LDF拥有的`scheduler-aware`变换：
 
 ```text
-delta_normalized = delta_physical / root_std[xz]
-root_t[xz] -= (1 - beta) * delta_normalized
+root_t[xz] -= (1 - beta) * delta_physical
 previous_root_frame[xz] -= delta_physical
 origin_xz += delta_physical
 ```
@@ -106,7 +105,7 @@ origin_xz += delta_physical
 - latent、heading、root height、VAE state与RNG不变；
 - 下一step从world事实重新编译所有root条件。
 
-committed token在rebase前返回，`InferenceSession`先用旧origin恢复其world输出，再把同一offset累加到`origin_xz`。该操作由`LDF.rebase_stream_state()`实现，因为root statistics、三角beta和normalized noisy state属于LDF scheduler，不属于Web或condition compiler。
+committed token在rebase前返回，`InferenceSession`先用旧origin恢复其world输出，再把同一offset累加到`origin_xz`。该操作由`LDF.commit_step()`和`rebase_motion_state()`实现；三角beta和persistent noisy state属于LDF scheduler，不属于Web或condition compiler。
 
 达到window边界后的rolling只删除旧token、推进`window_origin/epoch`、补充新Gaussian source并维护被删除窗口的previous-root boundary；它不再执行translation rebase，也不存在`rebase_on_roll`开关。
 

@@ -15,22 +15,20 @@ validation:
     enabled: false
 
 vae:
-  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/last.ckpt
-  params:
-    latent_stats_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/latent_stats.npz
+  checkpoint_path: null
 
 data:
   target: datasets.humanml3d.HumanML3DDataset
-  text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion/t5_text_embeddings.pt
+  text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion_local/t5_text_embeddings.pt
   text_meta_paths:
-    - ${dirs.raw_data}/HumanML3D_motion/all.txt
+    - ${dirs.raw_data}/HumanML3D_motion_local/all.txt
   train_meta_paths:
-    - ${dirs.raw_data}/HumanML3D_motion/train.txt
+    - ${dirs.raw_data}/HumanML3D_motion_local/train.txt
   val_meta_paths:
-    - ${dirs.raw_data}/HumanML3D_motion/val.txt
+    - ${dirs.raw_data}/HumanML3D_motion_local/val.txt
   test_probe_meta_paths:
     dense_xz:
-      - ${dirs.raw_data}/HumanML3D_motion/test_min.txt
+      - ${dirs.raw_data}/HumanML3D_motion_local/test.txt
   artifact_path: artifacts
   text_path: texts
   train_batch_size: 8

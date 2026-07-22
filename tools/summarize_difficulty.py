@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize root5/body265 artifact trajectory difficulty and split bins.
+"""Summarize root5/body259 artifact trajectory difficulty and split bins.
 
 This script scans a HumanML3D metadata list (e.g. train.txt / test_min.txt),
 loads per-sample physical root motion, computes a few simple

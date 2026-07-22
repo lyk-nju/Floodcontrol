@@ -7,7 +7,11 @@ import torch
 from utils.motion_process import (
     BODY_CONTINUOUS_DIM,
     BODY_DIM,
+    LEFT_ANKLE_INDEX,
+    LEFT_TOE_INDEX,
     ROOT_DIM,
+    RIGHT_ANKLE_INDEX,
+    RIGHT_TOE_INDEX,
     project_root_heading,
     recover_joint_positions,
 )
@@ -15,17 +19,12 @@ from utils.motion_process import (
 
 # HumanML 22-joint order used by the motion representation.  Body facing is
 # estimated from the same hip/shoulder geometry used by HumanML preprocessing,
-# rather than from the global root rotation stored in body265.  The latter has
-# a dataset-specific IK gauge and is therefore not directly comparable to the
-# physical root5 heading.
+# rather than from the IK-derived rotation block stored in body259. The latter
+# is retained for HumanML reconstruction and is not a physical-facing label.
 _RIGHT_HIP = 2
 _LEFT_HIP = 1
 _RIGHT_SHOULDER = 17
 _LEFT_SHOULDER = 16
-_LEFT_ANKLE = 7
-_RIGHT_ANKLE = 8
-_LEFT_TOE = 10
-_RIGHT_TOE = 11
 
 
 def _validate_inputs(
@@ -44,14 +43,20 @@ def _validate_inputs(
         BODY_CONTINUOUS_DIM,
         BODY_DIM,
     ):
-        raise ValueError("predicted_body must be physical [B,F,261 or 265]")
+        raise ValueError(
+            "predicted_body must be physical [B,F,"
+            f"{BODY_CONTINUOUS_DIM} or {BODY_DIM}]"
+        )
     if tuple(predicted_body.shape[:2]) != tuple(predicted_root.shape[:2]):
         raise ValueError("predicted body and root must share [B,F]")
     if target_body.ndim != 3 or target_body.shape[-1] not in (
         BODY_CONTINUOUS_DIM,
         BODY_DIM,
     ):
-        raise ValueError("target_body must be physical [B,F,261 or 265]")
+        raise ValueError(
+            "target_body must be physical [B,F,"
+            f"{BODY_CONTINUOUS_DIM} or {BODY_DIM}]"
+        )
     if tuple(target_body.shape[:2]) != tuple(predicted_root.shape[:2]):
         raise ValueError("target body and root must share [B,F]")
     if tuple(frame_mask.shape) != tuple(predicted_root.shape[:2]):
@@ -123,10 +128,10 @@ def _foot_forward_directions(
     joints = recover_joint_positions(root_motion, body_motion)
     directions = torch.stack(
         [
-            joints[..., _LEFT_TOE, [0, 2]]
-            - joints[..., _LEFT_ANKLE, [0, 2]],
-            joints[..., _RIGHT_TOE, [0, 2]]
-            - joints[..., _RIGHT_ANKLE, [0, 2]],
+            joints[..., LEFT_TOE_INDEX, [0, 2]]
+            - joints[..., LEFT_ANKLE_INDEX, [0, 2]],
+            joints[..., RIGHT_TOE_INDEX, [0, 2]]
+            - joints[..., RIGHT_ANKLE_INDEX, [0, 2]],
         ],
         dim=-2,
     ).float()

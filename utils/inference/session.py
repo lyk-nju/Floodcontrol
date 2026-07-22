@@ -161,8 +161,6 @@ class InferenceSession:
             raise ValueError("inference models must be in eval mode")
         if ldf.latent_dim != body_vae.latent_dim:
             raise ValueError("LDF and BodyVAE latent dimensions do not match")
-        if not body_vae.latent_statistics_ready:
-            raise RuntimeError("BodyVAE latent statistics are required for inference")
         if abs(float(ldf.fps) - float(body_vae.fps)) > 1e-6:
             raise ValueError("LDF and BodyVAE FPS must match")
         if not isinstance(config, InferenceConfig):
@@ -177,8 +175,9 @@ class InferenceSession:
             scale_constraint=ldf.cfg_scale_constraint,
             scale_joint=ldf.cfg_scale_joint,
         )
-        device = ldf.root_mean.device
-        dtype = next(ldf.parameters()).dtype
+        ldf_parameter = next(ldf.parameters())
+        device = ldf_parameter.device
+        dtype = ldf_parameter.dtype
         vae_parameter = next(body_vae.parameters())
         if vae_parameter.device != device:
             raise ValueError("LDF and BodyVAE must be on the same device")
@@ -230,8 +229,6 @@ class InferenceSession:
         )
         self.condition_compiler = InferenceConditionCompiler(
             text_embeddings=TextEmbeddingCache(text_encoder),
-            root_mean=ldf.root_mean,
-            root_std=ldf.root_std,
             fps=ldf.fps,
             active_tokens=ldf.chunk_size,
             max_horizon_token=config.max_horizon_token,
@@ -322,8 +319,7 @@ class InferenceSession:
         if candidate_ldf.commit_index != token_index + 1:
             raise RuntimeError("LDF must commit exactly one token per inference step")
 
-        physical_model_root = self.ldf.denormalize_root(committed.root_motion)
-        world_root = physical_model_root.clone()
+        world_root = committed.root_motion.clone()
         world_root[..., 0] += self.origin_xz[:, None, None, 0]
         world_root[..., 2] += self.origin_xz[:, None, None, 1]
         if not bool(torch.isfinite(world_root).all()):
@@ -358,7 +354,7 @@ class InferenceSession:
         # ``stream_generate_step`` has already rebased its persistent model
         # state by this committed token's final model-space XZ.  World output
         # must use the old origin; only the next transaction sees the update.
-        translation = physical_model_root[:, 0, -1, [0, 2]].clone()
+        translation = committed.root_motion[:, 0, -1, [0, 2]].clone()
         candidate_origin = self.origin_xz + translation.to(self.origin_xz)
         rebased = True
         if candidate_ldf.epoch != old_epoch:

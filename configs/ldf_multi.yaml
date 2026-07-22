@@ -15,9 +15,7 @@ validation:
     enabled: false
 
 vae:
-  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/last.ckpt
-  params:
-    latent_stats_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/latent_stats.npz
+  checkpoint_path: null
 
 data:
   target: datasets.multi.MultiDataset
@@ -25,20 +23,20 @@ data:
   datasets:
     - target: datasets.humanml3d.HumanML3DDataset
       text_meta_paths:
-        - ${dirs.raw_data}/HumanML3D_motion/all.txt
+        - ${dirs.raw_data}/HumanML3D_motion_local/all.txt
       train_meta_paths:
-        - ${dirs.raw_data}/HumanML3D_motion/train.txt
+        - ${dirs.raw_data}/HumanML3D_motion_local/train.txt
       val_meta_paths:
-        - ${dirs.raw_data}/HumanML3D_motion/val.txt
+        - ${dirs.raw_data}/HumanML3D_motion_local/val.txt
       artifact_path: artifacts
       text_path: texts
     - target: datasets.babel.BABELDataset
       text_meta_paths:
-        - ${dirs.raw_data}/BABEL_motion/all.txt
+        - ${dirs.raw_data}/BABEL_motion_local/all.txt
       train_meta_paths:
-        - ${dirs.raw_data}/BABEL_motion/train.txt
+        - ${dirs.raw_data}/BABEL_motion_local/train.txt
       val_meta_paths:
-        - ${dirs.raw_data}/BABEL_motion/val.txt
+        - ${dirs.raw_data}/BABEL_motion_local/val.txt
       artifact_path: artifacts
       text_path: texts
   train_batch_size: 16

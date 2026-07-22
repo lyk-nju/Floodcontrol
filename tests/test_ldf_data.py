@@ -20,7 +20,7 @@ def make_sample(frames=40, name="sample"):
     root[:, 0] = torch.arange(frames, dtype=torch.float32)
     root[:, 2] = torch.arange(frames, dtype=torch.float32) * 2
     root[:, 3] = 1
-    body = torch.zeros(frames, 265)
+    body = torch.zeros(frames, 259)
     body[:, 0] = torch.arange(frames, dtype=torch.float32)
     return {
         "dataset": "test",
@@ -63,7 +63,7 @@ def test_parent_window_at_sequence_start_has_no_fake_encoder_context():
     assert batch["source_start_token"].tolist() == [0]
     assert batch["context_token_count"].tolist() == [0]
     assert not batch["previous_root_valid_mask"].item()
-    assert batch["body_with_context"].shape == (1, 40, 265)
+    assert batch["body_with_context"].shape == (1, 40, 259)
     assert torch.equal(batch["body_motion"][0, :, 0], torch.arange(40))
 
 
@@ -112,7 +112,7 @@ def test_each_sample_keeps_its_natural_parent_length_and_uses_right_padding():
     assert batch["frame_valid_mask"][1].all()
     assert batch["source_start_token"].tolist() == [0, 0]
     assert batch["context_token_count"].tolist() == [0, 0]
-    assert batch["body_with_context"].shape == (2, 48, 265)
+    assert batch["body_with_context"].shape == (2, 48, 259)
     assert batch["body_with_context_frame_valid_mask"][0, :40].all()
     assert not batch["body_with_context_frame_valid_mask"][0, 40:].any()
     assert batch["body_with_context_frame_valid_mask"][1].all()

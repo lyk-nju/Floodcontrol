@@ -1,7 +1,8 @@
-"""Build root5/body265 artifacts from the processed HumanML3D dataset.
+"""Build root5/body259 artifacts from the processed HumanML3D dataset.
 
 The builder reads ``new_joint_vecs`` and source split TXT files from one
-HumanML3D root, then writes a separate, resumable ``HumanML3D_motion`` dataset.
+HumanML3D root, then writes a separate, resumable
+``HumanML3D_motion_local`` dataset.
 Rotations are explicitly identified as HumanML3D IK-derived rotations rather
 than native AMASS/SMPL pose parameters.
 """
@@ -16,7 +17,7 @@ from typing import Iterable
 
 import numpy as np
 
-from tools.convert_motion_263_to_265 import HUMANML_DIM
+from tools.convert_motion_263_to_259 import HUMANML_DIM
 from utils.token_frame import (
     FRAMES_PER_TOKEN,
     aligned_frame_floor,
@@ -57,6 +58,8 @@ def _read_split(path: Path) -> list[str]:
         names.append(name)
     if not names:
         raise RuntimeError(f"HumanML3D split contains no sample ids: {path}")
+    if len(names) != len(set(names)):
+        raise ValueError(f"HumanML3D split contains duplicate sample ids: {path}")
     return names
 
 
@@ -225,7 +228,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         required=True,
-        help="separate processed dataset root, for example HumanML3D_motion",
+        help="separate processed dataset root, for example HumanML3D_motion_local",
     )
     parser.add_argument(
         "--splits", nargs="+", default=list(DEFAULT_SPLITS), choices=DEFAULT_SPLITS

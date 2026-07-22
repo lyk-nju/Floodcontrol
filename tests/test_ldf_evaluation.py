@@ -73,18 +73,18 @@ def _zero_prediction(self, inputs, **kwargs):
     local = torch.zeros(*root_velocity.shape[:3], 4, device=root_velocity.device)
     valid = torch.ones_like(local, dtype=torch.bool)
     return LDFPrediction(
-        HybridMotion(root_velocity, latent_velocity),
-        inputs.noisy_motion.root_motion,
-        local,
-        valid,
+        raw_root_output=inputs.noisy_motion.root_motion,
+        raw_body_output=latent_velocity,
+        clean_motion=inputs.noisy_motion,
+        solver_velocity=HybridMotion(root_velocity, latent_velocity),
+        local_root_motion=local,
+        local_root_feature_valid=valid,
     )
 
 
 def _evaluation_module():
     model = LDF(
         latent_dim=3,
-        root_mean=[0] * 5,
-        root_std=[1] * 5,
         local_root_mean=[0] * 4,
         local_root_std=[1] * 4,
         hidden_dim=8,
@@ -410,7 +410,7 @@ def test_dense_xz_yaw_video_probe_renders_only_configured_rotation_triplet(
     root[:, 0] = torch.linspace(0.0, 0.7, 8)
     root[:, 1] = 1.0
     root[:, 3] = 1.0
-    body = torch.zeros(8, 265)
+    body = torch.zeros(8, 259)
     sample = {
         "dataset": "HumanML3D",
         "name": "001168",
@@ -496,7 +496,7 @@ def test_dense_xz_artifacts_follow_floodnet_layout(tmp_path):
     root = torch.zeros(8, 5)
     root[:, 1] = 1.0
     root[:, 3] = 1.0
-    body = torch.zeros(8, 265)
+    body = torch.zeros(8, 259)
     dirs = save_dense_xz_sample(
         save_dir=tmp_path,
         dataset="HumanML3D",
@@ -504,8 +504,8 @@ def test_dense_xz_artifacts_follow_floodnet_layout(tmp_path):
         step_tag="step_010000",
         sample_id="sample",
         caption="walk",
-        normalized_root=torch.zeros(2, 4, 5),
-        normalized_latent=torch.zeros(2, 128),
+        root_motion=torch.zeros(2, 4, 5),
+        latent_motion=torch.zeros(2, 128),
         predicted_root=root,
         predicted_body=body,
         target_root=root,
@@ -571,7 +571,7 @@ def test_dense_xz_video_embeds_trajectory_in_fixed_camera_scene(
     target_root[:, 0] = torch.tensor([0.0, 1.0])
     predicted_root = torch.zeros(2, 5)
     predicted_root[:, 2] = torch.tensor([0.0, 1.0])
-    body = torch.zeros(2, 265)
+    body = torch.zeros(2, 259)
     video_path = tmp_path / "video.mp4"
     composite_path = tmp_path / "composite.mp4"
     evaluation_artifacts.render_comparison_video(
@@ -618,7 +618,7 @@ def test_generation_modes_share_runtime_but_only_rolling_moves_window(
         "dataset": "HumanML3D",
         "name": "sample",
         "root_motion": root,
-        "body_motion": torch.zeros(16, 265),
+        "body_motion": torch.zeros(16, 259),
         "text_data": [
             {
                 "text": "walk",
@@ -640,10 +640,10 @@ def test_generation_modes_share_runtime_but_only_rolling_moves_window(
         num_denoise_steps=2,
         initial_noise_yaw_degrees=0,
     )
-    assert generated.normalized_motion.root_motion.shape == (1, 4, 4, 5)
-    assert generated.normalized_motion.latent_motion.shape == (1, 4, 3)
+    assert generated.hybrid_motion.root_motion.shape == (1, 4, 4, 5)
+    assert generated.hybrid_motion.latent_motion.shape == (1, 4, 3)
     assert generated.root_motion.shape == (16, 5)
-    assert generated.body_motion.shape == (16, 265)
+    assert generated.body_motion.shape == (16, 259)
     assert generated.traces[-1].window_origin_after == expected_final_origin
 
 
@@ -658,7 +658,7 @@ def test_generation_evaluation_can_override_model_guidance_mode():
         "dataset": "HumanML3D",
         "name": "sample",
         "root_motion": root,
-        "body_motion": torch.zeros(8, 265),
+        "body_motion": torch.zeros(8, 259),
         "text_data": [
             {
                 "text": "walk",

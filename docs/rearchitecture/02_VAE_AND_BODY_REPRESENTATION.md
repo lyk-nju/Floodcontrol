@@ -1,119 +1,144 @@
-# 02 Body VAE 与显式动作表示
+# VAE 与 Root5 / Body259 表示
 
-状态：`TOKENIZER_AND_RUNTIME_READY / LDF_TRAINING_PENDING`
+## 1. 唯一物理合同
 
-## 目标
-
-新版动作状态由explicit root与latent body组成。VAE只编码body，root保持为LDF可直接生成和约束的结构化变量。该设计参考ARDY的hybrid representation、Patch4 tokenizer和local-root-conditioned decoder，但保留FloodDiffusion的因果卷积工程基础。
-
-## 物理表示
+每个20 FPS物理帧拆成：
 
 ```text
-root_motion [B,F,5]
-  root xyz                                3
-  cos/sin global heading                 2
+root_motion [F,5]
+  [0:3] xyz
+  [3:5] cos(yaw), sin(yaw)
 
-body_motion [B,F,265]
-  non-root planar-root-relative positions 21*3 = 63
-  global joint rotation 6D                22*6 = 132
-  backward global joint velocities        22*3 = 66
-  foot contacts                                  4
+body_motion [F,259]
+  [0:63]    21个非Root关节的root-heading-local位置
+  [63:189]  21个非Root关节的heading-frame cumulative IK rotation6d
+  [189:255] 22个关节的current-heading-local backward velocity
+  [255:259] 4维foot contact
 ```
 
-positions只从x/z减去planar root，y保留世界高度。rotations和velocities保持全局朝向，因此随机yaw增强必须同步旋转root、positions、rotations和velocities。
-
-运行时代码只允许通过`utils/motion_process.py`处理该物理表示。该模块拥有全部物理维度常量、heading单位圆投影与唯一local-root codec；LDF/VAE condition模块只定义tensor合同并单向依赖它，不能重新实现root派生。公共接口固定为`pack_body/unpack_body`、`rotation_to_matrix/matrix_to_rotation`、`compute_joint_velocities/build_motion`、`project_root_heading`、`recover_root_yaw/recover_local_root/recover_joint_positions`和两种yaw旋转函数；模块不包含263D、272D或trajectory7分支。HumanML 263D的root积分、世界关节恢复、层级rotation组合与唯一263→265转换只存在于离线`tools/convert_motion_263_to_265.py`，Dataset和模型不得导入该工具。
-
-文件职责按依赖方向冻结为`conditions → motion_process → coordinate_transform`。`utils/coordinate_transform.py`只保留无表示所有权的yaw、XZ点和XZ向量坐标变换；`utils/training/vae/checkpoint.py`提供训练、LDF、评测和runtime共用的EMA checkpoint加载函数；离线`tools/convert_motion_263_to_265.py`和`tools/build_motion_artifact.py`负责source转换与最小NPZ写入。运行时已删除`utils/motion_artifact.py`，VAE不建立bundle、模型身份或artifact血缘层。
-
-## Token与因果合同
-
-- `utils/token_frame.py`唯一拥有`FRAMES_PER_TOKEN=4`及frame/token换算；模型输入帧数必须整除4，模型、Dataset和runtime不得自行向上取整或静默截断。
-- `utils/token_frame.py`同时唯一定义`MOTION_FPS=20.0`。VAE直接读取这个项目时间协议，不在`vae.params`中暴露一个可与数据协议产生分歧的`fps`实验参数。
-- encoder在进入网络前将连续四帧reshape为一个patch；不存在首帧特殊token。
-- encoder/decoder均在token轴使用causal convolution，token t不读取t+1。
-- decoder每次读取一个128D latent token和一个`[4,4]` local-root patch，严格输出四帧。
-- decoder cache由调用者以`VAEDecoderState(caches)`显式持有，不允许module-global cache或`first_chunk`开关；模型只更新cache tensor。
-- 当前encoder与decoder的精确因果历史均为24 tokens（96 frames）；模型分别通过`encoder_context_tokens`与`decoder_context_tokens`公开该值。
-
-## BodyVAE公共接口
-
-公共方法按latent空间固定语义，不使用布尔参数切换输入解释：
+`Root5`是世界XYZ平移和绝对heading yaw的唯一所有者，不包含root pitch/roll。
+设`R_t`为root-heading-frame到世界坐标的主动yaw旋转：
 
 ```text
-encode                       physical body -> raw posterior（VAE训练）
-decode / decode_step         raw latent -> physical body
-tokenize                     full physical body -> normalized deterministic mu
-tokenize_window              context + active body -> normalized active mu（LDF训练）
-detokenize / detokenize_step normalized latent -> physical body
-forward                      只接受VAEInput
+p_body(t,j) = R_t^T (p_world(t,j) - p_world(t,root))
+p_world(t,j) = p_world(t,root) + R_t p_body(t,j)
+v_body(t,j) = R_t^T (p_world(t,j) - p_world(t-1,j)) * 20
 ```
 
-`BodyVAE`只持有网络、前向所需statistics buffers与上述计算接口。构造时直接读取普通`motion_stats.npz`与可选`latent_stats.npz`，只校验数组shape、finite和正std，不解析metadata，也不生成模型/session identity。训练、LDF、评测和runtime统一调用`load_vae_checkpoint(model, checkpoint_path, use_ema=True)`加载同一个训练checkpoint。
+位置减去完整root XYZ，因此Body不携带绝对高度。速度使用当前帧heading、backward difference和m/s单位；cold-start第一帧速度置零且mask为false。Body中的root joint velocity只是重建/诊断信息，最终root运动始终由Root5决定。
 
-## Local root
+世界平移或统一世界yaw只改变Root5；Body259保持数值不变。这是数据合同，不是近似增强目标。VAE/LDF collator的translation rebase和random yaw因此都只能修改Root5，不能旋转Body block。
+
+## 2. Rotation gauge
+
+当前HumanML与BABEL源都是HumanML-style 263D。rotation来自HumanML IK，不是原生SMPL rotation。明确区分：
 
 ```text
-local_root_motion [B,T,4,4]
-  [yaw_rate, current-heading-local vx, current-heading-local vz, root_y]
+C_t = HumanML world-to-heading canonical rotation
+R_t = physical root-heading-to-world yaw rotation
+R_t = C_t^T
 ```
 
-差分使用当前帧减前一帧。裁剪位于原序列中间时必须携带真实previous root；cold start的首帧yaw/velocity无效并置零，root height仍有效。该处有意不同于ARDY公开代码的forward/world-axis velocity，以满足persistent decoder在token边界不读取未来帧的要求。
-
-## 统计所有权
+由HumanML parent-local IK rotation `L_j`恢复累计矩阵：
 
 ```text
-local root statistics    [4]
-body continuous stats    [261]
-latent mu statistics     [128]
+A_0 = C_t
+A_j = A_parent(j) L_j
+B_j = R_t^T A_j, j=1..21
 ```
 
-VAE statistics只拥有decoder local root与body；LDF global root statistics由后续LDF数据协议独立生成。contacts保持0/1，不参与z-score。physical stats只从train split计算；latent stats只在VAE冻结后用deterministic posterior mu计算。两个statistics文件都是普通NPZ：physical文件保存四组mean/std，latent文件只保存`mean/std`。latent buffers为non-persistent，不进入训练checkpoint。正确checkpoint与statistics配对由实验配置负责，模型不追踪文件hash、yaw policy或artifact manifest。
+Body259保存`B_j`的矩阵前两列6D，名称固定为`heading-frame cumulative IK rotation`。它不是parent-local rotation。恢复累计世界/gauge矩阵时使用`A_j = R_t B_j`；评测回写parent-local rotation时必须重新按骨架父子关系求相对矩阵。
 
-VAE train collator在物理空间施加独立`Uniform(0,2π)`全局yaw，因此第一帧yaw不会固定为零。该变换同步作用于root xz/heading、root-relative positions、global rotations、global velocities和previous-root boundary；contacts保持不变，current-heading-local root velocity在变换前后保持不变。Dataset本身不做任何随机变换。physical statistics使用`0/90/180/270`度四点quadrature；由于所有受影响通道都对yaw的cos/sin线性，该方法精确匹配连续均匀yaw的一阶与逐维二阶矩，同时保持统计结果确定性。
+累计rotation较冗余，父子预测可能不完全一致。VAE验收必须同时报告direct-position、rotation-FK和两者差异；HumanML源本身已有非零position/FK误差，所以比较的是相对源基线，而不是强制绝对零。
 
-ARDY使用一个physical stats集合的root/local/body切片，并为tokenizer latent保存额外统计；Floodcontrol保留physical/latent分离，但使用普通数组文件而非强血缘协议。
+关节顺序、parent表、raw offset方向及左右脚索引只由`utils/motion_process.py`定义。rotation6D始终保存矩阵前两列，禁止行展开。
 
-## VAE与loss
+## 3. VAE边界
 
-encoder输出`mu/logvar [B,T,128]`。VAE训练通过reparameterization采样，validation同时报告sample reconstruction与deterministic-mu reconstruction，LDF训练固定使用deterministic `mu`。正式tokenizer固定为同一checkpoint的EMA encoder与EMA decoder；raw/EMA混用和缺少EMA的checkpoint均fail-fast。
-
-训练目标冻结为`L_total = L_recon + 0.01 L_skate + 1e-5 L_KL`，不使用KL warmup。其中`L_recon`由三个分别归一化、分别masked-mean的continuous SmoothL1 block（position、rotation、velocity）和contact BCE相加，避免132D rotation仅凭维数支配重建目标。`L_skate`从预测global foot positions的相邻帧差分直接派生足速，再使用GT contact加权；它排除crop首帧、padding及无效position transition，因此直接约束最终展示使用的位置轨迹。独立velocity feature仍只受velocity reconstruction监督，velocity consistency默认关闭。geodesic、FK-to-GT、direct/FK position consistency和backward velocity consistency不进入正式配置，只保留为后续独立消融能力。
-
-## LDF训练时在线编码
-
-正式LDF训练不读取预编码latent artifact。Dataset只返回完整确定性的physical `root5/body265`；LDF collator派生crop、encoder context与previous-root边界，未来trainer再由冻结EMA encoder在线计算deterministic `mu`：
+VAE只编码Body259，root不进入encoder：
 
 ```text
-load deterministic root5/body265
-  -> choose token-aligned crop and encoder history context
-  -> apply one shared yaw to root/body/context/previous boundary
-  -> frozen EMA tokenizer.tokenize_window() under no_grad
-  -> normalized deterministic mu
-  -> construct HybridMotion(root_motion, latent_motion)
-  -> LDF v-predict
+encode()            physical Body259 -> raw posterior(mu, logvar)
+decode()            raw latent + physical local-root4 -> physical Body259
+tokenize()          physical Body259 -> deterministic raw mu
+tokenize_window()   real context + active Body259 -> active raw mu
+detokenize()        raw mu + physical local-root4 -> Body259
+detokenize_step()   one raw mu token + explicit cache -> four physical frames
 ```
 
-LDF训练不得采样posterior，也不得通过VAE encoder反传。一个training batch只执行一次encoder；scheduled training或self-forcing的多次LDF update复用同一份detached target。当前data contract使用普通worker RNG执行train crop/可选yaw，validation固定取前缀且关闭随机增强；更强的epoch/DDP可复现策略待真实trainer恢复时确定，不在Dataset中加入hash协议。
+训练`forward()`使用posterior sample；LDF、评测和runtime固定使用raw deterministic `mu`。不生成`latent_mean/std`，不做latent whitening。
 
-`utils/training/ldf/lightning_module.py`是唯一VAE→LDF训练边界：从正式checkpoint加载并冻结EMA VAE，以`tokenize_window()`在线产生normalized deterministic μ；同时通过LDF自己的`normalize_root()`归一化physical active root并reshape为`[B,T,4,5]`，最终构造共享token mask的`HybridMotion`。LDF latent维度、local-root statistics和collator需要的encoder context长度都直接来自VAE实例，不在配置中维护第二份数值。bridge必须逐样本验证active root token数等于去除context后的body token数，不能只比较批内最大tensor shape。root/latent在normalization后都重新清零padding。
+Decoder condition由Root5派生：
 
-由于encoder是token-causal，同一个active token不能因LDF crop起点不同而得到不同target。每个样本在线encode时携带`min(window_start_token, encoder_context_tokens)`个真实历史token；当前每个residual block含两个kernel为`k`的causal convolution，因此最大历史为`encoder_layers * 2 * (k - 1)`个token。批内输入固定为`[真实context | active crop | 右padding]`，`context_token_count [B]`给出逐样本active offset；`tokenize_window()`一次batch前向后逐样本gather active deterministic μ并将active padding置零。窗口接口不返回padding posterior，从而不存在对伪造logvar采样的歧义。真实序列起点历史不足由causal convolution自身的左边界处理，collator不得插入假零token。context、active crop与previous-root boundary必须共享同一个yaw。
+```text
+local_root4 = [yaw_rate, current-heading-local vx, vz, root_y]
+```
 
-latent statistics仍是必需的独立小型文件，但不保存逐样本latent。VAE冻结后使用同一EMA encoder、相同context协议和确定性均匀yaw扫描train split，得到`mean/std [128]`。正式LDF训练始终在线编码，不提供逐样本latent cache工具。
+差分使用当前帧减前一帧。中间crop携带真实previous-root；真实序列起点的yaw rate和XZ velocity置零且无效，root height仍有效。
 
-正式训练从每段动作中随机裁剪20–200帧（1–10秒、四帧对齐）的片段，共训练300k optimizer steps。优化采用FloodDiffusion验证过的AdamW `2e-4`与constant-after-warmup schedule：前1k steps线性升至基础学习率，之后保持恒定，便于在300k后按验证曲线直接续训。HumanML和HumanML+BABEL配置统一使用单卡、`strategy: auto`和实际batch size 128，不通过梯度累积或静默缩小batch改变有效训练协议。
+VAE只保留四组physical statistics buffer：
 
-## LDF接口补充
+```text
+body_cont_mean/std  [255]
+local_root_mean/std [4]
+```
 
-body保存global rotations，因此pure-noise cold start还需要绝对heading。Body Stage从唯一clean root派生首个有效帧的`[cos(yaw), sin(yaw)]` heading condition；该值与local root一起在stage boundary detach，不读取raw constraints，也不把Body loss传回Root Stage。
+contacts保持0/1。statistics仅从HumanML train split计算；HumanML+BABEL VAE也复用同一组HumanML statistics。训练checkpoint自包含四个buffer；LDF/runtime通过公共loader加载EMA encoder+decoder，不读取统计NPZ。
 
-## HumanML T2M评测适配
+## 4. Token与causal合同
 
-HumanML预训练movement/motion evaluator固定消费标准263D特征，因此FID、Diversity、Matching Score与R-Precision不得直接读取root5/body265，也不为新版表示重新训练另一套embedding模型。统一通过`metrics.humanml.convert_root5_body265_to_humanml263()`恢复标准root4、heading-canonical positions、21-joint local rotation6d、heading-local joint displacement和contacts，再沿用FloodDiffusion相同的evaluator mean/std与checkpoint。
+- `FRAMES_PER_TOKEN=4`，输入帧数必须整除4；预处理只丢弃不足四帧的尾部。
+- encoder/decoder均为token轴causal convolution。
+- 当前正式结构公开`encoder_context_tokens=decoder_context_tokens=24`，即96帧。
+- `tokenize_window()`输入布局为`[真实context | active | 右padding]`，逐样本`context_token_count[B]`裁掉真实context；序列起点允许context不足，不插入假历史。
+- decoder cache由调用方显式持有，module内部没有隐藏session状态。
+- full encode与context-window encode、full decode与逐token stream decode必须数值一致。
 
-标准HumanML每一行保存当前pose以及到下一pose的forward transition，所以`F`帧physical motion只严格确定`F-1`行263D。`tail="drop"`用于验证可观测部分的数学round-trip；与固定长度FloodDiffusion结果做正式横向比较时显式使用`tail="approximate"`，以最后一次观测transition外推不可见的尾transition并保持`F`行，避免T2M内部`length // 4`少掉一个完整movement token。128条真实验证中该保长适配的FID漂移为`1.49e-4`，而drop后直接对完整reference评测的漂移为`2.59e-3`。适配器必须对全局translation/yaw不变，并通过原始263 → root5/body265 → 263 round-trip回归。`tools.compare_humanml_adapter`同时报告分feature误差、严格drop、保长近似及drop-vs-full的预训练T2M embedding/FID漂移。
+## 5. Loss与诊断
 
-## 当前阻塞
+基础重建分别对position、rotation、velocity做masked normalized SmoothL1，并对contact做BCE。position-derived skating只约束接触脚的世界位置速度，不代表脚方向或FK一致性。
 
-HumanML3D-only VAE已完成300k steps。`step_299999.ckpt`中的EMA encoder+decoder可由公共checkpoint loader直接加载；历史`latent_stats.npz`仍可作为现有实验资产使用，新统计工具则用显式seed普通随机生成器扫描Dataset full sample。完整EMA validation的deterministic-mu total为`0.0051869`，sample total为`0.0051965`；posterior sigma mean为`0.00341`。LDF real-context collator、逐样本window tokenization、正式128D EMA在线编码和normalized HybridMotion bridge均已实现；正式H/G/F/C训练窗口、self-forcing、noise/beta、condition与root/latent v-predict loss仍未接入，因此真实LDF训练继续fail-fast。当前`root_stats.npz`只匹配临时简单crop/rebase策略，正式窗口冻结后必须通过共享sampler重新计算。Web已通过`InferenceSession`在每个LDF commit后原子执行`detokenize_step()`，并将结果作为严格四帧chunk传输；模型加载仍等待正式LDF checkpoint合同。现有300k权重是在position-derived skating启用前训练的，重新加载不会让该checkpoint获得新的loss收益。
+正式训练持续记录posterior `mu` mean/RMS/channel std、logvar、KL、active latent fraction和sigma。VAE评测至少报告：
+
+- Body local reconstruction；
+- GT Root5下的world MPJPE；
+- rotation geodesic；
+- source FK/direct基线、reconstruction FK/direct和FK/target误差；
+- ankle-toe方向误差、反向比例和长度误差；
+- contact accuracy、position-derived skating；
+- offline/stream parity。
+
+FK/geodesic/position-consistency/velocity-consistency可作为独立消融；启用FK loss必须提供与冻结HumanML22 parent/offset合同一致的skeleton offsets。
+
+## 6. LDF接口
+
+LDF只依赖EMA VAE的：
+
+```text
+latent_dim
+encoder_context_tokens
+tokenize_window(...)
+detokenize(...)
+init_decoder_state(...)
+detokenize_step(...)
+```
+
+LDF的Body状态就是raw posterior `mu`。LDF checkpoint不保存VAE参数；启动时独立加载并冻结VAE，且VAE不进入LDF optimizer或EMA。
+
+Body259改变了position、rotation和velocity坐标系，因此旧Body265 VAE/LDF checkpoint不兼容。新VAE必须从头训练，新LDF必须基于新VAE从头训练；shape不符时直接失败。
+
+## 7. HumanML263评测边界
+
+标准T2M evaluator仍消费HumanML263。转换前必须移除序列初始XZ与初始heading：
+
+```text
+R_rel(t) = R_abs(0)^T R_abs(t)
+C_HML(t) = R_rel(t)^T
+A_canon(t,j) = R_rel(t) B(t,j)
+```
+
+对root直接子关节：`L_j = C_HML^T A_canon,j`；其他关节：`L_j = A_canon,parent^T A_canon,j`。直接把绝对Root5 heading写入HumanML rotation会在第一层关节产生双重yaw。
+
+RIC XZ来自Body local position，RIC Y为`body_local_y + root_y`。root transition从Root5相邻帧计算；evaluator joint velocity从恢复后的世界position用forward difference重算，不使用Body中的backward velocity。`F`个物理pose严格产生`F-1`个HumanML rows。
+
+正式发布门槛包括263 round-trip、0/45/90/180度及随机yaw不变性、第一层髋/脊柱rotation测试、T2M feature漂移和GT self-FID基线。

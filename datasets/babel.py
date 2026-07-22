@@ -1,4 +1,4 @@
-"""BABEL Dataset for complete root5/body265 motion sequences."""
+"""BABEL Dataset for complete root5/body259 motion sequences."""
 
 from __future__ import annotations
 
@@ -121,11 +121,16 @@ class BABELDataset(Dataset):
                 )
 
             # Ignore optional metadata stored by older preprocessing versions.
-            root_motion = torch.from_numpy(data["root_motion"]).float()
-            body_motion = torch.from_numpy(data["body_motion"]).float()
-            body_feature_valid_mask = torch.from_numpy(
-                data["body_feature_valid_mask"]
-            ).bool()
+            root_array = np.asarray(data["root_motion"])
+            body_array = np.asarray(data["body_motion"])
+            mask_array = np.asarray(data["body_feature_valid_mask"])
+            if root_array.dtype != np.float32 or body_array.dtype != np.float32:
+                raise ValueError(f"motion tensors must be float32 in {path}")
+            if mask_array.dtype != np.bool_:
+                raise ValueError(f"body_feature_valid_mask must be bool in {path}")
+            root_motion = torch.from_numpy(root_array)
+            body_motion = torch.from_numpy(body_array)
+            body_feature_valid_mask = torch.from_numpy(mask_array)
 
         if root_motion.ndim != 2 or root_motion.shape[-1] != ROOT_DIM:
             raise ValueError(f"root_motion must be [F,{ROOT_DIM}] in {path}")
@@ -147,6 +152,9 @@ class BABELDataset(Dataset):
             torch.isfinite(body_motion).all()
         ):
             raise ValueError(f"motion contains non-finite values in {path}")
+        heading_norm = root_motion[:, 3:5].norm(dim=-1)
+        if not bool(torch.allclose(heading_norm, torch.ones_like(heading_norm), atol=1e-5)):
+            raise ValueError(f"root heading must be normalized in {path}")
 
         return root_motion, body_motion, body_feature_valid_mask
 

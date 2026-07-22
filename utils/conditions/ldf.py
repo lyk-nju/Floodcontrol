@@ -46,7 +46,7 @@ def _is_prefix_mask(mask: torch.Tensor) -> bool:
 
 @dataclass(frozen=True)
 class HybridMotion:
-    """The only persistent generative state: explicit root plus body latent."""
+    """Persistent state: physical root5 plus raw deterministic VAE latent."""
 
     root_motion: torch.Tensor
     latent_motion: torch.Tensor
@@ -450,8 +450,17 @@ class LDFInput:
 
 @dataclass(frozen=True)
 class LDFPrediction:
-    velocity: HybridMotion
-    clean_root_motion: torch.Tensor
+    """Native outputs plus physical and solver-facing interpretations.
+
+    ``clean_motion.root_motion`` is always the projected physical Root-to-Body
+    view. The Root solver endpoint remains raw until commit and is represented
+    only through ``solver_velocity``.
+    """
+
+    raw_root_output: torch.Tensor
+    raw_body_output: torch.Tensor
+    clean_motion: HybridMotion
+    solver_velocity: HybridMotion
     local_root_motion: torch.Tensor
     local_root_feature_valid: torch.Tensor
 

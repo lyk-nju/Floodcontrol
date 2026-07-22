@@ -401,10 +401,10 @@ generated += predicted_velocity * dt
 
 ```text
 state.noisy_motion.root_motion[active]
-    += prediction.velocity.root_motion[active] * dt
+    += prediction.solver_velocity.root_motion[active] * delta_beta
 
 state.noisy_motion.latent_motion[active]
-    += prediction.velocity.latent_motion[active] * dt
+    += prediction.solver_velocity.latent_motion[active] * delta_beta
 ```
 
 达到 clean/commit 条件后输出一个 `HybridMotion` token。runtime 使用 committed `root_motion` 派生 `local_root_motion`，再调用 causal VAE `decode_step(latent_motion, local_root_motion, decoder_state)`。LDF denoising loop 不调用 decoder。
@@ -492,7 +492,7 @@ FlexTraj attention
 外置root planner/post-decode projection正式路径
 ```
 
-历史阶段曾将训练与Web入口同步阻断在BodyVAE边界。当前BodyVAE、token prompt timeline、UMT5条件、active/future XZ、flow-v loss、optimizer/EMA与原子`InferenceSession`已经落地；canonical root statistics也已重算。训练入口直接检查所需文件、窗口预算、lookahead和dropout，不再要求额外的`training_ready`状态字段。Web模型加载继续以`BLOCKED_ON_LDF_CHECKPOINT`等待首个正式LDF checkpoint。
+历史阶段曾将训练与Web入口同步阻断在BodyVAE边界。当前BodyVAE、token prompt timeline、UMT5条件、active/future XZ、Root-x0/Body-velocity loss、optimizer/EMA与原子`InferenceSession`已经落地。训练入口直接检查所需checkpoint、窗口预算、lookahead、prediction type和dropout，不要求root/latent statistics或额外状态字段。Web模型加载继续以`BLOCKED_ON_LDF_CHECKPOINT`等待首个正式LDF checkpoint。
 
 ## 10. 最低验收测试
 

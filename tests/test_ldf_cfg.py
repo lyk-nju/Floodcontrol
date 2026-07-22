@@ -9,8 +9,6 @@ from utils.conditions.ldf import HybridMotion, LDFCondition, LDFInput
 def test_separated_cfg_combination_and_shared_root_boundary():
     model = LDF(
         latent_dim=2,
-        root_mean=[0] * 5,
-        root_std=[1] * 5,
         local_root_mean=[0] * 4,
         local_root_std=[1] * 4,
         hidden_dim=8,
@@ -64,8 +62,12 @@ def test_separated_cfg_combination_and_shared_root_boundary():
     output = model.predict_with_cfg(
         inputs, mode="separated", cfg_scale_text=2.0, cfg_scale_constraint=3.0
     )
-    assert torch.allclose(output.velocity.root_motion, torch.full_like(output.velocity.root_motion, 8.0))
-    assert torch.allclose(output.velocity.latent_motion, torch.full_like(output.velocity.latent_motion, 8.0))
+    assert torch.allclose(output.raw_root_output, torch.full_like(output.raw_root_output, 8.0))
+    assert torch.allclose(output.raw_body_output, torch.full_like(output.raw_body_output, 8.0))
+    assert torch.allclose(
+        output.clean_motion.root_motion[..., 3:5].norm(dim=-1),
+        torch.ones_like(output.clean_motion.root_motion[..., 3]),
+    )
     assert len(seen_local) == 3
     assert all(torch.equal(seen_local[0], item) for item in seen_local[1:])
     assert all(torch.equal(seen_heading[0], item) for item in seen_heading[1:])

@@ -18,16 +18,16 @@ rolling 与 route/text revision 不再由 Web 重复维护。后台生产与 HTT
 
 ## 当前阻塞项
 
-正式 Hybrid LDF 尚未完成训练，因此仓库还没有可以冻结的 LDF checkpoint、
-root statistics identity 和 checkpoint loader contract。`model_loader.load_model_bundle()`
+正式Root-x0/Body-velocity LDF尚未完成训练，因此仓库还没有可以冻结的LDF checkpoint
+和checkpoint loader contract。`model_loader.load_model_bundle()`
 会在尝试加载任何 legacy checkpoint 前明确抛出 `BLOCKED_ON_LDF_CHECKPOINT`。
 
 完成正式 LDF 训练后，需要实现唯一的 `ModelBundle` loader，加载并校验：
 
-1. LDF checkpoint 与冻结 global/local root statistics；
-2. 已训练 BodyVAE checkpoint 与 latent statistics；
+1. LDF checkpoint与Root/Body prediction合同；
+2. 自包含EMA BodyVAE checkpoint及其physical body/local-root buffers；
 3. UMT5 text encoder/tokenizer；
-4. FPS、latent dimension 和 contract/checkpoint identity。
+4. FPS、latent dimension和checkpoint内容身份。
 
 静态服务器可以启动并通过 `/api/status` 报告阻塞原因；在 loader 完成前，
 `POST /api/sessions` 会返回 HTTP 503，而不会回退到旧推理路径。

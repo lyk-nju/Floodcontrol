@@ -26,12 +26,16 @@ def _require_file(path: str, name: str) -> None:
         raise RuntimeError(f"{name}_REQUIRED: file not found at {path}")
 
 
-def _validate_training_config(cfg) -> None:
-    _require_file(str(cfg.data.root_stats_path), "ROOT_STATISTICS")
-    _require_file(str(cfg.vae.checkpoint_path), "VAE_CHECKPOINT")
-    _require_file(str(cfg.vae.params.motion_stats_path), "MOTION_STATISTICS")
-    _require_file(str(cfg.vae.params.latent_stats_path), "LATENT_STATISTICS")
-    _require_file(str(cfg.data.text_embeddings_path), "TEXT_EMBEDDINGS")
+def _validate_training_config(cfg, *, check_assets: bool = True) -> None:
+    """Validate the LDF recipe and, optionally, its external asset files."""
+
+    if check_assets:
+        _require_file(str(cfg.vae.checkpoint_path), "VAE_CHECKPOINT")
+        _require_file(str(cfg.data.text_embeddings_path), "TEXT_EMBEDDINGS")
+    for name in ("root_prediction_type", "body_prediction_type"):
+        value = str(cfg.model.params.get(name, ""))
+        if value not in {"x0", "velocity"}:
+            raise ValueError(f"model.params.{name} must be x0 or velocity")
     if int(cfg.model.params.text_len) != int(cfg.text_encoder.text_len):
         raise ValueError("model.text_len and text_encoder.text_len must match")
     training = cfg.get("training") or {}
@@ -90,30 +94,10 @@ def _validate_training_config(cfg) -> None:
         "body_weight",
         "rollout_weight",
         "root_boundary_weight",
-        "root_heading_cosine_weight",
-        "root_heading_vector_weight",
     ):
         value = float(loss.get(name, 0.0))
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"loss.{name} must be finite and non-negative")
-    beta_min = float(loss.get("offpath_beta_min", 0.1))
-    if not math.isfinite(beta_min) or beta_min <= 0.0:
-        raise ValueError("loss.offpath_beta_min must be finite and positive")
-    heading_beta_min = float(loss.get("root_heading_beta_min", 0.1))
-    if not math.isfinite(heading_beta_min) or heading_beta_min <= 0.0:
-        raise ValueError(
-            "loss.root_heading_beta_min must be finite and positive"
-        )
-    heading_cosine_min_norm = float(
-        loss.get("root_heading_cosine_min_norm", 0.05)
-    )
-    if (
-        not math.isfinite(heading_cosine_min_norm)
-        or heading_cosine_min_norm <= 0.0
-    ):
-        raise ValueError(
-            "loss.root_heading_cosine_min_norm must be finite and positive"
-        )
     sampling = training.get("constraint_sampling") or {}
     probabilities = [
         float(sampling.get(name, -1.0))
@@ -195,8 +179,9 @@ def _validate_training_config(cfg) -> None:
                 raise ValueError(
                     f"data.test_probe_meta_paths must define {probe!r}"
                 )
-            for index, path in enumerate(probe_paths[probe]):
-                _require_file(str(path), f"DENSE_XZ_PROBE_{index}")
+            if check_assets:
+                for index, path in enumerate(probe_paths[probe]):
+                    _require_file(str(path), f"DENSE_XZ_PROBE_{index}")
         if bool(t2m.get("enabled", False)):
             t2m_steps = int(t2m.get("steps", 0))
             if t2m_steps <= 0 or t2m_steps % validation_steps:
@@ -212,14 +197,15 @@ def _validate_training_config(cfg) -> None:
             if cfg.get("metrics") is None or cfg.metrics.get("t2m") is None:
                 raise ValueError("validation.t2m requires metrics.t2m")
             metric_cfg = cfg.metrics.t2m
-            for name, path in (
-                ("T2M_MEAN", metric_cfg.metric_mean_path),
-                ("T2M_STD", metric_cfg.metric_std_path),
-                ("T2M_TEXT_ENCODER", metric_cfg.textencoder.ckpt),
-                ("T2M_MOVEMENT_ENCODER", metric_cfg.moveencoder.ckpt),
-                ("T2M_MOTION_ENCODER", metric_cfg.motionencoder.ckpt),
-            ):
-                _require_file(str(path), name)
+            if check_assets:
+                for name, path in (
+                    ("T2M_MEAN", metric_cfg.metric_mean_path),
+                    ("T2M_STD", metric_cfg.metric_std_path),
+                    ("T2M_TEXT_ENCODER", metric_cfg.textencoder.ckpt),
+                    ("T2M_MOVEMENT_ENCODER", metric_cfg.moveencoder.ckpt),
+                    ("T2M_MOTION_ENCODER", metric_cfg.motionencoder.ckpt),
+                ):
+                    _require_file(str(path), name)
 
 
 def _create_run_directory(cfg) -> tuple[str, Path]:

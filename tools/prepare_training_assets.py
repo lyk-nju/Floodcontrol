@@ -5,9 +5,9 @@ Expected sources match FloodDiffusion's processed releases::
     HumanML3D/{new_joint_vecs,texts,train.txt,val.txt,test.txt}
     BABEL_streamed/{motions,texts,train_processed.txt,val_processed.txt}
 
-``pre-vae`` builds motion/statistics/text assets. ``post-vae`` computes latent
-statistics with a trained EMA BodyVAE. ``all`` runs both and ``verify`` only
-checks the resulting training contract.
+``pre-vae`` builds processed motion, VAE physical statistics, and text tables.
+``verify`` checks those assets and, when supplied, a self-contained VAE
+checkpoint suitable for LDF startup.
 """
 
 from __future__ import annotations
@@ -34,18 +34,19 @@ import numpy as np
 from datasets.babel import BABELDataset
 from datasets.humanml3d import HumanML3DDataset
 from tools.build_motion_artifact import atomic_write_text
-from tools.compute_ldf_root_stats import root_statistics_recipe
+from tools.pretokenize_t5_text import collect_unique_captions
 from utils.initialize import load_config
+from utils.motion_process import BODY_CONTINUOUS_DIM, BODY_DIM, ROOT_DIM
 from utils.training.ldf.text import TextEmbeddingLookup
+from utils.training.vae.checkpoint import load_vae_checkpoint
 
 
 MOTION_STATISTIC_SHAPES = {
     "local_root_mean": (4,),
     "local_root_std": (4,),
-    "body_cont_mean": (261,),
-    "body_cont_std": (261,),
+    "body_cont_mean": (BODY_CONTINUOUS_DIM,),
+    "body_cont_std": (BODY_CONTINUOUS_DIM,),
 }
-ROOT_STATISTIC_SHAPES = {"root_mean": (5,), "root_std": (5,)}
 
 
 @dataclass(frozen=True)
@@ -57,8 +58,6 @@ class AssetPaths:
     humanml: Path
     babel: Path
     humanml_stats: Path
-    multi_stats: Path
-    root_stats: Path
     humanml_t5: Path
     multi_t5: Path
     report: Path
@@ -123,8 +122,8 @@ def _resolve_paths(args) -> AssetPaths:
         if args.babel_source
         else raw_data / "BABEL_streamed"
     )
-    humanml = raw_data / "HumanML3D_motion"
-    babel = raw_data / "BABEL_motion"
+    humanml = raw_data / "HumanML3D_motion_local"
+    babel = raw_data / "BABEL_motion_local"
     return AssetPaths(
         raw_data=raw_data,
         deps=deps,
@@ -133,11 +132,9 @@ def _resolve_paths(args) -> AssetPaths:
         humanml=humanml,
         babel=babel,
         humanml_stats=humanml / "motion_stats.npz",
-        multi_stats=raw_data / "HumanML3D_BABEL_motion_stats.npz",
-        root_stats=humanml / "root_stats.npz",
         humanml_t5=humanml / "t5_text_embeddings.pt",
         multi_t5=raw_data / "HumanML3D_BABEL_t5_text_embeddings.pt",
-        report=raw_data / "training_assets.json",
+        report=raw_data / "training_assets_local.json",
     )
 
 
@@ -189,6 +186,40 @@ def _read_split(path: Path) -> list[str]:
     return names
 
 
+def _validate_motion_artifact(path: Path) -> int:
+    with np.load(path, allow_pickle=False) as sample:
+        expected = {"root_motion", "body_motion", "body_feature_valid_mask"}
+        if set(sample.files) != expected:
+            raise ValueError(f"invalid motion artifact fields at {path}")
+        root_motion = np.asarray(sample["root_motion"])
+        body_motion = np.asarray(sample["body_motion"])
+        feature_mask = np.asarray(sample["body_feature_valid_mask"])
+        if (
+            root_motion.ndim != 2
+            or root_motion.shape[-1] != ROOT_DIM
+            or root_motion.dtype != np.float32
+            or body_motion.ndim != 2
+            or body_motion.shape[-1] != BODY_DIM
+            or body_motion.dtype != np.float32
+            or feature_mask.shape != body_motion.shape
+            or feature_mask.dtype != np.bool_
+            or root_motion.shape[0] != body_motion.shape[0]
+            or root_motion.shape[0] < 4
+            or root_motion.shape[0] % 4
+        ):
+            raise ValueError(f"invalid root5/body259 shapes or dtypes at {path}")
+        if not np.isfinite(root_motion).all() or not np.isfinite(body_motion).all():
+            raise ValueError(f"non-finite motion artifact at {path}")
+        if not np.allclose(
+            np.linalg.norm(root_motion[:, 3:5], axis=-1),
+            1.0,
+            atol=1e-5,
+            rtol=0.0,
+        ):
+            raise ValueError(f"non-unit root heading at {path}")
+    return int(root_motion.shape[0])
+
+
 def _validate_dataset(root: Path, splits: tuple[str, ...]) -> dict[str, object]:
     counts: dict[str, int] = {}
     split_union: set[str] = set()
@@ -212,7 +243,18 @@ def _validate_dataset(root: Path, splits: tuple[str, ...]) -> dict[str, object]:
         raise RuntimeError(
             f"processed dataset all.txt does not equal the split union at {root}"
         )
-    return {"path": str(root.resolve()), "splits": counts, "all": len(all_names)}
+    total_frames = 0
+    for name in all_names:
+        total_frames += _validate_motion_artifact(
+            root / "artifacts" / f"{name}.npz"
+        )
+    return {
+        "path": str(root.resolve()),
+        "splits": counts,
+        "all": len(all_names),
+        "frames": total_frames,
+        "body_dim": BODY_DIM,
+    }
 
 
 def _validate_statistics(
@@ -243,21 +285,6 @@ def _validate_statistics(
     }
 
 
-def _validate_root_statistics(path: Path, cfg) -> dict[str, object]:
-    details = _validate_statistics(path, ROOT_STATISTIC_SHAPES)
-    with np.load(path, allow_pickle=False) as values:
-        if "metadata" not in values:
-            raise ValueError("root statistics have no frozen sampling metadata")
-        metadata = json.loads(str(np.asarray(values["metadata"]).item()))
-    expected = root_statistics_recipe(cfg)
-    if metadata != expected:
-        raise ValueError(
-            f"root statistics contract mismatch: saved={metadata}, expected={expected}"
-        )
-    details["sampling"] = metadata
-    return details
-
-
 def _validate_t5(path: Path, config: str, paths: AssetPaths) -> dict[str, object]:
     cfg = load_config(config, _overrides(paths))
     table = TextEmbeddingLookup(
@@ -265,10 +292,14 @@ def _validate_t5(path: Path, config: str, paths: AssetPaths) -> dict[str, object
         expected_dim=int(cfg.model.params.text_dim),
         expected_text_len=int(cfg.model.params.text_len),
     )
+    captions = sorted(collect_unique_captions(cfg))
+    for start in range(0, len(captions), 1024):
+        table.lookup(captions[start : start + 1024])
     return {
         "path": str(path.resolve()),
         "size": int(path.stat().st_size),
         "captions": len(table),
+        "required_captions": len(captions),
         "content_id": table.content_id,
     }
 
@@ -379,65 +410,19 @@ def _statistics_command(config: str, paths: AssetPaths, output: Path) -> list[st
 
 
 def _prepare_statistics(args, paths: AssetPaths, report: PreparationReport) -> None:
-    for name, config, output in (
-        ("humanml_motion_statistics", args.vae_config, paths.humanml_stats),
-        ("multi_motion_statistics", args.vae_multi_config, paths.multi_stats),
-    ):
-        pending = _pending_path(output, ".npz")
-        _stage(
-            report,
-            name,
-            validate=lambda output=output: _validate_statistics(
-                output, MOTION_STATISTIC_SHAPES
-            ),
-            action=lambda config=config, output=output, pending=pending: _run_atomic(
-                _statistics_command(config, paths, pending),
-                output=output,
-                pending=pending,
-                validate=lambda value: _validate_statistics(
-                    value, MOTION_STATISTIC_SHAPES
-                ),
-            ),
-            force=args.force,
-        )
-
-    cfg = load_config(args.ldf_config, _overrides(paths))
-    root_recipe = root_statistics_recipe(cfg)
-    pending = _pending_path(paths.root_stats, ".npz")
-    root_command = [
-        sys.executable,
-        "-m",
-        "tools.compute_ldf_root_stats",
-        "--train-meta-paths",
-        str(paths.humanml / "train.txt"),
-        "--artifact-path",
-        "artifacts",
-        "--output",
-        str(pending),
-        "--fps",
-        str(args.fps),
-        "--min-frames",
-        str(cfg.data.min_frames),
-        "--max-frames",
-        str(int(root_recipe["window_tokens"]) * 4),
-        "--windows-per-sample",
-        str(root_recipe["windows_per_sample"]),
-        "--active-tokens",
-        str(root_recipe["generation_tokens"]),
-        "--seed",
-        str(args.root_seed),
-    ]
-    if not bool(root_recipe["random_yaw"]):
-        root_command.append("--no-random-yaw")
+    output = paths.humanml_stats
+    pending = _pending_path(output, ".npz")
     _stage(
         report,
-        "ldf_root_statistics",
-        validate=lambda: _validate_root_statistics(paths.root_stats, cfg),
+        "humanml_motion_statistics",
+        validate=lambda: _validate_statistics(output, MOTION_STATISTIC_SHAPES),
         action=lambda: _run_atomic(
-            root_command,
-            output=paths.root_stats,
+            _statistics_command(args.vae_config, paths, pending),
+            output=output,
             pending=pending,
-            validate=lambda value: _validate_root_statistics(value, cfg),
+            validate=lambda value: _validate_statistics(
+                value, MOTION_STATISTIC_SHAPES
+            ),
         ),
         force=args.force,
     )
@@ -509,21 +494,24 @@ def _prepare_t5(args, paths: AssetPaths, report: PreparationReport) -> None:
     human_pending = _pending_path(paths.humanml_t5, ".pt")
 
     def human_action() -> None:
+        human_pending.unlink(missing_ok=True)
+        legacy_table = paths.raw_data / "HumanML3D_motion" / "t5_text_embeddings.pt"
+        if legacy_table.is_file():
+            shutil.copy2(legacy_table, human_pending)
         command, environment = _t5_command(
             config=args.ldf_config,
             output=human_pending,
             paths=paths,
             devices=devices,
             batch_size=args.t5_batch_size,
-            reuse=False,
+            reuse=human_pending.is_file(),
         )
-        _run_atomic(
-            command,
-            output=paths.humanml_t5,
-            pending=human_pending,
-            validate=lambda value: _validate_t5(value, args.ldf_config, paths),
-            env=environment,
-        )
+        try:
+            _run(command, env=environment)
+            _validate_t5(human_pending, args.ldf_config, paths)
+            human_pending.replace(paths.humanml_t5)
+        finally:
+            human_pending.unlink(missing_ok=True)
 
     _stage(
         report,
@@ -562,75 +550,16 @@ def _prepare_t5(args, paths: AssetPaths, report: PreparationReport) -> None:
     )
 
 
-def _prepare_latent(args, paths: AssetPaths, report: PreparationReport) -> Path:
-    if not args.vae_checkpoint:
-        raise RuntimeError("VAE_CHECKPOINT_REQUIRED: set --vae-checkpoint")
-    checkpoint = Path(args.vae_checkpoint).expanduser().resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
-    output = (
-        Path(args.latent_output).expanduser().resolve()
-        if args.latent_output
-        else checkpoint.parent / "latent_stats.npz"
-    )
-    latent_dim = int(load_config(args.vae_config, _overrides(paths)).model.params.latent_dim)
-    shapes = {"mean": (latent_dim,), "std": (latent_dim,)}
-    pending = _pending_path(output, ".npz")
-    command = [
-        sys.executable,
-        "-m",
-        "tools.compute_vae_latent_stats",
-        "--train-meta-paths",
-        str(paths.humanml / "train.txt"),
-        "--artifact-path",
-        "artifacts",
-        "--config",
-        args.vae_config,
-        "--checkpoint",
-        str(checkpoint),
-        "--motion-stats",
-        str(paths.humanml_stats),
-        "--output",
-        str(pending),
-        "--device",
-        args.latent_device,
-        "--yaw-seed",
-        str(args.latent_yaw_seed),
-        "--batch-size",
-        str(args.latent_batch_size),
-    ]
-    _stage(
-        report,
-        "vae_latent_statistics",
-        validate=lambda: _validate_statistics(output, shapes),
-        action=lambda: _run_atomic(
-            command,
-            output=output,
-            pending=pending,
-            validate=lambda value: _validate_statistics(value, shapes),
-        ),
-        force=args.force,
-    )
-    return output
-
-
 def _verify(
     args,
     paths: AssetPaths,
-    *,
-    latent_stats: Path | None,
 ) -> dict[str, object]:
-    cfg = load_config(args.ldf_config, _overrides(paths))
     details: dict[str, object] = {
         "humanml": _validate_dataset(paths.humanml, ("train", "val", "test")),
         "babel": _validate_dataset(paths.babel, ("train", "val")),
         "humanml_motion_stats": _validate_statistics(
             paths.humanml_stats, MOTION_STATISTIC_SHAPES
         ),
-        "multi_motion_stats": _validate_statistics(
-            paths.multi_stats, MOTION_STATISTIC_SHAPES
-        ),
-        "root_stats": _validate_root_statistics(paths.root_stats, cfg),
     }
     if not args.skip_t5:
         details["humanml_t5"] = _validate_t5(paths.humanml_t5, args.ldf_config, paths)
@@ -652,15 +581,31 @@ def _verify(
     )
     for dataset in (human, babel):
         sample = dataset[0]
-        if sample["root_motion"].shape[-1] != 5 or sample["body_motion"].shape[-1] != 265:
-            raise ValueError("processed sample does not satisfy root5/body265")
+        if (
+            sample["root_motion"].shape[-1] != ROOT_DIM
+            or sample["body_motion"].shape[-1] != BODY_DIM
+        ):
+            raise ValueError("processed sample does not satisfy root5/body259")
 
-    if latent_stats is not None:
-        latent_dim = int(load_config(args.vae_config, _overrides(paths)).model.params.latent_dim)
-        details["latent_stats"] = _validate_statistics(
-            latent_stats, {"mean": (latent_dim,), "std": (latent_dim,)}
-        )
+    if args.vae_checkpoint:
         checkpoint = Path(args.vae_checkpoint).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(checkpoint)
+        ldf_cfg = load_config(
+            args.ldf_config,
+            {**_overrides(paths), "vae.checkpoint_path": str(checkpoint)},
+        )
+        vae = load_vae_checkpoint(
+            checkpoint,
+            model_params=dict(ldf_cfg.vae.params),
+            use_ema=True,
+            freeze=True,
+        )
+        details["vae_checkpoint"] = {
+            "path": str(checkpoint),
+            "latent_dim": int(vae.latent_dim),
+            "physical_statistics": list(MOTION_STATISTIC_SHAPES),
+        }
         if args.skip_t5:
             details["ldf_configs"] = "not checked because --skip-t5 was set"
         else:
@@ -672,7 +617,6 @@ def _verify(
                     {
                         **_overrides(paths),
                         "vae.checkpoint_path": str(checkpoint),
-                        "vae.params.latent_stats_path": str(latent_stats),
                     },
                 )
                 _validate_training_config(cfg)
@@ -682,7 +626,7 @@ def _verify(
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("pre-vae", "post-vae", "all", "verify"))
+    parser.add_argument("phase", choices=("pre-vae", "verify"))
     parser.add_argument("--raw-data-root", required=True)
     parser.add_argument("--deps-root")
     parser.add_argument("--humanml-source")
@@ -692,17 +636,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ldf-config", default="configs/ldf.yaml")
     parser.add_argument("--ldf-multi-config", default="configs/ldf_multi.yaml")
     parser.add_argument("--vae-checkpoint")
-    parser.add_argument("--latent-output")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--min-frames", type=int, default=20)
-    parser.add_argument("--root-seed", type=int, default=1234)
     parser.add_argument("--t5-devices", default="0")
     parser.add_argument("--t5-batch-size", type=int, default=4)
     parser.add_argument("--skip-t5", action="store_true")
-    parser.add_argument("--latent-device", default="cuda:0")
-    parser.add_argument("--latent-batch-size", type=int, default=128)
-    parser.add_argument("--latent-yaw-seed", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     return parser
 
@@ -715,7 +654,6 @@ def main(argv: list[str] | None = None) -> None:
         "workers",
         "min_frames",
         "t5_batch_size",
-        "latent_batch_size",
     ):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"{name} must be positive")
@@ -725,29 +663,18 @@ def main(argv: list[str] | None = None) -> None:
     paths = _resolve_paths(args)
     paths.raw_data.mkdir(parents=True, exist_ok=True)
     report = PreparationReport(paths.report)
-    latent_stats: Path | None = None
-
-    if args.phase in {"pre-vae", "all"}:
+    if args.phase == "pre-vae":
         _prepare_motion(args, paths, report)
         _prepare_statistics(args, paths, report)
         _prepare_t5(args, paths, report)
-        report.record("pre_vae_verification", "completed", _verify(args, paths, latent_stats=None))
-    if args.phase in {"post-vae", "all"}:
-        latent_stats = _prepare_latent(args, paths, report)
+        report.record("pre_vae_verification", "completed", _verify(args, paths))
     if args.phase == "verify":
         if not args.vae_checkpoint:
             raise RuntimeError("VAE_CHECKPOINT_REQUIRED: verify checks LDF readiness")
-        latent_stats = (
-            Path(args.latent_output).expanduser().resolve()
-            if args.latent_output
-            else Path(args.vae_checkpoint).expanduser().resolve().parent
-            / "latent_stats.npz"
-        )
-    if args.phase in {"post-vae", "all", "verify"}:
         report.record(
             "final_verification",
             "completed",
-            _verify(args, paths, latent_stats=latent_stats),
+            _verify(args, paths),
         )
     print(f"training asset report: {paths.report}", flush=True)
 

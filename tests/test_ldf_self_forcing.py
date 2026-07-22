@@ -16,12 +16,12 @@ from utils.training.ldf.conditioning import (
     create_xz_condition,
     sample_xz_constraint_mask,
 )
-from utils.training.ldf.losses import compute_offpath_loss, compute_velocity_loss
-from utils.training.ldf.flow import (
-    build_span_beta,
-    recover_clean_for_full_gradient_auxiliary,
-    recover_clean_for_self_forcing,
+from utils.training.ldf.losses import (
+    compute_body_corrective_velocity_loss,
+    compute_ldf_loss,
+    compute_root_x0_loss,
 )
+from utils.training.ldf.flow import build_span_beta
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import (
     resolve_self_forcing_k,
@@ -321,8 +321,6 @@ def test_training_steps_reuse_absolute_noise_and_keep_fixed_span_masks():
 def test_cold_ideal_phase_matches_runtime_beta_visibility_and_state(denoise_step):
     model = LDF(
         latent_dim=3,
-        root_mean=[0.0] * 5,
-        root_std=[1.0] * 5,
         local_root_mean=[0.0] * 4,
         local_root_std=[1.0] * 4,
         hidden_dim=16,
@@ -402,8 +400,6 @@ def test_cold_ideal_phase_matches_runtime_beta_visibility_and_state(denoise_step
 def test_cold_dynamic_future_starts_at_each_microstep_visible_end():
     model = LDF(
         latent_dim=3,
-        root_mean=[0.0] * 5,
-        root_std=[1.0] * 5,
         local_root_mean=[0.0] * 4,
         local_root_std=[1.0] * 4,
         hidden_dim=16,
@@ -523,21 +519,6 @@ def test_mixed_batch_uses_each_samples_own_history_and_real_span_length():
     ]
 
 
-def test_self_forcing_recovery_attenuates_prediction_error_by_beta():
-    clean = torch.tensor([2.0])
-    noise = torch.tensor([-1.0])
-    beta = torch.tensor([0.2])
-    target_velocity = clean - noise
-    error = torch.tensor([0.5])
-    prediction = target_velocity + error
-    noisy = (1.0 - beta) * clean + beta * noise
-
-    sf_clean = recover_clean_for_self_forcing(noisy, beta, prediction)
-    auxiliary_clean = recover_clean_for_full_gradient_auxiliary(prediction, noise)
-    assert torch.allclose(sf_clean - clean, beta * error)
-    assert torch.allclose(auxiliary_clean - clean, error)
-
-
 class RecordingModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -548,14 +529,6 @@ class RecordingModel(nn.Module):
         self.future_position_inputs: list[list[list[int]] | None] = []
         self.noise_steps = 10
         self.chunk_size = 5
-        self.register_buffer("root_mean", torch.zeros(5))
-        self.register_buffer("root_std", torch.ones(5))
-
-    def denormalize_root(self, root):
-        return root
-
-    def _project_normalized_root(self, root):
-        return root
 
     def triangular_beta(self, *, timeline_position_ids, diffusion_time):
         time = torch.as_tensor(diffusion_time, dtype=torch.float32)
@@ -600,13 +573,20 @@ class RecordingModel(nn.Module):
             )
         root_velocity = torch.ones_like(inputs.noisy_motion.root_motion) * self.scale
         body_velocity = torch.ones_like(inputs.noisy_motion.latent_motion) * self.scale
-        clean_root = recover_clean_for_self_forcing(
-            inputs.noisy_motion.root_motion, inputs.beta, root_velocity
+        clean_root = (
+            inputs.noisy_motion.root_motion
+            + inputs.beta[..., None, None] * root_velocity
+        )
+        clean_body = (
+            inputs.noisy_motion.latent_motion
+            + inputs.beta[..., None] * body_velocity
         )
         local = torch.zeros(*clean_root.shape[:-1], 4)
         return LDFPrediction(
-            velocity=HybridMotion(root_velocity, body_velocity),
-            clean_root_motion=clean_root,
+            raw_root_output=clean_root,
+            raw_body_output=body_velocity,
+            clean_motion=HybridMotion(clean_root, clean_body),
+            solver_velocity=HybridMotion(root_velocity, body_velocity),
             local_root_motion=local,
             local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
         )
@@ -617,9 +597,9 @@ class RecordingModel(nn.Module):
         delta = inputs.beta - next_beta
         return HybridMotion(
             inputs.noisy_motion.root_motion
-            + delta[..., None, None] * prediction.velocity.root_motion,
+            + delta[..., None, None] * prediction.solver_velocity.root_motion,
             inputs.noisy_motion.latent_motion
-            + delta[..., None] * prediction.velocity.latent_motion,
+            + delta[..., None] * prediction.solver_velocity.latent_motion,
         ), prediction
 
 
@@ -701,11 +681,11 @@ def test_persistent_cold_runs_ten_plus_two_microsteps_with_one_fixed_source(
         )
         assert torch.equal(beta, expected)
 
-    losses = compute_offpath_loss(
+    losses = compute_ldf_loss(
         result.prediction,
         result.final_step,
-        root_mean=model.root_mean,
-        root_std=model.root_std,
+        root_prediction_type="x0",
+        body_prediction_type="velocity",
     )
     losses["total"].backward()
     assert model.scale.grad is not None
@@ -890,386 +870,135 @@ def test_k_step_rollout_detaches_only_left_boundary_and_backprops_final_step(
         clean.root_motion[:, 2:4]
     )
 
-    from utils.training.ldf.losses import compute_offpath_loss
-
-    losses = compute_offpath_loss(
+    losses = compute_ldf_loss(
         result.prediction,
         result.final_step,
-        root_mean=model.root_mean,
-        root_std=model.root_std,
+        root_prediction_type="x0",
+        body_prediction_type="velocity",
     )
-    ideal_losses = compute_velocity_loss(
-        result.prediction,
-        type(
-            "IdealStep",
-            (),
-            {
-                "loss_mask": result.final_step.loss_mask,
-                "target_velocity": result.prediction.velocity,
-                "clean_motion": result.final_step.clean_motion,
-                "inputs": result.final_step.inputs,
-            },
-        )(),
-        root_mean=model.root_mean,
-        root_std=model.root_std,
-    )
-    assert tuple(losses) == tuple(ideal_losses)
     losses["total"].backward()
     assert model.scale.grad is not None
 
 
-def test_offpath_loss_is_finite_near_zero_beta_and_boundary_loss_backpropagates():
-    clean_root = torch.zeros(1, 2, 4, 5)
-    clean_root[:, 1, :, 0] = torch.arange(1, 5, dtype=torch.float32)
-    clean = HybridMotion(clean_root, torch.zeros(1, 2, 3))
-    current = HybridMotion(
-        torch.zeros_like(clean.root_motion),
-        torch.zeros_like(clean.latent_motion),
-    )
-    noise = HybridMotion(
-        torch.zeros_like(clean.root_motion),
-        torch.zeros_like(clean.latent_motion),
-    )
-    beta = torch.tensor([[0.0, 1.0e-8]])
-    step = build_ldf_rollout_step(
-        model=RecordingModel(),
-        noisy_motion=current,
-        clean_motion=clean,
-        noise=noise,
-        beta=beta,
-        next_beta=beta,
-        source_start_token=torch.zeros(1, dtype=torch.long),
-        span_token_count=torch.tensor([2]),
-        history_end=torch.tensor([1]),
-        active_tokens=1,
-        step_index=0,
-        previous_root_frame=None,
-        previous_root_valid_mask=None,
-        condition=empty_condition(1)(
-            type("View", (), {"timeline_position_ids": torch.zeros(1, 2)})()
+def _minimal_loss_step(*, beta_value: float, is_rollout: bool = False):
+    beta = torch.tensor([[beta_value]])
+    root = torch.zeros(1, 1, 4, 5)
+    root[..., 3] = 1.0
+    latent = torch.zeros(1, 1, 3)
+    inputs = type(
+        "LossInputs",
+        (),
+        {
+            "noisy_motion": HybridMotion(torch.zeros_like(root), latent.clone()),
+            "beta": beta,
+            "history_mask": torch.zeros(1, 1, dtype=torch.bool),
+        },
+    )()
+    return type(
+        "LossStep",
+        (),
+        {
+            "loss_mask": torch.ones(1, 1, dtype=torch.bool),
+            "clean_motion": HybridMotion(root, latent),
+            "noise": HybridMotion(torch.zeros_like(root), torch.zeros_like(latent)),
+            "inputs": inputs,
+            "is_rollout": is_rollout,
+        },
+    )()
+
+
+def test_root_x0_heading_vector_has_gradient_at_exact_antipode():
+    step = _minimal_loss_step(beta_value=0.1)
+    raw_root = step.clean_motion.root_motion.clone()
+    raw_root[..., 3] = -1.0
+    raw_root.requires_grad_()
+    local = torch.zeros(1, 1, 4, 4)
+    prediction = LDFPrediction(
+        raw_root_output=raw_root,
+        raw_body_output=torch.zeros(1, 1, 3),
+        clean_motion=step.clean_motion,
+        solver_velocity=HybridMotion(
+            torch.zeros_like(raw_root), torch.zeros(1, 1, 3)
         ),
+        local_root_motion=local,
+        local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
     )
-    root_velocity = torch.zeros_like(clean.root_motion, requires_grad=True)
-    body_velocity = torch.zeros_like(clean.latent_motion, requires_grad=True)
-    local = torch.zeros(1, 2, 4, 4)
+    losses = compute_root_x0_loss(prediction, step)
+    losses["root"].backward()
+    assert raw_root.grad[..., 3:5].abs().sum().item() > 0.0
+
+
+def test_root_heading_observations_expose_low_norm_antipodal_output():
+    step = _minimal_loss_step(beta_value=0.5)
+    raw_root = step.clean_motion.root_motion.clone()
+    raw_root[..., 3] = -0.1
+    raw_root[..., 4] = 0.0
+    local = torch.zeros(1, 1, 4, 4)
     prediction = LDFPrediction(
-        HybridMotion(root_velocity, body_velocity),
-        clean.root_motion,
-        local,
-        torch.ones_like(local, dtype=torch.bool),
-    )
-    losses = compute_offpath_loss(
-        prediction,
-        step,
-        root_mean=torch.zeros(5),
-        root_std=torch.ones(5),
-        rollout_weight=0.0,
-        root_boundary_weight=1.0,
-        offpath_beta_min=0.1,
-    )
-    assert all(torch.isfinite(value) for value in losses.values())
-    losses["total"].backward()
-    assert root_velocity.grad is not None
-    assert torch.isfinite(root_velocity.grad).all()
-    assert root_velocity.grad.abs().sum() > 0
-
-
-def test_root_heading_auxiliary_uses_preprojection_endpoint_with_beta_compensation():
-    beta = torch.tensor([[0.5]])
-    angle = torch.tensor(torch.pi / 2, requires_grad=True)
-    heading = torch.stack((torch.cos(angle), torch.sin(angle)))
-    root_velocity = torch.cat(
-        (
-            torch.zeros(1, 1, 4, 3),
-            (heading / beta.item()).reshape(1, 1, 1, 2).expand(1, 1, 4, 2),
+        raw_root_output=raw_root,
+        raw_body_output=torch.zeros(1, 1, 3),
+        clean_motion=step.clean_motion,
+        solver_velocity=HybridMotion(
+            torch.zeros_like(raw_root), torch.zeros(1, 1, 3)
         ),
-        dim=-1,
-    )
-    noisy_root = torch.zeros_like(root_velocity)
-    target_root = torch.zeros(1, 1, 4, 5)
-    target_root[..., 3] = 1.0
-    body_velocity = torch.zeros(1, 1, 3)
-    local = torch.zeros(1, 1, 4, 4)
-    prediction = LDFPrediction(
-        velocity=HybridMotion(root_velocity, body_velocity),
-        clean_root_motion=target_root,
         local_root_motion=local,
         local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
     )
-    step = type(
-        "HeadingStep",
-        (),
-        {
-            "loss_mask": torch.ones(1, 1, dtype=torch.bool),
-            "target_velocity": HybridMotion(
-                root_velocity.detach(),
-                torch.zeros_like(body_velocity),
-            ),
-            "clean_motion": HybridMotion(target_root, torch.zeros_like(body_velocity)),
-            "inputs": type(
-                "HeadingInputs",
-                (),
-                {
-                    "noisy_motion": HybridMotion(
-                        noisy_root, torch.zeros_like(body_velocity)
-                    ),
-                    "beta": beta,
-                },
-            )(),
-        },
-    )()
-
-    losses = compute_velocity_loss(
+    metrics = compute_ldf_loss(
         prediction,
         step,
-        root_mean=torch.zeros(5),
-        root_std=torch.ones(5),
-        root_heading_cosine_weight=0.1,
-        root_heading_vector_weight=0.1,
-        root_heading_beta_min=0.1,
+        root_prediction_type="x0",
+        body_prediction_type="velocity",
     )
-
-    assert losses["root_heading_cosine"].detach().item() == pytest.approx(1.0)
-    assert losses["root_heading_cosine_weighted"].detach().item() == pytest.approx(2.0)
-    assert losses["root_heading_vector"].detach().item() == pytest.approx(0.5)
-    assert losses["root_heading_vector_weighted"].detach().item() == pytest.approx(1.0)
-    assert losses["root_heading_raw_norm_mean"].detach().item() == pytest.approx(1.0)
-    assert losses["root_heading_antipodal_ratio"].detach().item() == pytest.approx(0.0)
-    assert losses["anchor_root_flow_xz"].detach().item() == pytest.approx(0.0)
-    assert losses["anchor_root_flow_height"].detach().item() == pytest.approx(0.0)
-    assert losses["anchor_root_flow_heading"].detach().item() == pytest.approx(0.0)
-    assert losses["total"].detach().item() == pytest.approx(0.3)
-    losses["total"].backward()
-    assert angle.grad is not None
-    assert angle.grad.abs() > 0
+    assert metrics["root_heading_angle_degrees"].item() == pytest.approx(180.0)
+    assert metrics["root_heading_raw_norm"].item() == pytest.approx(0.1)
+    assert metrics["root_heading_raw_norm_p10"].item() == pytest.approx(0.1)
+    assert metrics["root_heading_low_norm_ratio"].item() == pytest.approx(1.0)
+    assert metrics["root_heading_antipodal_ratio"].item() == pytest.approx(1.0)
 
 
-def test_root_heading_vector_retains_gradient_at_exact_antipode():
-    def compute(*, cosine_weight: float, vector_weight: float):
-        beta = torch.tensor([[0.1]])
-        root_velocity = torch.zeros(1, 1, 4, 5)
-        root_velocity[..., 3] = -10.0
-        root_velocity.requires_grad_()
-        body_velocity = torch.zeros(1, 1, 3)
-        target_root = torch.zeros_like(root_velocity)
-        target_root[..., 3] = 1.0
-        local = torch.zeros(1, 1, 4, 4)
-        prediction = LDFPrediction(
-            velocity=HybridMotion(root_velocity, body_velocity),
-            clean_root_motion=target_root,
-            local_root_motion=local,
-            local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
-        )
-        step = type(
-            "AntipodalHeadingStep",
-            (),
-            {
-                "loss_mask": torch.ones(1, 1, dtype=torch.bool),
-                "target_velocity": HybridMotion(
-                    root_velocity.detach(), torch.zeros_like(body_velocity)
-                ),
-                "clean_motion": HybridMotion(
-                    target_root, torch.zeros_like(body_velocity)
-                ),
-                "inputs": type(
-                    "AntipodalHeadingInputs",
-                    (),
-                    {
-                        "noisy_motion": HybridMotion(
-                            torch.zeros_like(root_velocity),
-                            torch.zeros_like(body_velocity),
-                        ),
-                        "beta": beta,
-                    },
-                )(),
-            },
-        )()
-        losses = compute_velocity_loss(
-            prediction,
-            step,
-            root_mean=torch.zeros(5),
-            root_std=torch.ones(5),
-            root_heading_cosine_weight=cosine_weight,
-            root_heading_vector_weight=vector_weight,
-            root_heading_beta_min=0.1,
-        )
-        losses["total"].backward()
-        return losses, root_velocity.grad[..., 3:5]
-
-    cosine_losses, cosine_grad = compute(cosine_weight=1.0, vector_weight=0.0)
-    vector_losses, vector_grad = compute(cosine_weight=0.0, vector_weight=1.0)
-
-    assert cosine_losses["root_heading_cosine"].item() == pytest.approx(2.0)
-    assert cosine_grad.abs().max().item() == pytest.approx(0.0, abs=1e-7)
-    assert vector_grad.abs().sum().item() > 0.0
-    assert vector_losses["root_heading_raw_norm_mean"].item() == pytest.approx(1.0)
-    assert vector_losses["root_heading_antipodal_ratio"].item() == pytest.approx(1.0)
-
-
-def test_zero_norm_heading_uses_bounded_vector_gradient_without_cosine():
-    beta = torch.tensor([[0.1]])
-    root_velocity = torch.zeros(1, 1, 4, 5, requires_grad=True)
-    body_velocity = torch.zeros(1, 1, 3)
-    target_root = torch.zeros_like(root_velocity)
-    target_root[..., 3] = 1.0
+@pytest.mark.parametrize("beta_value", [1.0, 0.1])
+def test_body_corrective_velocity_uses_real_beta_with_bounded_gradient(beta_value):
+    step = _minimal_loss_step(beta_value=beta_value, is_rollout=True)
+    current = step.inputs.noisy_motion.latent_motion
+    target = torch.ones_like(current)
+    step.clean_motion = HybridMotion(step.clean_motion.root_motion, target)
+    exact_velocity = (target - current) / beta_value
+    raw_velocity = (exact_velocity + 2.0).detach().requires_grad_()
     local = torch.zeros(1, 1, 4, 4)
     prediction = LDFPrediction(
-        velocity=HybridMotion(root_velocity, body_velocity),
-        clean_root_motion=target_root,
+        raw_root_output=step.clean_motion.root_motion,
+        raw_body_output=raw_velocity,
+        clean_motion=step.clean_motion,
+        solver_velocity=HybridMotion(
+            torch.zeros_like(step.clean_motion.root_motion), raw_velocity
+        ),
         local_root_motion=local,
         local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
     )
-    step = type(
-        "ZeroNormHeadingStep",
-        (),
-        {
-            "loss_mask": torch.ones(1, 1, dtype=torch.bool),
-            "target_velocity": HybridMotion(
-                root_velocity.detach(), torch.zeros_like(body_velocity)
-            ),
-            "clean_motion": HybridMotion(
-                target_root, torch.zeros_like(body_velocity)
-            ),
-            "inputs": type(
-                "ZeroNormHeadingInputs",
-                (),
-                {
-                    "noisy_motion": HybridMotion(
-                        torch.zeros_like(root_velocity),
-                        torch.zeros_like(body_velocity),
-                    ),
-                    "beta": beta,
-                },
-            )(),
-        },
-    )()
-    losses = compute_velocity_loss(
-        prediction,
-        step,
-        root_mean=torch.zeros(5),
-        root_std=torch.ones(5),
-        root_heading_cosine_weight=1.0,
-        root_heading_vector_weight=1.0,
-        root_heading_beta_min=0.1,
-        root_heading_cosine_min_norm=0.05,
-    )
-
-    assert all(torch.isfinite(value) for value in losses.values())
-    assert losses["root_heading_cosine_weighted"].item() == pytest.approx(0.0)
-    assert losses["root_heading_low_norm_ratio"].item() == pytest.approx(1.0)
-    losses["total"].backward()
-    heading_gradient = root_velocity.grad[..., 3:5]
-    assert torch.isfinite(heading_gradient).all()
-    assert heading_gradient.abs().sum().item() > 0.0
-    assert heading_gradient.abs().max().item() <= 1.0
+    loss = compute_body_corrective_velocity_loss(prediction, step)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert raw_velocity.grad.abs().max().item() <= 1.0
+    assert raw_velocity.grad.abs().sum().item() > 0.0
 
 
-def test_root_heading_beta_compensation_equalizes_velocity_gradients():
-    gradients = []
-    for beta_value in (0.1, 0.9):
-        beta = torch.tensor([[beta_value]])
-        root_velocity = torch.zeros(1, 1, 4, 5)
-        root_velocity[..., 4] = 1.0 / beta_value
-        root_velocity.requires_grad_()
-        body_velocity = torch.zeros(1, 1, 3)
-        target_root = torch.zeros_like(root_velocity)
-        target_root[..., 3] = 1.0
-        local = torch.zeros(1, 1, 4, 4)
-        prediction = LDFPrediction(
-            velocity=HybridMotion(root_velocity, body_velocity),
-            clean_root_motion=target_root,
-            local_root_motion=local,
-            local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
-        )
-        step = type(
-            "CompensatedHeadingStep",
-            (),
-            {
-                "loss_mask": torch.ones(1, 1, dtype=torch.bool),
-                "target_velocity": HybridMotion(
-                    root_velocity.detach(), torch.zeros_like(body_velocity)
-                ),
-                "clean_motion": HybridMotion(
-                    target_root, torch.zeros_like(body_velocity)
-                ),
-                "inputs": type(
-                    "CompensatedHeadingInputs",
-                    (),
-                    {
-                        "noisy_motion": HybridMotion(
-                            torch.zeros_like(root_velocity),
-                            torch.zeros_like(body_velocity),
-                        ),
-                        "beta": beta,
-                    },
-                )(),
-            },
-        )()
-        losses = compute_velocity_loss(
-            prediction,
-            step,
-            root_mean=torch.zeros(5),
-            root_std=torch.ones(5),
-            root_heading_cosine_weight=1.0,
-            root_heading_vector_weight=1.0,
-            root_heading_beta_min=0.1,
-        )
-        losses["total"].backward()
-        gradients.append(root_velocity.grad[..., 3:5].clone())
-
-    assert torch.allclose(gradients[0], gradients[1], atol=1e-6, rtol=1e-6)
-
-
-def test_root_flow_logs_partition_xz_height_and_heading_channels():
-    root_velocity = torch.zeros(1, 1, 4, 5)
-    root_velocity[..., 3:5] = 2.0
-    body_velocity = torch.zeros(1, 1, 3)
-    clean_root = torch.zeros_like(root_velocity)
-    clean_root[..., 3] = 1.0
+def test_body_corrective_velocity_rejects_active_zero_beta():
+    step = _minimal_loss_step(beta_value=0.0, is_rollout=True)
     local = torch.zeros(1, 1, 4, 4)
     prediction = LDFPrediction(
-        velocity=HybridMotion(root_velocity, body_velocity),
-        clean_root_motion=clean_root,
+        raw_root_output=step.clean_motion.root_motion,
+        raw_body_output=step.clean_motion.latent_motion,
+        clean_motion=step.clean_motion,
+        solver_velocity=HybridMotion(
+            torch.zeros_like(step.clean_motion.root_motion),
+            torch.zeros_like(step.clean_motion.latent_motion),
+        ),
         local_root_motion=local,
         local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
     )
-    step = type(
-        "ChannelStep",
-        (),
-        {
-            "loss_mask": torch.ones(1, 1, dtype=torch.bool),
-            "target_velocity": HybridMotion(
-                torch.zeros_like(root_velocity),
-                torch.zeros_like(body_velocity),
-            ),
-            "clean_motion": HybridMotion(clean_root, torch.zeros_like(body_velocity)),
-            "inputs": type(
-                "ChannelInputs",
-                (),
-                {
-                    "noisy_motion": HybridMotion(
-                        torch.zeros_like(root_velocity),
-                        torch.zeros_like(body_velocity),
-                    ),
-                    "beta": torch.ones(1, 1),
-                },
-            )(),
-        },
-    )()
-
-    losses = compute_velocity_loss(
-        prediction,
-        step,
-        root_mean=torch.zeros(5),
-        root_std=torch.ones(5),
-    )
-
-    assert losses["anchor_root_flow_xz"].item() == pytest.approx(0.0)
-    assert losses["anchor_root_flow_height"].item() == pytest.approx(0.0)
-    assert losses["anchor_root_flow_heading"].item() == pytest.approx(4.0)
-    assert losses["anchor_root_flow_v"].item() == pytest.approx(1.6)
-
-
+    with pytest.raises(ValueError, match="strictly positive beta"):
+        compute_body_corrective_velocity_loss(prediction, step)
 def test_xz_condition_moves_active_and_future_ranges_with_self_forcing_steps():
     root = torch.zeros(1, 10, 4, 5)
     root[..., 0] = torch.arange(10)[None, :, None]

@@ -9,10 +9,9 @@ from utils.training.vae.losses import VAELoss
 def test_vae_loss_blocks_contacts_and_kl_warmup():
     model = make_vae(
         latent_dim=128, hidden_dim=32, encoder_layers=1, decoder_layers=1,
-        with_latent_stats=False,
     )
-    body = torch.randn(2, 8, 265)
-    body[..., 261:] = torch.randint(0, 2, body[..., 261:].shape).float()
+    body = torch.randn(2, 8, 259)
+    body[..., 255:] = torch.randint(0, 2, body[..., 255:].shape).float()
     root = torch.zeros(2, 8, 5)
     root[..., 3] = 1
     inputs = VAEInput(body, root, torch.ones(2, 8, dtype=torch.bool))
@@ -34,10 +33,9 @@ def test_vae_loss_blocks_contacts_and_kl_warmup():
 def test_optional_geometry_losses_are_independent():
     model = make_vae(
         latent_dim=8, hidden_dim=16, encoder_layers=1, decoder_layers=1,
-        with_latent_stats=False,
     )
-    body = torch.randn(1, 8, 265)
-    body[..., 261:] = 0
+    body = torch.randn(1, 8, 259)
+    body[..., 255:] = 0
     root = torch.zeros(1, 8, 5)
     root[..., 3] = 1
     inputs = VAEInput(body, root, torch.ones(1, 8, dtype=torch.bool))
@@ -56,8 +54,8 @@ def test_optional_geometry_losses_are_independent():
 def test_fk_loss_requires_versioned_skeleton():
     try:
         VAELoss(
-            body_cont_mean=torch.zeros(261),
-            body_cont_std=torch.ones(261),
+            body_cont_mean=torch.zeros(255),
+            body_cont_std=torch.ones(255),
             lambda_fk=1.0,
         )
     except ValueError as error:
@@ -67,8 +65,8 @@ def test_fk_loss_requires_versioned_skeleton():
 
 
 def test_skating_uses_position_transitions_and_reaches_position_gradient():
-    body = torch.zeros(1, 4, 265)
-    body[..., 261] = 1.0
+    body = torch.zeros(1, 4, 259)
+    body[..., 255] = 1.0
     root = torch.zeros(1, 4, 5)
     root[..., 3] = 1.0
     feature_valid = torch.ones_like(body, dtype=torch.bool)
@@ -79,7 +77,7 @@ def test_skating_uses_position_transitions_and_reaches_position_gradient():
         torch.ones(1, 4, dtype=torch.bool),
         body_feature_valid_mask=feature_valid,
     )
-    continuous = torch.zeros(1, 4, 261, requires_grad=True)
+    continuous = torch.zeros(1, 4, 255, requires_grad=True)
     positions = continuous[..., :63].reshape(1, 4, 21, 3)
     with torch.no_grad():
         positions[:, :, 6, 0] = torch.arange(4) * 0.1
@@ -91,8 +89,8 @@ def test_skating_uses_position_transitions_and_reaches_position_gradient():
         torch.ones(1, 1, 4, 4, dtype=torch.bool),
     )
     losses = VAELoss(
-        body_cont_mean=torch.zeros(261),
-        body_cont_std=torch.ones(261),
+        body_cont_mean=torch.zeros(255),
+        body_cont_std=torch.ones(255),
     )(inputs, prediction)
     # Frame zero is excluded because a predicted preceding position is absent;
     # three transitions have one contacted foot moving at 2 m/s.
@@ -103,8 +101,8 @@ def test_skating_uses_position_transitions_and_reaches_position_gradient():
 
 
 def test_position_skating_ignores_independent_velocity_feature():
-    body = torch.zeros(1, 4, 265)
-    body[..., 261] = 1.0
+    body = torch.zeros(1, 4, 259)
+    body[..., 255] = 1.0
     root = torch.zeros(1, 4, 5)
     root[..., 3] = 1.0
     inputs = VAEInput(
@@ -113,8 +111,8 @@ def test_position_skating_ignores_independent_velocity_feature():
         torch.ones(1, 4, dtype=torch.bool),
         body_feature_valid_mask=torch.ones_like(body, dtype=torch.bool),
     )
-    continuous = torch.zeros(1, 4, 261)
-    continuous[..., 195:].reshape(1, 4, 22, 3)[:, :, 7, 0] = 100.0
+    continuous = torch.zeros(1, 4, 255)
+    continuous[..., 189:].reshape(1, 4, 22, 3)[:, :, 7, 0] = 100.0
     prediction = VAEPrediction(
         BodyPrediction(continuous, torch.zeros(1, 4, 4)),
         VAEPosterior(torch.zeros(1, 1, 2), torch.zeros(1, 1, 2)),
@@ -123,7 +121,7 @@ def test_position_skating_ignores_independent_velocity_feature():
         torch.ones(1, 1, 4, 4, dtype=torch.bool),
     )
     losses = VAELoss(
-        body_cont_mean=torch.zeros(261),
-        body_cont_std=torch.ones(261),
+        body_cont_mean=torch.zeros(255),
+        body_cont_std=torch.ones(255),
     )(inputs, prediction)
     assert torch.equal(losses["skating"], torch.tensor(0.0))

@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 from lightning.pytorch.utilities import rank_zero_info
 
-from metrics.humanml import convert_root5_body265_to_humanml263
+from metrics.humanml import convert_root5_body259_to_humanml263
 from metrics.stream import compute_stream_boundary_metrics
 from metrics.t2m import T2MMetrics
 from metrics.trajectory import (
@@ -665,8 +665,8 @@ class LDFEvaluationRunner:
                         step_tag=step_tag,
                         sample_id=sample_id,
                         caption=generated.prompt.caption,
-                        normalized_root=generated.normalized_motion.root_motion[0],
-                        normalized_latent=generated.normalized_motion.latent_motion[0],
+                        root_motion=generated.hybrid_motion.root_motion[0],
+                        latent_motion=generated.hybrid_motion.latent_motion[0],
                         predicted_root=generated.root_motion,
                         predicted_body=generated.body_motion,
                         target_root=target_root,
@@ -798,12 +798,12 @@ class LDFEvaluationRunner:
                     max_horizon_token=config["max_horizon_token"],
                     num_denoise_steps=config["num_denoise_steps"],
                 )
-                reference = convert_root5_body265_to_humanml263(
+                reference = convert_root5_body259_to_humanml263(
                     sample["root_motion"][:frames],
                     sample["body_motion"][:frames],
                     tail="drop",
                 ).detach().to(module.device)
-                predicted = convert_root5_body265_to_humanml263(
+                predicted = convert_root5_body259_to_humanml263(
                     generated.root_motion,
                     generated.body_motion,
                     tail="drop",

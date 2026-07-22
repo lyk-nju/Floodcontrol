@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -42,44 +43,56 @@ def _load_statistic(data, name: str, expected_dim: int) -> torch.Tensor:
     return value
 
 
-def _load_motion_statistics(path: str | Path) -> tuple[torch.Tensor, ...]:
+def _load_motion_statistics(path: str | Path) -> dict[str, torch.Tensor]:
     with np.load(path, allow_pickle=False) as data:
-        return tuple(
-            _load_statistic(data, name, dim)
+        return {
+            name: _load_statistic(data, name, dim)
             for name, dim in (
                 ("body_cont_mean", BODY_CONTINUOUS_DIM),
                 ("body_cont_std", BODY_CONTINUOUS_DIM),
                 ("local_root_mean", 4),
                 ("local_root_std", 4),
             )
-        )
+        }
 
 
-def _load_latent_statistics(
-    path: str | Path, latent_dim: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    with np.load(path, allow_pickle=False) as data:
-        mean_key = "mean" if "mean" in data else "latent_mu_mean"
-        std_key = "std" if "std" in data else "latent_mu_std"
-        mean = _load_statistic(data, mean_key, latent_dim)
-        std = _load_statistic(data, std_key, latent_dim)
-    return mean, std
+def _validate_motion_statistics(
+    statistics: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    validated: dict[str, torch.Tensor] = {}
+    for name, dim in (
+        ("body_cont_mean", BODY_CONTINUOUS_DIM),
+        ("body_cont_std", BODY_CONTINUOUS_DIM),
+        ("local_root_mean", 4),
+        ("local_root_std", 4),
+    ):
+        if name not in statistics:
+            raise ValueError(f"motion statistics are missing {name!r}")
+        value = torch.as_tensor(statistics[name], dtype=torch.float32).detach().clone()
+        if tuple(value.shape) != (dim,):
+            raise ValueError(f"{name} must have shape [{dim}]")
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"{name} must contain only finite values")
+        if name.endswith("std") and bool((value <= 0).any()):
+            raise ValueError(f"{name} must be positive")
+        validated[name] = value
+    return validated
 
 
 class BodyVAE(nn.Module):
-    """Body-only VAE with explicit physical and latent-space boundaries.
+    """Body-only VAE with explicit physical and raw-latent boundaries.
 
-    ``encode``/``decode`` operate on raw posterior latents. ``tokenize`` and
-    ``detokenize`` are the normalized deployment interface used by the LDF.
-    Statistics are loaded from two ordinary NPZ files. Decoder history is an
-    explicit value passed by the caller; the module owns no hidden cache.
+    ``encode``/``tokenize`` return raw posterior latents and
+    ``decode``/``detokenize`` consume raw latents.  Physical body/local-root
+    statistics may come from the VAE training NPZ or directly from a checkpoint
+    loader. Decoder history is explicit; the module owns no hidden cache.
     """
 
     def __init__(
         self,
         *,
-        motion_stats_path: str | Path,
-        latent_stats_path: str | Path | None = None,
+        motion_stats_path: str | Path | None = None,
+        motion_statistics: Mapping[str, torch.Tensor] | None = None,
         latent_dim: int = 128,
         hidden_dim: int = 512,
         encoder_layers: int = 6,
@@ -90,31 +103,17 @@ class BodyVAE(nn.Module):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.fps = MOTION_FPS
-        body_mean, body_std, local_mean, local_std = _load_motion_statistics(
-            motion_stats_path
+        if (motion_stats_path is None) == (motion_statistics is None):
+            raise ValueError(
+                "provide exactly one of motion_stats_path or motion_statistics"
+            )
+        statistics = (
+            _load_motion_statistics(motion_stats_path)
+            if motion_stats_path is not None
+            else _validate_motion_statistics(motion_statistics)
         )
-
-        self.register_buffer(
-            "body_cont_mean", body_mean
-        )
-        self.register_buffer(
-            "body_cont_std", body_std
-        )
-        self.register_buffer(
-            "local_root_mean", local_mean
-        )
-        self.register_buffer(
-            "local_root_std", local_std
-        )
-        latent_mean, latent_std = (
-            _load_latent_statistics(latent_stats_path, self.latent_dim)
-            if latent_stats_path is not None
-            else (torch.empty(0), torch.empty(0))
-        )
-        # Latent statistics are computed after training and never belong to a
-        # training checkpoint.
-        self.register_buffer("latent_mean", latent_mean, persistent=False)
-        self.register_buffer("latent_std", latent_std, persistent=False)
+        for name, value in statistics.items():
+            self.register_buffer(name, value)
 
         self.model = CausalBodyVAE(
             latent_dim=self.latent_dim,
@@ -133,13 +132,9 @@ class BodyVAE(nn.Module):
     def decoder_context_tokens(self) -> int:
         return self.model.decoder_context_tokens
 
-    @property
-    def latent_statistics_ready(self) -> bool:
-        return self.latent_mean.numel() == self.latent_dim
-
     def normalize_body(self, body_motion: torch.Tensor) -> torch.Tensor:
         if body_motion.shape[-1] != BODY_DIM:
-            raise ValueError("body_motion must end in 265")
+            raise ValueError(f"body_motion must end in {BODY_DIM}")
         continuous = (
             body_motion[..., :BODY_CONTINUOUS_DIM] - self.body_cont_mean
         ) / self.body_cont_std
@@ -149,34 +144,20 @@ class BodyVAE(nn.Module):
     def normalize_local_root(self, local_root_motion: torch.Tensor) -> torch.Tensor:
         return (local_root_motion - self.local_root_mean) / self.local_root_std
 
-    def normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        if not self.latent_statistics_ready:
-            raise RuntimeError("latent mu statistics must be loaded before tokenization")
-        normalized = (latent - self.latent_mean) / self.latent_std
-        if not bool(torch.isfinite(normalized).all()):
-            raise ValueError("normalized latent contains non-finite values")
-        return normalized
-
-    def unnormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        if not self.latent_statistics_ready:
-            raise RuntimeError("latent mu statistics must be loaded before detokenization")
-        raw = latent * self.latent_std + self.latent_mean
-        if not bool(torch.isfinite(raw).all()):
-            raise ValueError("unnormalized latent contains non-finite values")
-        return raw
-
     def encode(
         self, body_motion: torch.Tensor, frame_valid_mask: torch.Tensor
     ) -> VAEPosterior:
         """Encode physical body motion into a raw posterior."""
 
         if body_motion.ndim != 3 or body_motion.shape[-1] != BODY_DIM:
-            raise ValueError("body_motion must be [B,F,265]")
+            raise ValueError(f"body_motion must be [B,F,{BODY_DIM}]")
         if (
             tuple(frame_valid_mask.shape) != tuple(body_motion.shape[:2])
             or frame_valid_mask.dtype != torch.bool
         ):
             raise ValueError("frame_valid_mask must be bool [B,F]")
+        if not bool(torch.isfinite(body_motion[frame_valid_mask]).all()):
+            raise ValueError("valid body_motion frames contain non-finite values")
         normalized = self.normalize_body(body_motion)
         normalized = torch.where(
             frame_valid_mask[..., None], normalized, torch.zeros_like(normalized)
@@ -197,6 +178,11 @@ class BodyVAE(nn.Module):
     ) -> BodyPrediction:
         """Decode raw latent tokens into physical body motion."""
 
+        if not bool(torch.isfinite(latent_tokens).all()):
+            raise ValueError("latent_tokens contain non-finite values")
+        if not bool(torch.isfinite(local_root_motion).all()):
+            raise ValueError("local_root_motion contains non-finite values")
+
         output = self.model.decode(
             latent_tokens,
             self.normalize_local_root(local_root_motion),
@@ -211,6 +197,10 @@ class BodyVAE(nn.Module):
     ) -> BodyPrediction:
         physical = output.continuous_body * self.body_cont_std + self.body_cont_mean
         contact_logits = output.contact_logits
+        if not bool(torch.isfinite(physical).all()) or not bool(
+            torch.isfinite(contact_logits).all()
+        ):
+            raise ValueError("VAE decoder produced non-finite values")
         if frame_valid_mask is not None:
             if tuple(frame_valid_mask.shape) != tuple(physical.shape[:2]):
                 raise ValueError("frame_valid_mask does not match decoded frames")
@@ -250,7 +240,7 @@ class BodyVAE(nn.Module):
     def tokenize(
         self, body_motion: torch.Tensor, frame_valid_mask: torch.Tensor
     ) -> torch.Tensor:
-        return self.normalize_latent(self.encode(body_motion, frame_valid_mask).mu)
+        return self.encode(body_motion, frame_valid_mask).mu
 
     @torch.no_grad()
     def tokenize_window(
@@ -259,7 +249,7 @@ class BodyVAE(nn.Module):
         frame_valid_mask: torch.Tensor,
         context_token_count: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode active motion as normalized deterministic tokens.
+        """Encode active motion as raw deterministic posterior means.
 
         ``body_with_context`` is laid out as a valid left prefix followed by
         right padding. ``context_token_count`` locates the first active token
@@ -267,7 +257,7 @@ class BodyVAE(nn.Module):
         """
 
         if body_with_context.ndim != 3 or body_with_context.shape[-1] != BODY_DIM:
-            raise ValueError("body_with_context must be [B,F,265]")
+            raise ValueError(f"body_with_context must be [B,F,{BODY_DIM}]")
         if not torch.is_tensor(context_token_count):
             raise TypeError("context_token_count must be a tensor")
         if context_token_count.dtype != torch.long:
@@ -312,25 +302,20 @@ class BodyVAE(nn.Module):
         latent_index = safe_index[..., None].expand(
             batch, max_active_tokens, posterior.mu.shape[-1]
         )
-        normalized = self.normalize_latent(posterior.mu.gather(1, latent_index))
+        raw_mu = posterior.mu.gather(1, latent_index)
         return torch.where(
-            active_valid[..., None], normalized, torch.zeros_like(normalized)
+            active_valid[..., None], raw_mu, torch.zeros_like(raw_mu)
         )
 
     @torch.no_grad()
     def detokenize(
         self,
-        normalized_mu: torch.Tensor,
+        raw_mu: torch.Tensor,
         local_root_motion: torch.Tensor,
         local_root_valid_mask: torch.Tensor,
         frame_valid_mask: torch.Tensor | None = None,
     ) -> BodyPrediction:
-        return self.decode(
-            self.unnormalize_latent(normalized_mu),
-            local_root_motion,
-            local_root_valid_mask,
-            frame_valid_mask,
-        )
+        return self.decode(raw_mu, local_root_motion, local_root_valid_mask, frame_valid_mask)
 
     def init_decoder_state(
         self, batch_size: int, *, device=None, dtype=torch.float32
@@ -349,6 +334,11 @@ class BodyVAE(nn.Module):
     ) -> tuple[VAEDecoderState, BodyPrediction]:
         """Decode one raw latent token with explicit causal caches."""
 
+        if not bool(torch.isfinite(latent_token).all()):
+            raise ValueError("latent_token contains non-finite values")
+        if not bool(torch.isfinite(local_root_patch).all()):
+            raise ValueError("local_root_patch contains non-finite values")
+
         next_caches, output = self.model.decode_step(
             latent_token,
             self.normalize_local_root(local_root_patch),
@@ -360,15 +350,15 @@ class BodyVAE(nn.Module):
     @torch.no_grad()
     def detokenize_step(
         self,
-        normalized_token: torch.Tensor,
+        raw_token: torch.Tensor,
         local_root_patch: torch.Tensor,
         local_root_valid_mask: torch.Tensor,
         state: VAEDecoderState,
     ) -> tuple[VAEDecoderState, BodyPrediction]:
-        """Decode one normalized tokenizer token with explicit causal caches."""
+        """Decode one raw tokenizer token with explicit causal caches."""
 
         return self.decode_step(
-            self.unnormalize_latent(normalized_token),
+            raw_token,
             local_root_patch,
             local_root_valid_mask,
             state,

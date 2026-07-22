@@ -34,7 +34,7 @@ class EvaluationPrompt:
 @dataclass(frozen=True)
 class GeneratedSequence:
     mode: str
-    normalized_motion: HybridMotion
+    hybrid_motion: HybridMotion
     root_motion: torch.Tensor
     body_motion: torch.Tensor
     prompt: EvaluationPrompt
@@ -77,8 +77,9 @@ def create_evaluation_initial_noise(
 ) -> HybridMotion:
     """Create paired source noise and apply the physical yaw action to root5."""
 
-    device = module.model.root_mean.device
-    dtype = next(module.model.parameters()).dtype
+    parameter = next(module.model.parameters())
+    device = parameter.device
+    dtype = parameter.dtype
     generator = torch.Generator(device=device).manual_seed(int(seed))
     root = torch.randn(
         1,
@@ -99,19 +100,18 @@ def create_evaluation_initial_noise(
     )
     angle = math.radians(float(yaw_degrees))
     if abs(angle) >= 1e-12:
-        physical = module.model.denormalize_root(root)
         cosine = math.cos(angle)
         sine = math.sin(angle)
-        rotated = physical.clone()
-        x = physical[..., 0]
-        z = physical[..., 2]
+        rotated = root.clone()
+        x = root[..., 0]
+        z = root[..., 2]
         rotated[..., 0] = cosine * x + sine * z
         rotated[..., 2] = -sine * x + cosine * z
-        heading_cosine = physical[..., 3]
-        heading_sine = physical[..., 4]
+        heading_cosine = root[..., 3]
+        heading_sine = root[..., 4]
         rotated[..., 3] = cosine * heading_cosine - sine * heading_sine
         rotated[..., 4] = sine * heading_cosine + cosine * heading_sine
-        root = module.model.normalize_root(rotated)
+        root = rotated
     return HybridMotion(root, latent)
 
 
@@ -296,18 +296,16 @@ def generate_evaluation_sequence(
     )[0]
     if tuple(root.shape[:1]) != (frames,) or tuple(body.shape[:1]) != (frames,):
         raise RuntimeError("evaluation decode did not recover exactly four frames per token")
-    normalized = HybridMotion(
-        module.model.normalize_root(
-            root.reshape(1, token_count, FRAMES_PER_TOKEN, 5)
-        ),
+    hybrid_motion = HybridMotion(
+        root.reshape(1, token_count, FRAMES_PER_TOKEN, 5),
         torch.cat(
             [chunk.committed_motion.latent_motion for chunk in chunks], dim=1
         ),
     )
-    normalized.validate()
+    hybrid_motion.validate()
     return GeneratedSequence(
         mode=mode,
-        normalized_motion=normalized,
+        hybrid_motion=hybrid_motion,
         root_motion=root,
         body_motion=body,
         prompt=prompt,

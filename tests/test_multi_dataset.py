@@ -25,7 +25,7 @@ def write_npz(root, name):
     (root / "artifacts").mkdir(parents=True, exist_ok=True)
     root_motion = np.zeros((20, 5), dtype=np.float32)
     root_motion[:, 3] = 1
-    body = np.zeros((20, 265), dtype=np.float32)
+    body = np.zeros((20, 259), dtype=np.float32)
     np.savez_compressed(
         root / "artifacts" / f"{name}.npz",
         root_motion=root_motion,
@@ -55,7 +55,7 @@ def test_babel_is_independent_and_parses_segmented_text(tmp_path):
     sample = dataset[0]
     assert sample["dataset"] == "BABEL"
     assert sample["root_motion"].shape == (20, 5)
-    assert sample["body_motion"].shape == (20, 265)
+    assert sample["body_motion"].shape == (20, 259)
     assert [(item["start_frame"], item["end_frame"]) for item in sample["text_data"]] == [
         (0, 8), (0, 8), (8, 20)
     ]
@@ -127,17 +127,16 @@ def test_multi_dataset_only_concatenates_and_preserves_source_identity(tmp_path)
     batch = VAEWindowCollator(
         min_frames=20, max_frames=20, training=False
     )([dataset[0], dataset[1]])
-    assert batch["body_motion"].shape == (2, 20, 265)
+    assert batch["body_motion"].shape == (2, 20, 259)
     assert batch["dataset"] == ["HumanML3D", "BABEL"]
-    statistics = compute_motion_statistics(dataset, random_yaw=False)
-    assert statistics["body_cont_mean"].shape == (261,)
+    statistics = compute_motion_statistics(dataset)
+    assert statistics["body_cont_mean"].shape == (255,)
 
     model = make_vae(
         latent_dim=4,
         hidden_dim=8,
         encoder_layers=1,
         decoder_layers=1,
-        with_latent_stats=False,
     ).eval()
     single_summary = evaluate_dataset(
         model,

@@ -13,11 +13,9 @@ from models.diffusion_forcing_wan import LDF
 from utils.conditions.ldf import HybridMotion, LDFCondition, LDFInput
 
 
-def make_model():
-    return LDF(
+def make_model(**overrides):
+    parameters = dict(
         latent_dim=8,
-        root_mean=[0] * 5,
-        root_std=[1] * 5,
         local_root_mean=[0] * 4,
         local_root_std=[1] * 4,
         hidden_dim=32,
@@ -31,6 +29,8 @@ def make_model():
         chunk_size=2,
         noise_steps=4,
     )
+    parameters.update(overrides)
+    return LDF(**parameters)
 
 
 def make_input(batch=2, tokens=6):
@@ -86,8 +86,8 @@ def _static_future_graph_worker(
             inputs = _with_future_condition(inputs)
         output = model(inputs)
         loss = (
-            output.velocity.root_motion.square().mean()
-            + output.velocity.latent_motion.square().mean()
+            output.solver_velocity.root_motion.square().mean()
+            + output.solver_velocity.latent_motion.square().mean()
         )
         loss.backward()
         gradient = model.module.root_transformer.future_projection.weight.grad
@@ -100,24 +100,198 @@ def _static_future_graph_worker(
         dist.destroy_process_group()
 
 
-def test_forward_shapes_and_v_to_x0_identity():
+def test_forward_shapes_and_solver_endpoint_identity():
     model = make_model()
     inputs = make_input()
     output = model(inputs)
-    assert output.velocity.root_motion.shape == inputs.noisy_motion.root_motion.shape
-    assert output.velocity.latent_motion.shape == inputs.noisy_motion.latent_motion.shape
-    expected = inputs.noisy_motion.root_motion + inputs.beta[..., None, None] * output.velocity.root_motion
-    # x/y/z are unaffected by the heading manifold projection under identity stats.
-    assert torch.allclose(output.clean_root_motion[..., :3], expected[..., :3], atol=1e-5)
+    assert output.raw_root_output.shape == inputs.noisy_motion.root_motion.shape
+    assert output.raw_body_output.shape == inputs.noisy_motion.latent_motion.shape
+    solver_endpoint = (
+        inputs.noisy_motion.root_motion
+        + inputs.beta[..., None, None] * output.solver_velocity.root_motion
+    )
+    assert torch.allclose(solver_endpoint, output.raw_root_output, atol=1e-5)
+    assert torch.allclose(
+        output.clean_motion.root_motion[..., 3:5].norm(dim=-1),
+        torch.ones_like(output.clean_motion.root_motion[..., 3]),
+        atol=1e-5,
+    )
     assert output.local_root_motion.shape == (2, 6, 4, 4)
+
+
+@pytest.mark.parametrize("root_prediction_type", ["x0", "velocity"])
+@pytest.mark.parametrize("body_prediction_type", ["x0", "velocity"])
+def test_independent_prediction_types_share_one_clean_endpoint_contract(
+    root_prediction_type,
+    body_prediction_type,
+):
+    model = make_model(
+        root_prediction_type=root_prediction_type,
+        body_prediction_type=body_prediction_type,
+    ).eval()
+    inputs = make_input(batch=1, tokens=2)
+    current_root = torch.zeros_like(inputs.noisy_motion.root_motion)
+    current_root[..., 3] = 1.0
+    current_body = torch.zeros_like(inputs.noisy_motion.latent_motion)
+    inputs = LDFInput(
+        **{
+            **inputs.__dict__,
+            "noisy_motion": HybridMotion(current_root, current_body),
+            "beta": torch.full((1, 2), 0.5),
+        }
+    )
+    raw_root = torch.zeros_like(current_root)
+    raw_root[..., 0] = 2.0
+    raw_root[..., 1] = 1.5
+    raw_root[..., 2] = -4.0
+    raw_root[..., 4] = 2.0
+    raw_body = torch.full_like(current_body, 3.0)
+
+    model._predict_root = types.MethodType(
+        lambda self, call_inputs, condition: raw_root,
+        model,
+    )
+    model._predict_body = types.MethodType(
+        lambda self, call_inputs, condition, local, valid, heading: raw_body,
+        model,
+    )
+    prediction = model(inputs)
+
+    expected_raw_root = raw_root.clone()
+    if root_prediction_type == "velocity":
+        expected_raw_root = current_root + 0.5 * raw_root
+    expected_root = expected_raw_root.clone()
+    expected_root[..., 3:5] = torch.nn.functional.normalize(
+        expected_root[..., 3:5], dim=-1
+    )
+    expected_body = (
+        raw_body
+        if body_prediction_type == "x0"
+        else current_body + 0.5 * raw_body
+    )
+    assert torch.equal(prediction.raw_root_output, raw_root)
+    assert torch.equal(prediction.raw_body_output, raw_body)
+    assert torch.allclose(prediction.clean_motion.root_motion, expected_root)
+    assert torch.allclose(prediction.clean_motion.latent_motion, expected_body)
+    assert torch.allclose(
+        current_root + 0.5 * prediction.solver_velocity.root_motion,
+        expected_raw_root,
+    )
+    assert torch.allclose(
+        current_body + 0.5 * prediction.solver_velocity.latent_motion,
+        expected_body,
+    )
+
+
+def test_root_x0_solver_uses_raw_endpoint_and_commit_projects_heading():
+    model = make_model(root_prediction_type="x0").eval()
+    inputs = make_input(batch=1, tokens=2)
+    current_root = torch.zeros_like(inputs.noisy_motion.root_motion)
+    current_root[..., 3] = 1.0
+    inputs = LDFInput(
+        **{
+            **inputs.__dict__,
+            "noisy_motion": HybridMotion(
+                current_root,
+                torch.zeros_like(inputs.noisy_motion.latent_motion),
+            ),
+            "beta": torch.full((1, 2), 0.5),
+        }
+    )
+    raw_root = current_root.clone()
+    raw_root[..., 3] = 0.0
+    raw_root[..., 4] = 2.0
+    raw_body = torch.zeros_like(inputs.noisy_motion.latent_motion)
+    model._predict_root = types.MethodType(
+        lambda self, call_inputs, condition: raw_root,
+        model,
+    )
+    model._predict_body = types.MethodType(
+        lambda self, call_inputs, condition, local, valid, heading: raw_body,
+        model,
+    )
+
+    prediction = model(inputs)
+    assert torch.allclose(
+        prediction.clean_motion.root_motion[..., 3:5],
+        torch.tensor([0.0, 1.0]),
+    )
+    solver_endpoint = (
+        inputs.noisy_motion.root_motion
+        + inputs.beta[..., None, None]
+        * prediction.solver_velocity.root_motion
+    )
+    assert torch.allclose(
+        solver_endpoint[..., 3:5],
+        torch.tensor([0.0, 2.0]),
+    )
+
+    next_motion, _ = model.denoise_step(
+        inputs,
+        torch.zeros_like(inputs.beta),
+        use_cfg=False,
+    )
+    assert torch.allclose(
+        next_motion.root_motion[..., 3:5],
+        torch.tensor([0.0, 2.0]),
+    )
+    _, committed, _ = model.commit_step(
+        next_motion,
+        torch.zeros_like(inputs.beta),
+        token_index=0,
+    )
+    assert torch.allclose(
+        committed.root_motion[..., 3:5],
+        torch.tensor([0.0, 1.0]),
+    )
+
+
+def test_history_beta_zero_is_authoritative_and_never_divided():
+    model = make_model(root_prediction_type="x0", body_prediction_type="x0").eval()
+    inputs = make_input(batch=1, tokens=2)
+    inputs = LDFInput(
+        **{
+            **inputs.__dict__,
+            "beta": torch.tensor([[0.0, 0.5]]),
+            "history_mask": torch.tensor([[True, False]]),
+            "generation_mask": torch.tensor([[False, True]]),
+        }
+    )
+    prediction = model(inputs)
+    assert torch.equal(
+        prediction.clean_motion.root_motion[:, 0],
+        inputs.noisy_motion.root_motion[:, 0],
+    )
+    assert torch.equal(
+        prediction.clean_motion.latent_motion[:, 0],
+        inputs.noisy_motion.latent_motion[:, 0],
+    )
+    assert not prediction.solver_velocity.root_motion[:, 0].any()
+    assert not prediction.solver_velocity.latent_motion[:, 0].any()
+    assert torch.isfinite(prediction.solver_velocity.root_motion).all()
+    assert torch.isfinite(prediction.solver_velocity.latent_motion).all()
+
+
+def test_active_beta_zero_fails_before_endpoint_division():
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=2)
+    inputs = LDFInput(
+        **{
+            **inputs.__dict__,
+            "beta": torch.tensor([[0.0, 0.5]]),
+            "generation_mask": torch.tensor([[True, True]]),
+        }
+    )
+    with pytest.raises(ValueError, match="strictly positive beta"):
+        model(inputs)
 
 
 def test_future_projection_has_zero_gradient_instead_of_being_unused():
     model = make_model().train()
     output = model(make_input(batch=1, tokens=4))
     (
-        output.velocity.root_motion.square().mean()
-        + output.velocity.latent_motion.square().mean()
+        output.solver_velocity.root_motion.square().mean()
+        + output.solver_velocity.latent_motion.square().mean()
     ).backward()
 
     for parameter in model.root_transformer.future_projection.parameters():
@@ -145,7 +319,7 @@ def test_future_projection_static_graph_supports_rank_local_future_conditions(tm
 def test_body_loss_does_not_backpropagate_into_root_transformer():
     model = make_model().train()
     output = model(make_input(batch=1, tokens=4))
-    output.velocity.latent_motion.square().mean().backward()
+    output.raw_body_output.square().mean().backward()
     assert all(parameter.grad is None for parameter in model.root_transformer.parameters())
     assert any(parameter.grad is not None for parameter in model.body_transformer.parameters())
 
@@ -187,7 +361,7 @@ def test_changing_active_xz_condition_changes_root_prediction():
             root_condition_mask=mask,
         )
         conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
-        return model(conditioned).velocity.root_motion
+        return model(conditioned).solver_velocity.root_motion
 
     assert not torch.allclose(predict(first_value), predict(second_value))
 
@@ -222,8 +396,8 @@ def test_active_xz_condition_preserves_noisy_root_as_an_independent_input():
     original = LDFInput(**{**inputs.__dict__, "condition": condition})
 
     with torch.no_grad():
-        original_velocity = model(original).velocity.root_motion
-        changed_velocity = model(changed).velocity.root_motion
+        original_velocity = model(original).solver_velocity.root_motion
+        changed_velocity = model(changed).solver_velocity.root_motion
     assert not torch.allclose(original_velocity, changed_velocity)
 
 
@@ -247,7 +421,7 @@ def test_unobserved_active_root_values_cannot_leak_through_condition_input():
             root_condition_mask=mask,
         )
         conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
-        return model(conditioned).velocity.root_motion
+        return model(conditioned).solver_velocity.root_motion
 
     with torch.no_grad():
         assert torch.equal(predict(first_value), predict(second_value))
@@ -263,7 +437,7 @@ def test_bfloat16_text_runs_with_float32_model_without_autocast():
     conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
     with torch.no_grad():
         output = model(conditioned)
-    assert output.velocity.root_motion.dtype == torch.float32
+    assert output.solver_velocity.root_motion.dtype == torch.float32
 
 
 def test_body_heading_is_derived_from_clean_root():
@@ -315,8 +489,8 @@ def test_future_root_uses_generation_centered_rope_without_extending_body():
     output = model(inputs)
     assert captured["input_length"] == 6
     assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 2, 3, 4]]
-    assert output.velocity.root_motion.shape[1] == 6
-    assert output.velocity.latent_motion.shape[1] == 6
+    assert output.solver_velocity.root_motion.shape[1] == 6
+    assert output.solver_velocity.latent_motion.shape[1] == 6
 
 
 def test_future_root_supports_bfloat16_autocast():
@@ -347,10 +521,10 @@ def test_future_root_supports_bfloat16_autocast():
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         output = model(inputs)
 
-    assert output.velocity.root_motion.shape == (1, 4, 4, 5)
-    assert output.velocity.latent_motion.shape == (1, 4, 8)
-    assert torch.isfinite(output.velocity.root_motion).all()
-    assert torch.isfinite(output.velocity.latent_motion).all()
+    assert output.solver_velocity.root_motion.shape == (1, 4, 4, 5)
+    assert output.solver_velocity.latent_motion.shape == (1, 4, 8)
+    assert torch.isfinite(output.solver_velocity.root_motion).all()
+    assert torch.isfinite(output.solver_velocity.latent_motion).all()
 
 
 def test_future_root_is_packed_after_the_visible_motion_prefix():
@@ -393,7 +567,7 @@ def test_future_root_is_packed_after_the_visible_motion_prefix():
     assert captured["input_length"] == 4
     assert captured["rope_position_ids"].tolist() == [[-1, 0, 1, 3]]
     assert captured["text_query_indices"].tolist() == [[0, 1, 2, -1]]
-    assert not output.velocity.root_motion[:, 3].any()
+    assert not output.solver_velocity.root_motion[:, 3].any()
 
 
 def test_root_transformer_packs_only_dynamic_future_tail():
@@ -567,7 +741,7 @@ def test_changing_future_xz_lookahead_changes_root_prediction():
             future_horizon_tokens=torch.tensor([2]),
         )
         conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
-        return model(conditioned).velocity.root_motion
+        return model(conditioned).solver_velocity.root_motion
 
     assert not torch.allclose(predict(first_value), predict(second_value))
 
@@ -627,12 +801,12 @@ def test_invisible_motion_and_text_tail_cannot_change_visible_predictions():
         original = model(inputs)
         changed = model(changed_inputs)
     assert torch.equal(
-        original.velocity.root_motion[:, :4],
-        changed.velocity.root_motion[:, :4],
+        original.solver_velocity.root_motion[:, :4],
+        changed.solver_velocity.root_motion[:, :4],
     )
     assert torch.equal(
-        original.velocity.latent_motion[:, :4],
-        changed.velocity.latent_motion[:, :4],
+        original.solver_velocity.latent_motion[:, :4],
+        changed.solver_velocity.latent_motion[:, :4],
     )
-    assert not original.velocity.root_motion[:, 4:].any()
-    assert not original.velocity.latent_motion[:, 4:].any()
+    assert not original.solver_velocity.root_motion[:, 4:].any()
+    assert not original.solver_velocity.latent_motion[:, 4:].any()

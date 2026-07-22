@@ -1,4 +1,4 @@
-"""Build minimal root5/body265 NPZ files from HumanML-style 263D motion."""
+"""Build minimal root5/body259 NPZ files from HumanML-style 263D motion."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import shutil
 import numpy as np
 import torch
 
-from tools.convert_motion_263_to_265 import (
+from tools.convert_motion_263_to_259 import (
     HUMANML_DIM,
-    convert_motion_263_to_265,
+    convert_motion_263_to_259,
 )
 from utils.motion_process import BODY_DIM, ROOT_DIM
 from utils.token_frame import FRAMES_PER_TOKEN, aligned_frame_floor
@@ -47,15 +47,33 @@ def artifact_is_current(source: Path, target: Path, *, fps: float) -> bool:
         return False
     try:
         with np.load(target, allow_pickle=False) as data:
-            return (
-                data["root_motion"].ndim == 2
-                and data["root_motion"].shape[-1] == ROOT_DIM
-                and data["body_motion"].ndim == 2
-                and data["body_motion"].shape[-1] == BODY_DIM
-                and data["body_feature_valid_mask"].shape == data["body_motion"].shape
-                and data["root_motion"].shape[0] == data["body_motion"].shape[0]
+            if set(data.files) != {
+                "root_motion",
+                "body_motion",
+                "body_feature_valid_mask",
+            }:
+                return False
+            root = np.asarray(data["root_motion"])
+            body = np.asarray(data["body_motion"])
+            valid = np.asarray(data["body_feature_valid_mask"])
+            heading_norm = np.linalg.norm(root[:, 3:5], axis=-1)
+            return bool(
+                root.ndim == 2
+                and root.shape[-1] == ROOT_DIM
+                and root.dtype == np.float32
+                and body.ndim == 2
+                and body.shape[-1] == BODY_DIM
+                and body.dtype == np.float32
+                and valid.shape == body.shape
+                and valid.dtype == np.bool_
+                and root.shape[0] == body.shape[0]
+                and root.shape[0] >= FRAMES_PER_TOKEN
+                and root.shape[0] % FRAMES_PER_TOKEN == 0
+                and np.isfinite(root).all()
+                and np.isfinite(body).all()
+                and np.allclose(heading_norm, 1.0, atol=1e-5, rtol=0.0)
             )
-    except (KeyError, OSError, ValueError):
+    except (IndexError, KeyError, OSError, ValueError):
         return False
 
 
@@ -72,7 +90,7 @@ def process_file(source: Path, target: Path, *, fps: float = 20.0) -> dict:
     if usable < FRAMES_PER_TOKEN:
         raise ValueError(f"{source} has fewer than four usable frames")
     motion = torch.from_numpy(feature[:usable]).float()
-    root, body, feature_valid = convert_motion_263_to_265(motion, fps=fps)
+    root, body, feature_valid = convert_motion_263_to_259(motion, fps=fps)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.stem}.{os.getpid()}.tmp.npz")
     try:

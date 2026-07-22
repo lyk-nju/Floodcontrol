@@ -15,7 +15,6 @@ from utils.conditions.ldf import (
 from utils.motion_process import ROOT_DIM
 from utils.training.ldf.flow import (
     build_span_beta,
-    flow_velocity_target,
     mix_fixed_noise,
 )
 
@@ -37,7 +36,6 @@ class LDFStepView:
 @dataclass(frozen=True)
 class LDFTrainingStep:
     inputs: LDFInput
-    target_velocity: HybridMotion
     loss_mask: torch.Tensor
     noise: HybridMotion
     view: LDFStepView
@@ -183,7 +181,6 @@ def build_ldf_training_step(
     )
     return LDFTrainingStep(
         inputs=inputs,
-        target_velocity=flow_velocity_target(clean_motion, noise),
         loss_mask=loss_mask,
         noise=noise,
         view=view,
@@ -275,7 +272,6 @@ def build_cold_start_training_step(
     inputs.validate_structure()
     return LDFTrainingStep(
         inputs=inputs,
-        target_velocity=flow_velocity_target(clean_motion, noise),
         loss_mask=loss_mask,
         noise=noise,
         view=view,
@@ -361,7 +357,6 @@ def build_ldf_rollout_step(
     loss_mask = inputs.generation_mask & valid
     return LDFTrainingStep(
         inputs=inputs,
-        target_velocity=flow_velocity_target(clean_motion, noise),
         loss_mask=loss_mask,
         noise=noise,
         view=view,

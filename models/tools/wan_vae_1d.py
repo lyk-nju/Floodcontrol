@@ -135,7 +135,7 @@ class CausalBodyVAE(nn.Module):
     @staticmethod
     def _patch_body(body_motion: torch.Tensor) -> torch.Tensor:
         if body_motion.ndim != 3 or body_motion.shape[-1] != BODY_DIM:
-            raise ValueError("body_motion must be [B,F,265]")
+            raise ValueError(f"body_motion must be [B,F,{BODY_DIM}]")
         require_aligned_frame_count(body_motion.shape[1])
         return body_motion.reshape(body_motion.shape[0], -1, FRAMES_PER_TOKEN * BODY_DIM)
 

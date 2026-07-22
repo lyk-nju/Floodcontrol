@@ -1,7 +1,7 @@
 """Lightweight HumanML22 motion video rendering.
 
 ``render_joint_video`` consumes world-space joints and owns only projection
-and rasterization. ``render_motion_video`` is the physical root5/body265
+and rasterization. ``render_motion_video`` is the physical root5/body259
 adapter. Directory traversal, evaluation artifact layout, and video comparison
 belong to their task-specific callers rather than this module.
 """
@@ -296,7 +296,7 @@ def render_motion_video(
     show_full_trajectory: bool = False,
     show_generated_trajectory: bool = False,
 ) -> None:
-    """Recover and render one physical root5/body265 motion and optional route."""
+    """Recover and render one physical root5/body259 motion and optional route."""
     root = torch.from_numpy(_numpy_float32(root_motion, name="root_motion"))
     body = torch.from_numpy(_numpy_float32(body_motion, name="body_motion"))
     if root.ndim != 2 or root.shape[-1] != ROOT_DIM:

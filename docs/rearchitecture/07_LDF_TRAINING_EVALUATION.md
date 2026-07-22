@@ -31,9 +31,9 @@ XZ控制指标只保留物理意义直接且互补的ADE、FDE和最大逐帧误
 
 ## T2M评测
 
-HumanML3D生成结果仍可通过唯一`root5/body265 -> HumanML263`converter进入已有T2M evaluator，记录FID、Matching Score、R-Precision以及Diversity。T2M读取`data.val_meta_paths`并遍历完整HumanML3D validation split，不提供容易被误当成正式FID的`max_samples`捷径。当前正式训练默认关闭该高成本评测；需要阶段性检查无轨迹动作分布时再显式启用，不删除其独立评测能力。
+HumanML3D生成结果通过唯一`Root5/Body259 -> HumanML263`converter进入已有T2M evaluator，记录FID、Matching Score、R-Precision以及Diversity。转换先移除初始XZ与初始heading，再恢复HumanML IK parent-local rotation；joint velocity从恢复后的world positions用forward difference重算。T2M读取`data.val_meta_paths`并遍历完整HumanML3D validation split，不提供容易被误当成正式FID的`max_samples`捷径。
 
-T2M评测不提供轨迹条件；dense XZ评测和T2M评测分别回答“控制是否准确”和“无轨迹提示时动作分布是否合理”，不能把二者混为同一指标。基础配置的研究默认是`cfg_mode: joint`与`cfg_scale_joint: 3.0`：该值来自step-160000 EMA在完整1450条HumanML3D validation样本上的固定seed stream sweep，离散最优出现在约3.125，基础配置取更简单且相邻表现接近的3.0。远端`ldf.yaml`是另一台训练服务器profile的显式快照：它开启T2M但使用`nocfg`，同时将模型全局Joint scale覆盖为1.0；该覆盖不反向修改本机与Multi的基础研究默认。
+T2M评测不提供轨迹条件；dense XZ评测和T2M评测分别回答“控制是否准确”和“无轨迹提示时动作分布是否合理”，不能把二者混为同一指标。正式配置统一使用`cfg_mode: joint`与`cfg_scale_joint: 3.0`：该值来自step-160000 EMA在完整1450条HumanML3D validation样本上的固定seed stream sweep，离散最优出现在约3.125，正式默认取更简单且相邻表现接近的3.0。remote/local/multi不再覆盖这一语义。
 
 每次T2M评测完成后，rank 0必须在训练控制台打印本轮样本数、生成模式、CFG模式，以及实际计算出的FID、Matching Score、R-Precision和Diversity；相同数值继续写入评测`summary.json`和Lightning/WandB日志。其他DDP rank不重复打印。
 
@@ -67,7 +67,7 @@ validation:
 
 生成轨迹probe不从validation split中隐式取“前N条”，而是按FloodNet格式由`data.test_probe_meta_paths.dense_xz`指定小型TXT。该TXT是数值样本与视频样本的唯一来源，不再维护第二层`video_sample_ids`筛选：每条样本的`num_runs`全部参与数值指标，只有run 0渲染原始、`+90°`和`+180°`三组结果。若只需要`000021/001168`，应让`test_min.txt`只包含这两个ID。T2M仍独立使用完整validation split。
 
-三组yaw视频采用paired-noise合同：root5/body265与dense world-XZ route同步旋转；latent source保持逐元素相同；root source在物理root5空间执行同一yaw旋转后重新归一化；文本、seed和denoise设置保持一致。因此三组差异用于诊断模型的yaw等变性，而不是比较三个无关随机生成。`run_at_start: true`使训练入口在`trainer.fit()`之前显式执行一次`trainer.validate(..., ckpt_path=resume_ckpt)`；该轮validation使用加载后的checkpoint/EMA并额外生成六个固定视频，目录标签为`fit_start`。不再通过`on_train_start`维护另一套启动生命周期。当前正式paired-yaw视频只随`modes: [stream]`执行。
+三组yaw视频采用paired-noise合同：Root5与dense world-XZ route同步旋转，Body259/raw latent source保持逐元素相同；文本、seed和denoise设置保持一致。因此三组差异用于诊断模型的yaw等变性，而不是比较三个无关随机生成。`run_at_start: true`使训练入口在`trainer.fit()`之前显式执行一次`trainer.validate(..., ckpt_path=resume_ckpt)`；该轮validation使用加载后的checkpoint/EMA并额外生成固定视频，目录标签为`fit_start`。
 
 heavy evaluation在非sanity validation且step命中周期时执行，并支持单卡或DDP。所有rank都进入同一个EMA与collective作用域，但generation sample按全局稳定编号round-robin分片，每条motion只由一个rank生成。当前实验只启用`stream`；将modes改为`[stream, rolling]`即可同时比较两条runtime路径。运行前后每个rank分别恢复自己的Python、NumPy、Torch和当前CUDA device RNG状态。EMA参数在整轮validation开始时只交换一次，普通loss probe与inline evaluation共享同一EMA scope；epoch-end或异常路径恢复训练权重并释放临时副本，不改变optimizer、scheduler、LDF stream state或VAE decoder state。EMA shadow的device迁移和checkpoint加载显式退出Lightning validation的`inference_mode`，避免fit前validation把长期EMA storage变成后续无法原地更新的inference tensor。
 

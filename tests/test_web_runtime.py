@@ -37,7 +37,7 @@ class FakeInferenceSession:
         root[..., 1] = 1.0
         root[..., 3] = 1.0
         body = BodyPrediction(
-            continuous_body=torch.zeros(1, 4, 261),
+            continuous_body=torch.zeros(1, 4, 255),
             contact_logits=torch.zeros(1, 4, 4),
         )
         trace = InferenceStepTrace(

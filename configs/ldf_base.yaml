@@ -44,7 +44,6 @@ validation:
     cfg_mode: joint
 
 vae:
-  target: models.vae_wan_1d.BodyVAE
   params:
     latent_dim: 128
     hidden_dim: 512
@@ -52,10 +51,8 @@ vae:
     decoder_layers: 6
     kernel_size: 3
     dropout: 0.0
-    motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
 
 data:
-  root_stats_path: ${dirs.raw_data}/HumanML3D_motion/root_stats.npz
   min_frames: 20
   max_frames: 200
   random_yaw: true
@@ -103,35 +100,23 @@ metrics:
 
 training:
   text_dropout: 0.1
-  constraint_dropout: 0.1
+  constraint_dropout: 0.2
   window:
     max_tokens: 50
     generation_tokens: 5
     sampling: random_generation_start
   max_horizon_token: 45
   constraint_sampling:
-    dense_probability: 1.0
-    waypoint_probability: 0.0
-    goal_probability: 0.0
+    dense_probability: 0.5
+    waypoint_probability: 0.25
+    goal_probability: 0.25
     max_waypoint_count: 4
-
-root_statistics:
-  window_tokens: 50
-  generation_tokens: 5
-  anchor_sampling: uniform_legal_history
-  random_yaw: true
-  windows_per_sample: 1
 
 loss:
   root_weight: 1.0
   body_weight: 1.0
   rollout_weight: 1.0
-  offpath_beta_min: 0.1
   root_boundary_weight: 0.0
-  root_heading_cosine_weight: 0.1
-  root_heading_vector_weight: 0.1
-  root_heading_beta_min: 0.1
-  root_heading_cosine_min_norm: 0.05
 
 self_forcing:
   cold_start_replay: 0.1
@@ -168,12 +153,13 @@ model:
     cfg_scale_text: 1.0
     cfg_scale_constraint: 1.0
     cfg_scale_joint: 3.0
-    prediction_type: vel
+    root_prediction_type: x0
+    body_prediction_type: velocity
 
 optimizer:
   target: AdamW
   params:
-    lr: 2.0e-5
+    lr: 1.0e-4
     betas: [0.9, 0.99]
     weight_decay: 0.0
     eps: 1.0e-8

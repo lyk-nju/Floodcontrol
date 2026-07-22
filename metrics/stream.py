@@ -96,7 +96,9 @@ def compute_stream_boundary_metrics(
     root = _to_motion_tensor(root_motion, ROOT_DIM)
     body_dim = int(body_motion.shape[-1])
     if body_dim not in (BODY_CONTINUOUS_DIM, BODY_DIM):
-        raise ValueError("body_motion must end in 261 or 265")
+        raise ValueError(
+            f"body_motion must end in {BODY_CONTINUOUS_DIM} or {BODY_DIM}"
+        )
     body = _to_motion_tensor(body_motion, body_dim)
     if root.shape[0] != body.shape[0]:
         raise ValueError("root_motion and body_motion must share frame length")
@@ -166,7 +168,10 @@ def compute_stream_vs_offline_metrics(
         BODY_CONTINUOUS_DIM,
         BODY_DIM,
     ):
-        raise ValueError("stream/offline body motions must share dimension 261 or 265")
+        raise ValueError(
+            "stream/offline body motions must share dimension "
+            f"{BODY_CONTINUOUS_DIM} or {BODY_DIM}"
+        )
     stream_body = _to_motion_tensor(stream_body_motion, stream_body_dim)
     offline_body = _to_motion_tensor(offline_body_motion, offline_body_dim)
     if stream_root.shape[0] != stream_body.shape[0]:

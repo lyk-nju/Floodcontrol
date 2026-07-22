@@ -1,4 +1,4 @@
-exp_name: vae_body265
+exp_name: vae_body259
 seed: 1234
 debug: false
 train: true
@@ -23,9 +23,9 @@ validation:
 data:
   target: datasets.humanml3d.HumanML3DDataset
   train_meta_paths:
-    - ${dirs.raw_data}/HumanML3D_motion/train.txt
+    - ${dirs.raw_data}/HumanML3D_motion_local/train.txt
   val_meta_paths:
-    - ${dirs.raw_data}/HumanML3D_motion/val.txt
+    - ${dirs.raw_data}/HumanML3D_motion_local/val.txt
   artifact_path: artifacts
   text_path: null
   train_batch_size: 128
@@ -45,8 +45,7 @@ model:
     decoder_layers: 6
     kernel_size: 3
     dropout: 0.0
-    motion_stats_path: ${dirs.raw_data}/HumanML3D_motion/motion_stats.npz
-    latent_stats_path: null
+    motion_stats_path: ${dirs.raw_data}/HumanML3D_motion_local/motion_stats.npz
 
 loss:
   lambda_position: 1.0

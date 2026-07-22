@@ -1,4 +1,4 @@
-"""Measure root5/body265-to-HumanML263 round-trip and evaluator drift."""
+"""Measure root5/body259-to-HumanML263 round-trip and evaluator drift."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from metrics.humanml import convert_root5_body265_to_humanml263
+from metrics.humanml import convert_root5_body259_to_humanml263
 from metrics.tools.t2m_evaluator import MovementConvEncoder, MotionEncoderBiGRUCo
 from metrics.tools.utils import (
     calculate_activation_statistics_np,
     calculate_frechet_distance_np,
 )
-from tools.convert_motion_263_to_265 import convert_motion_263_to_265
+from tools.convert_motion_263_to_259 import convert_motion_263_to_259
 
 
 FEATURE_BLOCKS = {
@@ -125,9 +125,9 @@ def main() -> None:
         source = torch.from_numpy(np.load(path)).float()
         if source.ndim != 2 or source.shape[-1] != 263 or source.shape[0] < 8:
             continue
-        root, body, _ = convert_motion_263_to_265(source)
-        exact = convert_root5_body265_to_humanml263(root, body, tail="drop")
-        approximate = convert_root5_body265_to_humanml263(
+        root, body, _ = convert_motion_263_to_259(source)
+        exact = convert_root5_body259_to_humanml263(root, body, tail="drop")
+        approximate = convert_root5_body259_to_humanml263(
             root, body, tail="approximate"
         )
         exact_reference = source[:-1]

@@ -306,7 +306,7 @@ def create_xz_condition(
         or clean_root_motion.ndim != 4
         or tuple(clean_root_motion.shape[2:]) != (FRAMES_PER_TOKEN, ROOT_DIM)
     ):
-        raise ValueError("clean_root_motion must be normalized [B,T,4,5]")
+        raise ValueError("clean_root_motion must be physical [B,T,4,5]")
     batch, tokens = clean_root_motion.shape[:2]
     if (
         not torch.is_tensor(token_valid_mask)

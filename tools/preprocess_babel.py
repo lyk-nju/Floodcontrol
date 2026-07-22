@@ -1,4 +1,4 @@
-"""Build versioned root5/body265 artifacts from BABEL_streamed motions."""
+"""Build root5/body259 artifacts from BABEL_streamed motions."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from tools.build_motion_artifact import (
     atomic_write_text,
     process_file,
 )
-from tools.convert_motion_263_to_265 import HUMANML_DIM
+from tools.convert_motion_263_to_259 import HUMANML_DIM
 from utils.token_frame import (
     FRAMES_PER_TOKEN,
     aligned_frame_floor,

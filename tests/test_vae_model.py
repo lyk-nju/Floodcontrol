@@ -21,14 +21,14 @@ def make_local(batch=2, tokens=3):
 
 def test_four_frame_shapes_and_deterministic_tokenize():
     model = make_model()
-    body = torch.randn(2, 12, 265)
+    body = torch.randn(2, 12, 259)
     mask = torch.ones(2, 12, dtype=torch.bool)
     posterior = model.encode(body, mask)
     assert posterior.mu.shape == (2, 3, 128)
     assert torch.equal(model.tokenize(body, mask), posterior.mu)
     local, valid = make_local()
     decoded = model.decode(posterior.mu, local, valid)
-    assert decoded.continuous_body.shape == (2, 12, 261)
+    assert decoded.continuous_body.shape == (2, 12, 255)
     assert decoded.contact_logits.shape == (2, 12, 4)
 
 
@@ -56,7 +56,7 @@ def test_tokenize_window_matches_full_clip_for_real_context(start, context):
     model = make_model()
     assert model.encoder_context_tokens == 8
     tokens = 20
-    body = torch.randn(1, tokens * 4, 265)
+    body = torch.randn(1, tokens * 4, 259)
     mask = torch.ones(1, tokens * 4, dtype=torch.bool)
     full = model.encode(body, mask)
     active_tokens = 3
@@ -65,13 +65,13 @@ def test_tokenize_window_matches_full_clip_for_real_context(start, context):
         mask[:, (start - context) * 4 : (start + active_tokens) * 4],
         context_token_count=torch.tensor([context], dtype=torch.long),
     )
-    expected = model.normalize_latent(full.mu[:, start : start + active_tokens])
+    expected = full.mu[:, start : start + active_tokens]
     assert torch.allclose(local, expected, atol=1e-6)
 
 
 def test_tokenize_window_rejects_partial_encoder_token():
     model = make_model()
-    body = torch.zeros(1, 4, 265)
+    body = torch.zeros(1, 4, 259)
     mask = torch.tensor([[True, True, False, False]])
     with pytest.raises(ValueError, match="constant within each four-frame token"):
         model.tokenize_window(
@@ -82,12 +82,9 @@ def test_tokenize_window_rejects_partial_encoder_token():
 
 
 def test_tokenize_window_mixed_batch_gathers_active_tokens_and_zeros_padding(tmp_path):
-    motion_stats, latent_stats = write_statistics(
-        tmp_path, latent_dim=128, latent_mean=2.0, latent_std=3.0
-    )
+    motion_stats = write_statistics(tmp_path)
     model = BodyVAE(
         motion_stats_path=motion_stats,
-        latent_stats_path=latent_stats,
         latent_dim=128,
         hidden_dim=32,
         encoder_layers=2,
@@ -99,13 +96,13 @@ def test_tokenize_window_mixed_batch_gathers_active_tokens_and_zeros_padding(tmp
         (3, 3, 2),
         (12, model.encoder_context_tokens, 4),
     )
-    full_body = torch.randn(len(specs), 20 * 4, 265)
+    full_body = torch.randn(len(specs), 20 * 4, 259)
     full_mask = torch.ones(len(specs), 20 * 4, dtype=torch.bool)
     full_posterior = model.encode(full_body, full_mask)
 
     window_tokens = [context + active for _, context, active in specs]
     max_window_tokens = max(window_tokens)
-    body_with_context = torch.zeros(len(specs), max_window_tokens * 4, 265)
+    body_with_context = torch.zeros(len(specs), max_window_tokens * 4, 259)
     window_mask = torch.zeros(len(specs), max_window_tokens * 4, dtype=torch.bool)
     for batch_index, (start, context, active) in enumerate(specs):
         source = full_body[
@@ -116,21 +113,19 @@ def test_tokenize_window_mixed_batch_gathers_active_tokens_and_zeros_padding(tmp
         window_mask[batch_index, : source.shape[0]] = True
 
     context_count = torch.tensor([item[1] for item in specs], dtype=torch.long)
-    normalized_mu = model.tokenize_window(
+    raw_mu = model.tokenize_window(
         body_with_context, window_mask, context_count
     )
 
     max_active = max(item[2] for item in specs)
-    assert normalized_mu.shape == (len(specs), max_active, 128)
+    assert raw_mu.shape == (len(specs), max_active, 128)
     for batch_index, (start, _, active) in enumerate(specs):
-        expected = model.normalize_latent(
-            full_posterior.mu[batch_index, start : start + active]
-        )
+        expected = full_posterior.mu[batch_index, start : start + active]
         assert torch.allclose(
-            normalized_mu[batch_index, :active], expected, atol=1e-6
+            raw_mu[batch_index, :active], expected, atol=1e-6
         )
         if active < max_active:
-            assert not normalized_mu[batch_index, active:].any()
+            assert not raw_mu[batch_index, active:].any()
 
 
 def test_offline_and_explicit_state_decode_match():
@@ -167,20 +162,17 @@ def test_two_decoder_states_do_not_share_cache():
     assert all(torch.count_nonzero(cache) == 0 for pair in second.caches for cache in pair)
 
 
-def test_statistics_files_only_require_arrays(tmp_path):
-    motion, latent = write_statistics(
-        tmp_path, latent_dim=4, latent_mean=2.0, latent_std=3.0
-    )
+def test_statistics_files_only_require_physical_arrays(tmp_path):
+    motion = write_statistics(tmp_path)
     model = BodyVAE(
         motion_stats_path=motion,
-        latent_stats_path=latent,
         latent_dim=4,
         hidden_dim=8,
         encoder_layers=1,
         decoder_layers=1,
     )
-    assert torch.equal(model.latent_mean, torch.full((4,), 2.0))
-    assert torch.equal(model.latent_std, torch.full((4,), 3.0))
+    assert torch.equal(model.body_cont_mean, torch.zeros(255))
+    assert torch.equal(model.local_root_std, torch.ones(4))
 
 
 def test_tiny_deterministic_mu_path_can_overfit_two_clips():
@@ -190,9 +182,8 @@ def test_tiny_deterministic_mu_path_can_overfit_two_clips():
         hidden_dim=16,
         encoder_layers=1,
         decoder_layers=1,
-        with_latent_stats=False,
     ).train()
-    body = torch.randn(2, 8, 265)
+    body = torch.randn(2, 8, 259)
     local = torch.randn(2, 2, 4, 4)
     valid = torch.ones_like(local, dtype=torch.bool)
     mask = torch.ones(2, 8, dtype=torch.bool)
@@ -200,7 +191,7 @@ def test_tiny_deterministic_mu_path_can_overfit_two_clips():
 
     def reconstruction():
         output = model.decode(model.encode(body, mask).mu, local, valid)
-        return (output.continuous_body - body[..., :261]).square().mean()
+        return (output.continuous_body - body[..., :255]).square().mean()
 
     initial = reconstruction().detach()
     for _ in range(20):

@@ -25,7 +25,6 @@ def _model() -> BodyVAE:
         hidden_dim=16,
         encoder_layers=1,
         decoder_layers=1,
-        with_latent_stats=False,
     ).eval()
 
 
@@ -34,8 +33,8 @@ def _sample(frames: int = 12) -> MotionSample:
     root[:, 0] = torch.arange(frames) * 0.01
     root[:, 1] = 1.0
     root[:, 3] = 1.0
-    body = torch.randn(frames, 265)
-    body[:, 261:] = torch.randint(0, 2, (frames, 4)).float()
+    body = torch.randn(frames, 259)
+    body[:, 255:] = torch.randint(0, 2, (frames, 4)).float()
     return MotionSample(
         sample_id="sample",
         dataset="HumanML3D",
@@ -57,22 +56,32 @@ def test_stream_reconstruction_uses_deterministic_mu_and_matches_offline():
         first.streamed_body.continuous_body,
         second.streamed_body.continuous_body,
     )
-    assert first.streamed_body.continuous_body.shape == (1, 12, 261)
+    assert first.streamed_body.continuous_body.shape == (1, 12, 255)
     assert first.stream_offline_max_abs <= 1e-5
     metrics = reconstruction_metrics(sample, first)
     assert metrics["frames"] == 12
     assert metrics["tokens"] == 3
     assert metrics["stream_offline_max_abs"] <= 1e-5
+    for name in (
+        "world_mpjpe_m",
+        "source_fk_direct_mpjpe_m",
+        "reconstruction_fk_direct_mpjpe_m",
+        "reconstruction_fk_target_mpjpe_m",
+        "foot_direction_error_deg",
+        "foot_reverse_ratio",
+        "ankle_toe_length_mae_m",
+    ):
+        assert torch.isfinite(torch.tensor(metrics[name]))
 
 
-def test_recover_joint_positions_uses_explicit_root_xz_and_global_height():
+def test_recover_joint_positions_adds_full_explicit_root_xyz():
     root = torch.tensor([[2.0, 1.2, -3.0, 1.0, 0.0]])
-    body = torch.zeros(1, 265)
+    body = torch.zeros(1, 259)
     body[0, :3] = torch.tensor([0.5, 0.8, -0.25])
     joints = recover_joint_positions(root, body)
     assert joints.shape == (1, 22, 3)
     assert torch.equal(joints[0, 0], torch.tensor([2.0, 1.2, -3.0]))
-    assert torch.equal(joints[0, 1], torch.tensor([2.5, 0.8, -3.25]))
+    assert torch.equal(joints[0, 1], torch.tensor([2.5, 2.0, -3.25]))
 
 
 def test_stream_metrics_consume_explicit_root_and_body_motion():
@@ -167,8 +176,8 @@ def test_rolling_full_decoder_context_matches_persistent_stream():
 def test_reconstruction_skating_metrics_use_position_transitions_and_masks():
     sample = _sample(frames=12)
     sample.body_motion.zero_()
-    sample.body_motion[:, 261] = 1.0
-    continuous = torch.zeros(1, 12, 261)
+    sample.body_motion[:, 255] = 1.0
+    continuous = torch.zeros(1, 12, 255)
     continuous[0, :, :63].reshape(12, 21, 3)[:, 6, 0] = (
         torch.arange(12) * 0.1
     )
@@ -191,8 +200,8 @@ def test_reconstruction_skating_metrics_use_position_transitions_and_masks():
 
 
 def test_output_layout_separates_original_and_reconstruction(tmp_path):
-    paths = output_paths(tmp_path, "humanml3d", "vae_body265_run", "sample")
-    model_root = tmp_path / "humanml3d/vae_body265_run"
+    paths = output_paths(tmp_path, "humanml3d", "vae_body259_run", "sample")
+    model_root = tmp_path / "humanml3d/vae_body259_run"
     assert paths["original_video"] == model_root / "video/original/sample.mp4"
     assert paths["reconstruction_video"] == model_root / "video/reconstruction/sample.mp4"
     assert paths["original_motion"] == model_root / "motion/original/sample.npz"

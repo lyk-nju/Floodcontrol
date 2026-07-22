@@ -119,15 +119,22 @@ def collect_unique_captions(cfg) -> Set[str]:
         for meta_file in _text_meta_paths_from_data_block(block):
             meta_file = os.path.normpath(meta_file)
             if not os.path.isfile(meta_file):
-                rank_zero_info(f"Meta file missing, skip: {meta_file}")
-                continue
+                raise FileNotFoundError(
+                    f"text inventory is missing: {meta_file}"
+                )
             root = os.path.dirname(meta_file)
             with open(meta_file, "r") as f:
                 names = [ln.strip() for ln in f if ln.strip()]
+            if not names or len(names) != len(set(names)):
+                raise ValueError(
+                    f"text inventory must contain unique sample ids: {meta_file}"
+                )
             for name in tqdm(names, desc=f"scan {os.path.basename(meta_file)}", leave=False):
                 txt_path = os.path.join(root, text_path, name + ".txt")
                 if not os.path.isfile(txt_path):
-                    continue
+                    raise FileNotFoundError(
+                        f"caption file listed by {meta_file} is missing: {txt_path}"
+                    )
                 with open(txt_path, "r") as tf:
                     for line in tf:
                         line = line.strip()

@@ -6,7 +6,7 @@ import torch
 
 from datasets.humanml3d import HumanML3DDataset
 from tools.compute_vae_stats import compute_motion_statistics, main as compute_stats_main
-from tools.convert_motion_263_to_265 import convert_motion_263_to_265, recover_root_263
+from tools.convert_motion_263_to_259 import convert_motion_263_to_259, recover_root_263
 from tools.preprocess_humanml3d import build_dataset
 from utils.motion_process import rotate_motion_yaw, unpack_body
 from utils.training.vae.data import VAEWindowCollator
@@ -33,7 +33,7 @@ def write_processed_sample(root, name="sample", frames=12, *, legacy_metadata=Tr
     root_motion[:, 1] = 1
     root_motion[:, 2] = np.arange(frames) * 2 + 20
     root_motion[:, 3] = 1
-    body = np.zeros((frames, 265), dtype=np.float32)
+    body = np.zeros((frames, 259), dtype=np.float32)
     body[:, 0] = np.arange(frames)
     valid = np.ones_like(body, dtype=bool)
     payload = {
@@ -43,7 +43,7 @@ def write_processed_sample(root, name="sample", frames=12, *, legacy_metadata=Tr
     }
     if legacy_metadata:
         payload.update(
-            contract_version="body265-v1",
+            contract_version="body259-v1",
             converter_version="old-converter",
             source_sha256="ignored",
             fps=np.float32(123.0),
@@ -53,16 +53,16 @@ def write_processed_sample(root, name="sample", frames=12, *, legacy_metadata=Tr
 
 
 def test_humanml263_conversion_recovers_root_body_and_backward_velocity():
-    root, body, valid = convert_motion_263_to_265(
+    root, body, valid = convert_motion_263_to_259(
         torch.from_numpy(make_humanml263()), fps=20
     )
     assert root.shape == (8, 5)
-    assert body.shape == (8, 265)
+    assert body.shape == (8, 259)
     assert torch.allclose(root[:, 0], torch.arange(8) * 0.05, atol=1e-6)
     parts = unpack_body(body)
     assert torch.allclose(parts["joint_velocities"][1:, 0, 0], torch.ones(7))
-    assert not valid[0, 195:261].any()
-    assert valid[1:, 195:261].all()
+    assert not valid[0, 189:255].any()
+    assert valid[1:, 189:255].all()
 
 
 def test_humanml263_root_recovery_preserves_floating_dtype():
@@ -153,7 +153,7 @@ def test_vae_validation_collator_uses_prefix_rebase_previous_root_and_padding(tm
         min_frames=4, max_frames=12, training=False, random_yaw=True
     )([dataset[0], dataset[1]])
     assert batch["root_motion"].shape == (2, 12, 5)
-    assert batch["body_motion"].shape == (2, 12, 265)
+    assert batch["body_motion"].shape == (2, 12, 259)
     assert batch["frame_valid_mask"][0].all()
     assert batch["frame_valid_mask"][1, :8].all()
     assert not batch["frame_valid_mask"][1, 8:].any()
@@ -167,7 +167,7 @@ def test_vae_training_collator_owns_random_aligned_crop_yaw_and_boundary(monkeyp
     root[:, 0] = torch.arange(16, dtype=torch.float32)
     root[:, 2] = torch.arange(16, dtype=torch.float32) * 2
     root[:, 3] = 1
-    body = torch.zeros(16, 265)
+    body = torch.zeros(16, 259)
     body[:, 0] = 1
     sample = {
         "dataset": "d",
@@ -225,8 +225,8 @@ def test_statistics_consumes_dataset_samples_and_cli_smoke(tmp_path, monkeypatch
     write_processed_sample(tmp_path, frames=12)
     (tmp_path / "train.txt").write_text("sample\n")
     dataset = HumanML3DDataset(meta_paths=[tmp_path / "train.txt"], split="train")
-    statistics = compute_motion_statistics(dataset, random_yaw=False)
-    assert statistics["body_cont_mean"].shape == (261,)
+    statistics = compute_motion_statistics(dataset)
+    assert statistics["body_cont_mean"].shape == (255,)
     assert statistics["local_root_mean"].shape == (4,)
 
     output = tmp_path / "stats.npz"
@@ -235,7 +235,7 @@ def test_statistics_consumes_dataset_samples_and_cli_smoke(tmp_path, monkeypatch
         "argv",
         [
             "compute_vae_stats.py", "--train-meta-paths", str(tmp_path / "train.txt"),
-            "--output", str(output), "--no-random-yaw",
+            "--output", str(output),
         ],
     )
     compute_stats_main()

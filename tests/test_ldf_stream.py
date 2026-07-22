@@ -12,8 +12,6 @@ from utils.training.ldf.window import sample_window_plan
 def make_model():
     return LDF(
         latent_dim=3,
-        root_mean=[0] * 5,
-        root_std=[1] * 5,
         local_root_mean=[0] * 4,
         local_root_std=[1] * 4,
         hidden_dim=8,
@@ -34,7 +32,18 @@ def constant_prediction(self, inputs, **kwargs):
     latent = torch.ones_like(inputs.noisy_motion.latent_motion)
     local = torch.zeros(*root.shape[:3], 4, device=root.device)
     valid = torch.ones_like(local, dtype=torch.bool)
-    return LDFPrediction(HybridMotion(root, latent), root, local, valid)
+    clean = HybridMotion(
+        inputs.noisy_motion.root_motion + inputs.beta[..., None, None] * root,
+        inputs.noisy_motion.latent_motion + inputs.beta[..., None] * latent,
+    )
+    return LDFPrediction(
+        raw_root_output=root,
+        raw_body_output=latent,
+        clean_motion=clean,
+        solver_velocity=HybridMotion(root, latent),
+        local_root_motion=local,
+        local_root_feature_valid=valid,
+    )
 
 
 def stream_condition(tokens=6):
@@ -88,8 +97,10 @@ def test_denoise_step_matches_euler_update_and_preserves_ideal_bridge():
     def perfect_forward(self, inputs):
         local = torch.zeros(*inputs.noisy_motion.root_motion.shape[:3], 4)
         return LDFPrediction(
-            velocity=target,
-            clean_root_motion=clean.root_motion,
+            raw_root_output=target.root_motion,
+            raw_body_output=target.latent_motion,
+            clean_motion=clean,
+            solver_velocity=target,
             local_root_motion=local,
             local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
         )
@@ -125,7 +136,7 @@ def test_denoise_step_matches_euler_update_and_preserves_ideal_bridge():
         atol=1e-6,
         rtol=1e-5,
     )
-    assert prediction.velocity is target
+    assert prediction.solver_velocity is target
 
 
 def test_commit_rebase_preserves_the_world_space_motion_state():
@@ -142,10 +153,9 @@ def test_commit_rebase_preserves_the_world_space_motion_state():
         token_index,
     )
 
-    normalized_translation = translation_xz / model.root_std[[0, 2]]
     restored_world_xz = rebased.root_motion[..., [0, 2]] + (
         (1.0 - beta)[..., None, None]
-        * normalized_translation[:, None, None, :]
+        * translation_xz[:, None, None, :]
     )
 
     assert torch.allclose(restored_world_xz, root[..., [0, 2]])
@@ -155,7 +165,7 @@ def test_commit_rebase_preserves_the_world_space_motion_state():
         torch.ones_like(committed.root_motion[..., 3]),
     )
     assert torch.allclose(
-        model.denormalize_root(committed.root_motion)[:, 0, -1, [0, 2]],
+        committed.root_motion[:, 0, -1, [0, 2]],
         translation_xz,
     )
 
@@ -313,7 +323,7 @@ def test_real_ldf_persistent_cold_matches_two_runtime_commits():
     assert torch.equal(training_state.beta, runtime_beta)
     runtime_origin = sum(
         (
-            model.denormalize_root(committed.root_motion)[:, 0, -1, [0, 2]]
+            committed.root_motion[:, 0, -1, [0, 2]]
             for committed in runtime_commits
         ),
         torch.zeros(1, 2),

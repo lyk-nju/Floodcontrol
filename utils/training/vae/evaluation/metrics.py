@@ -13,7 +13,17 @@ from utils.conditions.vae import (
     BODY_ROTATION_DIM,
     NUM_JOINTS,
 )
-from utils.motion_process import recover_joint_positions, rotation_to_matrix
+from utils.motion_process import (
+    FOOT_JOINT_INDICES,
+    LEFT_ANKLE_INDEX,
+    LEFT_TOE_INDEX,
+    RIGHT_ANKLE_INDEX,
+    RIGHT_TOE_INDEX,
+    forward_kinematics_heading_frame,
+    infer_humanml_skeleton_offsets,
+    recover_joint_positions,
+    rotation_to_matrix,
+)
 from utils.token_frame import frame_count_to_token_count
 
 from .reconstruction import MotionSample, ReconstructionResult
@@ -24,6 +34,48 @@ def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> float:
     if not bool(expanded.any()):
         return 0.0
     return float(value[expanded].mean())
+
+
+def _direction_metrics(
+    predicted_joints: torch.Tensor,
+    target_joints: torch.Tensor,
+    joint_valid: torch.Tensor,
+) -> tuple[float, float, float]:
+    """Return foot direction error, reverse ratio and ankle-toe length MAE."""
+
+    pairs = (
+        (LEFT_ANKLE_INDEX, LEFT_TOE_INDEX),
+        (RIGHT_ANKLE_INDEX, RIGHT_TOE_INDEX),
+    )
+    predicted = torch.stack(
+        [predicted_joints[:, toe] - predicted_joints[:, ankle] for ankle, toe in pairs],
+        dim=1,
+    )
+    target = torch.stack(
+        [target_joints[:, toe] - target_joints[:, ankle] for ankle, toe in pairs],
+        dim=1,
+    )
+    predicted_length = predicted.norm(dim=-1)
+    target_length = target.norm(dim=-1)
+    pair_valid = torch.stack(
+        [joint_valid[:, ankle] & joint_valid[:, toe] for ankle, toe in pairs],
+        dim=1,
+    )
+    valid = (
+        pair_valid
+        & (predicted_length > 1e-6)
+        & (target_length > 1e-6)
+    )
+    cosine = (
+        (predicted * target).sum(dim=-1)
+        / (predicted_length * target_length).clamp_min(1e-12)
+    ).clamp(-1.0, 1.0)
+    angle = torch.rad2deg(torch.acos(cosine))
+    return (
+        _masked_mean(angle, valid),
+        _masked_mean((cosine < 0).float(), valid),
+        _masked_mean((predicted_length - target_length).abs(), valid),
+    )
 
 
 def reconstruction_metrics(
@@ -45,10 +97,14 @@ def reconstruction_metrics(
     ).abs()
 
     pred_rotation = rotation_to_matrix(
-        predicted[:, BODY_POSITION_DIM:velocity_start].reshape(-1, NUM_JOINTS, 6)
+        predicted[:, BODY_POSITION_DIM:velocity_start].reshape(
+            -1, NUM_JOINTS - 1, 6
+        )
     )
     target_rotation = rotation_to_matrix(
-        target[:, BODY_POSITION_DIM:velocity_start].reshape(-1, NUM_JOINTS, 6)
+        target[:, BODY_POSITION_DIM:velocity_start].reshape(
+            -1, NUM_JOINTS - 1, 6
+        )
     )
     relative = pred_rotation.transpose(-1, -2) @ target_rotation
     cosine = (
@@ -56,7 +112,7 @@ def reconstruction_metrics(
     ).clamp(-1.0, 1.0)
     rotation_error = torch.rad2deg(torch.acos(cosine))
     rotation_valid = feature_valid[:, BODY_POSITION_DIM:velocity_start].reshape(
-        -1, NUM_JOINTS, 6
+        -1, NUM_JOINTS - 1, 6
     ).all(-1)
 
     target_contact = target[:, BODY_CONTINUOUS_DIM:].bool()
@@ -67,8 +123,54 @@ def reconstruction_metrics(
     precision = true_positive / max(true_positive + false_positive, 1)
     recall = true_positive / max(true_positive + false_negative, 1)
 
-    foot_indices = torch.tensor((7, 10, 8, 11))
+    foot_indices = torch.tensor(FOOT_JOINT_INDICES)
     reconstructed_joints = recover_joint_positions(sample.root_motion, predicted)
+    target_joints = recover_joint_positions(sample.root_motion, target)
+    position_joint_valid = feature_valid[:, :BODY_POSITION_DIM].reshape(
+        -1, NUM_JOINTS - 1, 3
+    ).all(dim=-1)
+    joint_valid = torch.cat(
+        [
+            torch.ones(
+                target.shape[0], 1, dtype=torch.bool, device=target.device
+            ),
+            position_joint_valid,
+        ],
+        dim=-1,
+    )
+    world_mpjpe = (
+        reconstructed_joints - target_joints
+    ).norm(dim=-1)
+
+    # HumanML derives subject scale from a reference pose.  Using the target's
+    # first pose supplies the same offsets to target and prediction, so the
+    # source FK/direct mismatch remains visible instead of being attributed to
+    # the VAE.
+    skeleton_offsets = infer_humanml_skeleton_offsets(target_joints[0])
+    target_fk_joints = forward_kinematics_heading_frame(
+        sample.root_motion,
+        target_rotation,
+        skeleton_offsets,
+    )
+    reconstructed_fk_joints = forward_kinematics_heading_frame(
+        sample.root_motion,
+        pred_rotation,
+        skeleton_offsets,
+    )
+    source_fk_error = (target_fk_joints - target_joints).norm(dim=-1)
+    reconstructed_fk_error = (
+        reconstructed_fk_joints - reconstructed_joints
+    ).norm(dim=-1)
+    reconstructed_fk_target_error = (
+        reconstructed_fk_joints - target_joints
+    ).norm(dim=-1)
+    foot_direction_error, foot_reverse_ratio, ankle_toe_length_mae = (
+        _direction_metrics(
+            reconstructed_joints,
+            target_joints,
+            joint_valid,
+        )
+    )
     reconstructed_foot_positions = reconstructed_joints.index_select(1, foot_indices)
     position_foot_speed = predicted.new_zeros(target.shape[0], 4)
     position_foot_speed[1:] = (
@@ -100,6 +202,17 @@ def reconstruction_metrics(
         "position_mae_m": _masked_mean(
             position_error, feature_valid[:, :BODY_POSITION_DIM]
         ),
+        "world_mpjpe_m": _masked_mean(world_mpjpe, joint_valid),
+        "source_fk_direct_mpjpe_m": _masked_mean(source_fk_error, joint_valid),
+        "reconstruction_fk_direct_mpjpe_m": _masked_mean(
+            reconstructed_fk_error, joint_valid
+        ),
+        "reconstruction_fk_target_mpjpe_m": _masked_mean(
+            reconstructed_fk_target_error, joint_valid
+        ),
+        "foot_direction_error_deg": foot_direction_error,
+        "foot_reverse_ratio": foot_reverse_ratio,
+        "ankle_toe_length_mae_m": ankle_toe_length_mae,
         "velocity_mae_mps": _masked_mean(
             velocity_error, feature_valid[:, velocity_start:BODY_CONTINUOUS_DIM]
         ),
@@ -132,7 +245,7 @@ def reconstruction_metrics(
         ).abs()
         reference_rotation = rotation_to_matrix(
             reference[:, BODY_POSITION_DIM:velocity_start].reshape(
-                -1, NUM_JOINTS, 6
+                -1, NUM_JOINTS - 1, 6
             )
         )
         rolling_relative = pred_rotation.transpose(-1, -2) @ reference_rotation

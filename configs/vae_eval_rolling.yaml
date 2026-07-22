@@ -8,9 +8,8 @@ window:
   commit_tokens: 1
 
 model:
-  model_id: vae_body265_20260715_164325
-  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260715_164325_vae_body265/last.ckpt
-  motion_stats_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/motion_stats.npz
+  model_id: vae_body259
+  checkpoint_path: null
   params:
     latent_dim: 128
     hidden_dim: 512
@@ -18,14 +17,13 @@ model:
     decoder_layers: 6
     kernel_size: 3
     dropout: 0.0
-    fps: 20.0
 
 datasets:
   humanml3d:
-    val_meta_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion/val.txt
+    val_meta_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/HumanML3D_motion_local/val.txt
     artifact_path: artifacts
   babel:
-    val_meta_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/BABEL_motion/val.txt
+    val_meta_path: /data1/yuankai/text2Motion/FloodDiffusion/raw_data/BABEL_motion_local/val.txt
     artifact_path: artifacts
 
 render:

@@ -1,6 +1,6 @@
 """Physical source-span construction for LDF training.
 
-Datasets own complete root5/body265 clips.  This module selects one fixed,
+Datasets own complete root5/body259 clips. This module selects one fixed,
 token-aligned physical span for a batch and supplies the real causal body
 context needed by the frozen EMA VAE.  H/A/frontier regions, flow noise and
 self-forcing state deliberately belong to the later training kernel.

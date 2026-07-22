@@ -11,7 +11,7 @@ import torch
 from datasets.humanml3d import HumanML3DDataset
 from utils.initialize import load_config
 from utils.conditions.vae import BODY_CONTINUOUS_DIM
-from utils.motion_process import recover_local_root, rotate_motion_yaw
+from utils.motion_process import recover_local_root
 from utils.token_frame import MOTION_FPS
 from utils.training.vae.data import create_dataset
 
@@ -49,33 +49,19 @@ def compute_motion_statistics(
     dataset,
     *,
     fps: float = 20.0,
-    random_yaw: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Accumulate statistics from one source Dataset or a MultiDataset."""
+    """Accumulate yaw-invariant Body259 statistics from one Dataset."""
 
     local_acc = Accumulator(4)
     body_acc = Accumulator(BODY_CONTINUOUS_DIM)
-    yaw_quadrature = (
-        torch.arange(4, dtype=torch.float32) * (torch.pi / 2)
-        if random_yaw
-        else torch.zeros(1, dtype=torch.float32)
-    )
     for index, sample in enumerate(dataset, start=1):
         root = sample["root_motion"][None]
         body = sample["body_motion"][None]
         body_valid = sample["body_feature_valid_mask"][None]
-        # Training samples receive a fresh uniform global yaw. Four quarter-turn
-        # quadrature points exactly match the first and per-feature second moments
-        # of every x/z vector, heading pair, and global rotation column under a
-        # continuous uniform yaw, without making statistics nondeterministic.
-        for angle in yaw_quadrature:
-            _, rotated_body = rotate_motion_yaw(
-                root, body, angle.reshape(1)
-            )
-            body_acc.update(
-                rotated_body[..., :BODY_CONTINUOUS_DIM],
-                body_valid[..., :BODY_CONTINUOUS_DIM],
-            )
+        body_acc.update(
+            body[..., :BODY_CONTINUOUS_DIM],
+            body_valid[..., :BODY_CONTINUOUS_DIM],
+        )
         local, local_valid = recover_local_root(root, None, fps=fps)
         local_acc.update(local, local_valid)
         if index % 500 == 0 or index == len(dataset):
@@ -98,11 +84,6 @@ def main() -> None:
     parser.add_argument("--artifact-path", default="artifacts")
     parser.add_argument("--output")
     parser.add_argument("--fps", type=float, default=20.0)
-    parser.add_argument(
-        "--random-yaw",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     args = parser.parse_args()
     if args.config:
         overrides = {}
@@ -130,9 +111,7 @@ def main() -> None:
         )
         fps = float(args.fps)
         output_path = args.output
-    statistics = compute_motion_statistics(
-        dataset, fps=fps, random_yaw=args.random_yaw
-    )
+    statistics = compute_motion_statistics(dataset, fps=fps)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(

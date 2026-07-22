@@ -29,7 +29,6 @@ from utils.conditions.ldf import (
     LDFStreamState,
     create_cfg_condition,
     normalize_features,
-    unnormalize_features,
 )
 from utils.motion_process import (
     LOCAL_ROOT_DIM,
@@ -520,8 +519,6 @@ class LDF(nn.Module):
         self,
         *,
         latent_dim: int,
-        root_mean,
-        root_std,
         local_root_mean,
         local_root_std,
         hidden_dim: int = 1024,
@@ -540,11 +537,19 @@ class LDF(nn.Module):
         cfg_scale_text: float = 1.0,
         cfg_scale_constraint: float = 1.0,
         cfg_scale_joint: float = 1.0,
-        prediction_type: str = "vel",
+        root_prediction_type: str = "x0",
+        body_prediction_type: str = "velocity",
     ):
         super().__init__()
-        if prediction_type != "vel":
-            raise ValueError("new LDF supports v-predict only")
+        supported_prediction_types = {"x0", "velocity"}
+        if root_prediction_type not in supported_prediction_types:
+            raise ValueError(
+                "root_prediction_type must be either 'x0' or 'velocity'"
+            )
+        if body_prediction_type not in supported_prediction_types:
+            raise ValueError(
+                "body_prediction_type must be either 'x0' or 'velocity'"
+            )
         if chunk_size <= 0 or noise_steps <= 0 or noise_steps % chunk_size:
             raise ValueError("noise_steps must be positive and divisible by chunk_size")
         if cfg_mode not in {"nocfg", "joint", "separated"}:
@@ -558,8 +563,8 @@ class LDF(nn.Module):
         self.cfg_scale_text = float(cfg_scale_text)
         self.cfg_scale_constraint = float(cfg_scale_constraint)
         self.cfg_scale_joint = float(cfg_scale_joint)
-        self.register_buffer("root_mean", _as_stats("root_mean", root_mean, ROOT_DIM))
-        self.register_buffer("root_std", _as_stats("root_std", root_std, ROOT_DIM))
+        self.root_prediction_type = str(root_prediction_type)
+        self.body_prediction_type = str(body_prediction_type)
         self.register_buffer(
             "local_root_mean",
             _as_stats("local_root_mean", local_root_mean, LOCAL_ROOT_DIM),
@@ -585,35 +590,88 @@ class LDF(nn.Module):
             **common, num_layers=body_num_layers
         )
 
-    def _recover_root(
-        self, noisy_root: torch.Tensor, beta: torch.Tensor, velocity: torch.Tensor
+    @staticmethod
+    def _update_mask(inputs: LDFInput) -> torch.Tensor:
+        mask = inputs.generation_mask
+        if bool((inputs.beta[mask] <= 0).any()):
+            raise ValueError("active generation tokens must have strictly positive beta")
+        return mask
+
+    @staticmethod
+    def _velocity_from_endpoint(
+        current: torch.Tensor,
+        clean: torch.Tensor,
+        beta: torch.Tensor,
+        update_mask: torch.Tensor,
     ) -> torch.Tensor:
-        clean = noisy_root + beta[..., None, None] * velocity
-        physical = unnormalize_features(clean, self.root_mean, self.root_std)
-        physical = project_root_heading(physical)
-        return normalize_features(physical, self.root_mean, self.root_std)
+        """Convert a clean endpoint to solver velocity without dividing history."""
 
-    def normalize_root(self, physical_root: torch.Tensor) -> torch.Tensor:
-        """Normalize physical root5 values with this LDF's frozen statistics."""
+        if tuple(current.shape) != tuple(clean.shape):
+            raise ValueError("current and clean endpoint must share shape")
+        if tuple(beta.shape) != tuple(update_mask.shape) or tuple(beta.shape) != tuple(
+            current.shape[:2]
+        ):
+            raise ValueError("beta and update_mask must match current [B,T]")
+        if bool((beta[update_mask] <= 0).any()):
+            raise ValueError("active generation tokens must have strictly positive beta")
+        safe_beta = torch.where(update_mask, beta, torch.ones_like(beta))
+        while safe_beta.ndim < current.ndim:
+            safe_beta = safe_beta.unsqueeze(-1)
+        velocity = (clean - current) / safe_beta.to(current)
+        expanded_mask = update_mask
+        while expanded_mask.ndim < current.ndim:
+            expanded_mask = expanded_mask.unsqueeze(-1)
+        return torch.where(expanded_mask, velocity, torch.zeros_like(velocity))
 
-        if not torch.is_tensor(physical_root) or physical_root.shape[-1] != ROOT_DIM:
-            raise ValueError("physical_root must be a tensor ending in root5")
-        if not physical_root.is_floating_point():
-            raise TypeError("physical_root must be floating point")
-        return normalize_features(physical_root, self.root_mean, self.root_std)
+    def _interpret_root_output(
+        self,
+        inputs: LDFInput,
+        raw_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Interpret Root output as physical condition and solver endpoint.
 
-    def denormalize_root(self, normalized_root: torch.Tensor) -> torch.Tensor:
-        """Restore normalized root5 values to physical model coordinates."""
+        ``clean`` is always a valid physical root5 and is therefore safe for
+        the Root-to-Body boundary.  The solver transports toward the raw
+        transformer endpoint; persistent state is projected only at commit.
+        """
 
-        if not torch.is_tensor(normalized_root) or normalized_root.shape[-1] != ROOT_DIM:
-            raise ValueError("normalized_root must be a tensor ending in root5")
-        if not normalized_root.is_floating_point():
-            raise TypeError("normalized_root must be floating point")
-        return unnormalize_features(normalized_root, self.root_mean, self.root_std)
+        current = inputs.noisy_motion.root_motion
+        update_mask = self._update_mask(inputs)
+        if self.root_prediction_type == "x0":
+            raw_endpoint = raw_output
+        else:
+            raw_endpoint = (
+                current
+                + inputs.beta[..., None, None].to(current) * raw_output
+            )
+        physical_endpoint = project_root_heading(raw_endpoint)
+        clean = torch.where(
+            update_mask[..., None, None], physical_endpoint, current
+        )
+        solver_endpoint = torch.where(
+            update_mask[..., None, None], raw_endpoint, current
+        )
+        solver_velocity = self._velocity_from_endpoint(
+            current, solver_endpoint, inputs.beta, update_mask
+        )
+        return clean, solver_velocity
 
-    def _project_normalized_root(self, normalized_root: torch.Tensor) -> torch.Tensor:
-        physical = self.denormalize_root(normalized_root)
-        return self.normalize_root(project_root_heading(physical))
+    def _interpret_body_output(
+        self,
+        inputs: LDFInput,
+        raw_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current = inputs.noisy_motion.latent_motion
+        update_mask = self._update_mask(inputs)
+        if self.body_prediction_type == "x0":
+            proposed_clean = raw_output
+        else:
+            proposed_clean = current + inputs.beta[..., None].to(current) * raw_output
+        clean = torch.where(update_mask[..., None], proposed_clean, current)
+        solver_velocity = self._velocity_from_endpoint(
+            current, clean, inputs.beta, update_mask
+        )
+        return clean, solver_velocity
 
     def _local_root(
         self,
@@ -621,9 +679,8 @@ class LDF(nn.Module):
         previous_root_frame: torch.Tensor | None,
         previous_root_valid_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        physical = unnormalize_features(clean_root, self.root_mean, self.root_std)
         local, valid = recover_local_root(
-            physical.flatten(1, 2),
+            clean_root.flatten(1, 2),
             previous_root_frame,
             fps=self.fps,
             previous_root_valid_mask=previous_root_valid_mask,
@@ -665,15 +722,38 @@ class LDF(nn.Module):
         first_token = valid.to(torch.int64).argmax(dim=1)
         batch_index = torch.arange(clean_root.shape[0], device=clean_root.device)
         root_frame = clean_root[batch_index, first_token, 0]
-        physical = unnormalize_features(root_frame, self.root_mean, self.root_std)
-        return project_root_heading(physical)[..., 3:5]
+        return project_root_heading(root_frame)[..., 3:5]
+
+    def _build_prediction(
+        self,
+        inputs: LDFInput,
+        raw_root_output: torch.Tensor,
+        raw_body_output: torch.Tensor,
+        clean_root: torch.Tensor,
+        root_solver_velocity: torch.Tensor,
+        local: torch.Tensor,
+        local_valid: torch.Tensor,
+    ) -> LDFPrediction:
+        clean_body, body_solver_velocity = self._interpret_body_output(
+            inputs, raw_body_output
+        )
+        return LDFPrediction(
+            raw_root_output=raw_root_output,
+            raw_body_output=raw_body_output,
+            clean_motion=HybridMotion(clean_root, clean_body),
+            solver_velocity=HybridMotion(
+                root_solver_velocity, body_solver_velocity
+            ),
+            local_root_motion=local,
+            local_root_feature_valid=local_valid,
+        )
 
     def forward(self, inputs: LDFInput) -> LDFPrediction:
         """Run one joint condition branch without classifier-free guidance."""
         inputs.validate_structure()
-        root_velocity = self._predict_root(inputs, inputs.condition)
-        clean_root = self._recover_root(
-            inputs.noisy_motion.root_motion, inputs.beta, root_velocity
+        raw_root_output = self._predict_root(inputs, inputs.condition)
+        clean_root, root_solver_velocity = self._interpret_root_output(
+            inputs, raw_root_output
         )
         local, local_valid, normalized_local = self._local_root(
             clean_root,
@@ -681,14 +761,17 @@ class LDF(nn.Module):
             inputs.previous_root_valid_mask,
         )
         heading = self._body_heading_condition(clean_root, inputs)
-        latent_velocity = self._predict_body(
+        raw_body_output = self._predict_body(
             inputs, inputs.condition, normalized_local, local_valid, heading
         )
-        return LDFPrediction(
-            velocity=HybridMotion(root_velocity, latent_velocity),
-            clean_root_motion=clean_root,
-            local_root_motion=local,
-            local_root_feature_valid=local_valid,
+        return self._build_prediction(
+            inputs,
+            raw_root_output,
+            raw_body_output,
+            clean_root,
+            root_solver_velocity,
+            local,
+            local_valid,
         )
 
     @staticmethod
@@ -728,18 +811,18 @@ class LDF(nn.Module):
         scale_joint = self.cfg_scale_joint if cfg_scale_joint is None else cfg_scale_joint
 
         if mode == "nocfg":
-            root_velocity = self._predict_root(inputs, branches["joint"])
+            raw_root_output = self._predict_root(inputs, branches["joint"])
         elif mode == "joint":
             root_history = self._predict_root(inputs, branches["history"])
             root_joint = self._predict_root(inputs, branches["joint"])
-            root_velocity = root_history + float(scale_joint) * (
+            raw_root_output = root_history + float(scale_joint) * (
                 root_joint - root_history
             )
         elif mode == "separated":
             root_history = self._predict_root(inputs, branches["history"])
             root_text = self._predict_root(inputs, branches["text"])
             root_constraint = self._predict_root(inputs, branches["constraint"])
-            root_velocity = self._compose_cfg(
+            raw_root_output = self._compose_cfg(
                 root_history,
                 root_text,
                 root_constraint,
@@ -749,8 +832,8 @@ class LDF(nn.Module):
         else:
             raise ValueError(f"unsupported CFG mode {mode!r}")
 
-        clean_root = self._recover_root(
-            inputs.noisy_motion.root_motion, inputs.beta, root_velocity
+        clean_root, root_solver_velocity = self._interpret_root_output(
+            inputs, raw_root_output
         )
         local, local_valid, normalized_local = self._local_root(
             clean_root,
@@ -760,7 +843,7 @@ class LDF(nn.Module):
         heading = self._body_heading_condition(clean_root, inputs)
 
         if mode == "nocfg":
-            latent_velocity = self._predict_body(
+            raw_body_output = self._predict_body(
                 inputs, branches["joint"], normalized_local, local_valid, heading
             )
         elif mode == "joint":
@@ -770,7 +853,7 @@ class LDF(nn.Module):
             body_joint = self._predict_body(
                 inputs, branches["joint"], normalized_local, local_valid, heading
             )
-            latent_velocity = body_history + float(scale_joint) * (
+            raw_body_output = body_history + float(scale_joint) * (
                 body_joint - body_history
             )
         else:
@@ -783,18 +866,21 @@ class LDF(nn.Module):
             body_constraint = self._predict_body(
                 inputs, branches["constraint"], normalized_local, local_valid, heading
             )
-            latent_velocity = self._compose_cfg(
+            raw_body_output = self._compose_cfg(
                 body_history,
                 body_text,
                 body_constraint,
                 scale_text=float(scale_text),
                 scale_constraint=float(scale_constraint),
             )
-        return LDFPrediction(
-            velocity=HybridMotion(root_velocity, latent_velocity),
-            clean_root_motion=clean_root,
-            local_root_motion=local,
-            local_root_feature_valid=local_valid,
+        return self._build_prediction(
+            inputs,
+            raw_root_output,
+            raw_body_output,
+            clean_root,
+            root_solver_velocity,
+            local,
+            local_valid,
         )
 
     def denoise_step(
@@ -835,9 +921,9 @@ class LDF(nn.Module):
         delta_beta = inputs.beta - next_beta
         next_motion = HybridMotion(
             inputs.noisy_motion.root_motion
-            + prediction.velocity.root_motion * delta_beta[..., None, None],
+            + prediction.solver_velocity.root_motion * delta_beta[..., None, None],
             inputs.noisy_motion.latent_motion
-            + prediction.velocity.latent_motion * delta_beta[..., None],
+            + prediction.solver_velocity.latent_motion * delta_beta[..., None],
         )
         return next_motion, prediction
 
@@ -886,13 +972,10 @@ class LDF(nn.Module):
             translation = translation[None]
         if tuple(translation.shape) != (motion.batch_size, 2):
             raise ValueError("translation_xz must have shape [2] or [B,2]")
-        normalized_translation = translation / self.root_std[[0, 2]].to(
-            translation
-        )
         root = motion.root_motion.clone()
         root[..., [0, 2]] -= (
             (1.0 - beta)[..., None, None].to(root)
-            * normalized_translation[:, None, None, :].to(root)
+            * translation[:, None, None, :].to(root)
         )
         return HybridMotion(root, motion.latent_motion.clone())
 
@@ -1000,15 +1083,13 @@ class LDF(nn.Module):
         batch_index = torch.arange(batch, device=motion.root_motion.device)
         root = motion.root_motion.clone()
         latent = motion.latent_motion.clone()
-        committed_root = self._project_normalized_root(root[batch_index, indices])
+        committed_root = project_root_heading(root[batch_index, indices])
         root[batch_index, indices] = committed_root
         committed = HybridMotion(
             committed_root[:, None],
             latent[batch_index, indices][:, None].clone(),
         )
-        translation_xz = self.denormalize_root(committed.root_motion)[
-            :, 0, -1, [0, 2]
-        ]
+        translation_xz = committed.root_motion[:, 0, -1, [0, 2]]
         rebased = self.rebase_motion_state(
             HybridMotion(root, latent), beta, translation_xz
         )
@@ -1073,7 +1154,7 @@ class LDF(nn.Module):
                 cfg_scale_joint=cfg_scale_joint,
             )
         return HybridMotion(
-            self._project_normalized_root(motion.root_motion),
+            project_root_heading(motion.root_motion),
             motion.latent_motion,
         )
 
@@ -1090,7 +1171,7 @@ class LDF(nn.Module):
     ) -> LDFStreamState:
         if batch_size <= 0 or window_tokens <= self.chunk_size:
             raise ValueError("window_tokens must be larger than chunk_size")
-        device = torch.device(device or self.root_mean.device)
+        device = torch.device(device or self.local_root_mean.device)
         if generator is None:
             generator = torch.Generator(device=device)
             generator.manual_seed(torch.seed())
@@ -1143,10 +1224,7 @@ class LDF(nn.Module):
         roll = self.chunk_size
         root = state.noisy_motion.root_motion
         latent = state.noisy_motion.latent_motion
-        boundary_normalized = root[:, roll - 1, -1]
-        boundary_physical = unnormalize_features(
-            boundary_normalized, self.root_mean, self.root_std
-        )
+        boundary_physical = root[:, roll - 1, -1]
         generator = torch.Generator(device=root.device)
         generator.set_state(state.rng_state.to(device="cpu"))
         new_root = torch.randn(

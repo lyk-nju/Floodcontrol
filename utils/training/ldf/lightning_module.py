@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 
-import numpy as np
 import torch
-from lightning.pytorch.utilities import rank_zero_warn
 from omegaconf import OmegaConf
 
 from utils.conditions.ldf import HybridMotion
@@ -28,7 +25,7 @@ from utils.training.ldf.conditioning import (
     sample_future_horizon_tokens,
     sample_xz_constraint_mask,
 )
-from utils.training.ldf.losses import compute_offpath_loss, compute_velocity_loss
+from utils.training.ldf.losses import compute_ldf_loss
 from utils.training.ldf.metrics import compute_heading_metrics
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import (
@@ -40,20 +37,6 @@ from utils.training.ldf.window import (
 from utils.training.ldf.text import TextEmbeddingLookup
 
 
-_LDF_STATISTIC_NAMES = (
-    "root_mean",
-    "root_std",
-    "local_root_mean",
-    "local_root_std",
-)
-_VAE_STATISTIC_NAMES = (
-    "body_cont_mean",
-    "body_cont_std",
-    "local_root_mean",
-    "local_root_std",
-    "latent_mean",
-    "latent_std",
-)
 _MODEL_RESUME_PARAMETER_NAMES = (
     "hidden_dim",
     "ffn_dim",
@@ -63,15 +46,13 @@ _MODEL_RESUME_PARAMETER_NAMES = (
     "num_heads",
     "root_num_layers",
     "body_num_layers",
-    "chunk_size",
-    "noise_steps",
-    "fps",
-    "time_embedding_scale",
-    "prediction_type",
+    "root_prediction_type",
+    "body_prediction_type",
 )
 _MODEL_RESUME_PARAMETER_DEFAULTS = {
     "time_embedding_scale": 1.0,
-    "prediction_type": "vel",
+    "root_prediction_type": "x0",
+    "body_prediction_type": "velocity",
 }
 
 
@@ -115,37 +96,12 @@ def _persistent_cold_validation_phases(
     )
 
 
-def _load_root_statistics(path: str | Path) -> tuple[torch.Tensor, torch.Tensor]:
-    with np.load(path, allow_pickle=False) as data:
-        values = []
-        for name in ("root_mean", "root_std"):
-            if name not in data:
-                raise ValueError(f"root statistics are missing {name!r}")
-            value = torch.from_numpy(np.asarray(data[name])).float()
-            if tuple(value.shape) != (ROOT_DIM,):
-                raise ValueError(f"{name} must have shape [{ROOT_DIM}]")
-            if not bool(torch.isfinite(value).all()):
-                raise ValueError(f"{name} must contain only finite values")
-            if name == "root_std" and bool((value <= 0).any()):
-                raise ValueError("root_std must be positive")
-            values.append(value)
-    return values[0], values[1]
-
-
-def _file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).expanduser().open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _module_parameter_content_id(module: torch.nn.Module) -> str:
-    """Identify the learned tokenizer actually loaded for LDF use."""
+    """Identify VAE parameters and physical statistics actually in use."""
 
     digest = hashlib.blake2b(digest_size=20)
-    for name, parameter in module.named_parameters():
-        value = parameter.detach().cpu().contiguous()
+    for name, tensor in module.state_dict().items():
+        value = tensor.detach().cpu().contiguous()
         encoded_name = name.encode("utf-8")
         encoded_dtype = str(value.dtype).encode("utf-8")
         digest.update(len(encoded_name).to_bytes(8, "little"))
@@ -185,27 +141,16 @@ class LDFLightningModule(BasicLightningModule):
     """Train hybrid root/body flow targets with frozen VAE and text features."""
 
     def __init__(self, cfg):
-        vae = instantiate_target(
-            target=cfg.vae.target,
-            cfg=None,
-            hfstyle=False,
-            **cfg.vae.params,
-        )
-        load_vae_checkpoint(
-            vae,
+        vae = load_vae_checkpoint(
             cfg.vae.checkpoint_path,
+            model_params=OmegaConf.to_container(cfg.vae.params, resolve=True),
             use_ema=True,
             freeze=True,
         )
-        if not vae.latent_statistics_ready:
-            raise RuntimeError("LDF requires VAE latent statistics")
 
-        root_mean, root_std = _load_root_statistics(cfg.data.root_stats_path)
         model_params = dict(cfg.model.params)
         injected_names = {
             "latent_dim",
-            "root_mean",
-            "root_std",
             "local_root_mean",
             "local_root_std",
         }
@@ -220,8 +165,6 @@ class LDFLightningModule(BasicLightningModule):
             cfg=None,
             hfstyle=False,
             latent_dim=vae.latent_dim,
-            root_mean=root_mean,
-            root_std=root_std,
             local_root_mean=vae.local_root_mean.detach().cpu(),
             local_root_std=vae.local_root_std.detach().cpu(),
             **model_params,
@@ -242,7 +185,6 @@ class LDFLightningModule(BasicLightningModule):
             self.model.local_root_std.cpu(), self.vae.local_root_std.cpu()
         ):
             raise RuntimeError("LDF and VAE local-root statistics do not match")
-        self._vae_checkpoint_path = str(cfg.vae.checkpoint_path)
         self._vae_tokenizer_content_id = _module_parameter_content_id(self.vae)
         self._last_heading_metrics: dict[str, torch.Tensor] = {}
 
@@ -299,7 +241,7 @@ class LDFLightningModule(BasicLightningModule):
     def _create_clean_motion(
         self, batch: dict[str, torch.Tensor]
     ) -> tuple[HybridMotion, torch.Tensor]:
-        """Convert one physical LDF data batch to normalized clean motion."""
+        """Convert one physical LDF batch to physical-root/raw-mu motion."""
 
         root = batch["root_motion"]
         frame_valid = batch["frame_valid_mask"]
@@ -328,7 +270,6 @@ class LDFLightningModule(BasicLightningModule):
         root = root.reshape(
             root.shape[0], tokens, FRAMES_PER_TOKEN, ROOT_DIM
         )
-        root = self.model.normalize_root(root)
         root = torch.where(
             token_valid[..., None, None], root, torch.zeros_like(root)
         )
@@ -562,48 +503,16 @@ class LDFLightningModule(BasicLightningModule):
                 target_body=batch["body_motion"],
             )
         weights = self.cfg.get("loss") or {}
-        if result.is_rollout:
-            return compute_offpath_loss(
-                result.prediction,
-                result.final_step,
-                root_mean=self.model.root_mean,
-                root_std=self.model.root_std,
-                root_weight=float(weights.get("root_weight", 1.0)),
-                body_weight=float(weights.get("body_weight", 1.0)),
-                rollout_weight=float(weights.get("rollout_weight", 1.0)),
-                offpath_beta_min=float(weights.get("offpath_beta_min", 0.1)),
-                root_boundary_weight=float(
-                    weights.get("root_boundary_weight", 0.0)
-                ),
-                root_heading_cosine_weight=float(
-                    weights.get("root_heading_cosine_weight", 0.0)
-                ),
-                root_heading_vector_weight=float(
-                    weights.get("root_heading_vector_weight", 0.0)
-                ),
-                root_heading_beta_min=float(
-                    weights.get("root_heading_beta_min", 0.1)
-                ),
-                root_heading_cosine_min_norm=float(
-                    weights.get("root_heading_cosine_min_norm", 0.05)
-                ),
-            )
-        return compute_velocity_loss(
+        return compute_ldf_loss(
             result.prediction,
             result.final_step,
-            root_mean=self.model.root_mean,
-            root_std=self.model.root_std,
+            root_prediction_type=self.model.root_prediction_type,
+            body_prediction_type=self.model.body_prediction_type,
             root_weight=float(weights.get("root_weight", 1.0)),
             body_weight=float(weights.get("body_weight", 1.0)),
-            root_heading_cosine_weight=float(
-                weights.get("root_heading_cosine_weight", 0.0)
-            ),
-            root_heading_vector_weight=float(
-                weights.get("root_heading_vector_weight", 0.0)
-            ),
-            root_heading_beta_min=float(weights.get("root_heading_beta_min", 0.1)),
-            root_heading_cosine_min_norm=float(
-                weights.get("root_heading_cosine_min_norm", 0.05)
+            rollout_weight=float(weights.get("rollout_weight", 1.0)),
+            root_boundary_weight=float(
+                weights.get("root_boundary_weight", 0.0)
             ),
         )
 
@@ -627,12 +536,7 @@ class LDFLightningModule(BasicLightningModule):
 
         step = result.final_step
         prediction = result.prediction
-        beta = step.inputs.beta
-        predicted_latent = (
-            step.inputs.noisy_motion.latent_motion
-            + beta[..., None].to(step.inputs.noisy_motion.latent_motion)
-            * prediction.velocity.latent_motion
-        )
+        predicted_latent = prediction.clean_motion.latent_motion
         frame_valid = token_valid_mask.repeat_interleave(
             FRAMES_PER_TOKEN, dim=1
         )
@@ -642,12 +546,8 @@ class LDFLightningModule(BasicLightningModule):
             prediction.local_root_feature_valid,
             frame_valid,
         ).continuous_body
-        predicted_root = self.model.denormalize_root(
-            prediction.clean_root_motion
-        ).flatten(1, 2)
-        target_root = self.model.denormalize_root(
-            step.clean_motion.root_motion
-        ).flatten(1, 2)
+        predicted_root = prediction.clean_motion.root_motion.flatten(1, 2)
+        target_root = step.clean_motion.root_motion.flatten(1, 2)
         metric_frames = step.loss_mask.repeat_interleave(
             FRAMES_PER_TOKEN, dim=1
         )
@@ -692,20 +592,12 @@ class LDFLightningModule(BasicLightningModule):
 
     def _resume_contract(self) -> dict[str, object]:
         return {
-            "resume_contract_version": 2,
+            "resume_contract_version": 4,
             "vae_tokenizer_content_id": self._vae_tokenizer_content_id,
             # This remains metadata rather than a hard resume condition. A
             # larger table or a different compatible text feature source is a
             # valid fine-tuning choice.
             "text_embedding_content_id": self.text_embeddings.content_id,
-            "ldf_statistics": {
-                name: getattr(self.model, name).detach().cpu().clone()
-                for name in _LDF_STATISTIC_NAMES
-            },
-            "vae_statistics": {
-                name: getattr(self.vae, name).detach().cpu().clone()
-                for name in _VAE_STATISTIC_NAMES
-            },
             "model_signature": _model_resume_signature(
                 self.cfg.model.params,
                 latent_dim=self.model.latent_dim,
@@ -717,96 +609,24 @@ class LDFLightningModule(BasicLightningModule):
         checkpoint["ldf_resume_contract"] = self._resume_contract()
 
     def on_load_checkpoint(self, checkpoint) -> None:
-        state = checkpoint.get("state_dict", {})
-        for name in _LDF_STATISTIC_NAMES:
-            if name not in state:
-                raise RuntimeError(f"LDF resume checkpoint is missing {name}")
-            if not torch.equal(
-                state[name].detach().cpu(), getattr(self.model, name).cpu()
-            ):
-                raise RuntimeError(f"LDF resume statistics mismatch for {name}")
-
         saved_contract = checkpoint.get("ldf_resume_contract")
-        if saved_contract is None:
-            saved_contract = checkpoint.get("ldf_training_contract")
         current_contract = self._resume_contract()
         if not isinstance(saved_contract, dict):
             raise RuntimeError(
                 "LDF resume checkpoint has no resume contract; "
                 "old checkpoints cannot be resumed by this training entrypoint"
             )
-        legacy_path_contract = isinstance(saved_contract.get("paths"), dict)
-        saved_tokenizer_id = saved_contract.get("vae_tokenizer_content_id")
-        if saved_tokenizer_id is not None:
-            if saved_tokenizer_id != current_contract["vae_tokenizer_content_id"]:
-                raise RuntimeError("LDF resume VAE tokenizer content does not match")
-        else:
-            # Checkpoints written before the tokenizer-parameter identity was
-            # introduced stored the hash of the complete VAE checkpoint. Keep
-            # those checkpoints resumable without weakening their old check.
-            legacy_checkpoint_id = saved_contract.get("vae_checkpoint_content_id")
-            if isinstance(legacy_checkpoint_id, str):
-                if legacy_checkpoint_id != _file_sha256(self._vae_checkpoint_path):
-                    raise RuntimeError(
-                        "LDF resume VAE checkpoint content does not match"
-                    )
-            elif legacy_path_contract:
-                rank_zero_warn(
-                    "LDF resume checkpoint predates VAE content identities; "
-                    "continuing after strict LDF state and VAE statistics checks."
-                )
-            else:
-                raise RuntimeError("LDF resume contract has no VAE identity")
-
-        saved_text_id = saved_contract.get("text_embedding_content_id")
-        if (
-            isinstance(saved_text_id, str)
-            and saved_text_id != current_contract["text_embedding_content_id"]
-        ):
-            rank_zero_warn(
-                "LDF resume text embedding content changed; continuing because "
-                "text tables are a compatible fine-tuning input when text_dim "
-                "and text_len still match."
+        if saved_contract.get("resume_contract_version") != 4:
+            raise RuntimeError(
+                "LDF checkpoint uses an incompatible Root/Body prediction contract"
             )
-        for group_name in ("ldf_statistics", "vae_statistics"):
-            saved_statistics = saved_contract.get(group_name)
-            if group_name == "ldf_statistics" and saved_statistics is None:
-                if legacy_path_contract:
-                    # The four LDF buffers were already checked directly from
-                    # state_dict before any checkpoint value could overwrite
-                    # the configured model.
-                    continue
-                saved_statistics = {}
-            if not isinstance(saved_statistics, dict):
-                raise RuntimeError(f"LDF resume contract has no {group_name}")
-            for name, current in current_contract[group_name].items():
-                saved = saved_statistics.get(name)
-                if not torch.is_tensor(saved) or not torch.equal(saved.cpu(), current):
-                    label = "LDF" if group_name == "ldf_statistics" else "VAE"
-                    raise RuntimeError(
-                        f"LDF resume {label} statistics mismatch for {name}"
-                    )
-        saved_model_signature = saved_contract.get("model_signature")
-        if saved_model_signature is None:
-            legacy_model = saved_contract.get("model")
-            if isinstance(legacy_model, dict) and isinstance(
-                legacy_model.get("params"), dict
-            ):
-                saved_model_signature = _model_resume_signature(
-                    legacy_model["params"],
-                    latent_dim=self.model.latent_dim,
-                )
-            elif legacy_path_contract:
-                rank_zero_warn(
-                    "LDF resume checkpoint predates model signatures; relying "
-                    "on strict state_dict loading for this legacy checkpoint."
-                )
-            else:
-                raise RuntimeError("LDF resume contract has no model signature")
         if (
-            saved_model_signature is not None
-            and saved_model_signature != current_contract["model_signature"]
+            saved_contract.get("vae_tokenizer_content_id")
+            != current_contract["vae_tokenizer_content_id"]
         ):
+            raise RuntimeError("LDF resume VAE tokenizer content does not match")
+        saved_model_signature = saved_contract.get("model_signature")
+        if saved_model_signature != current_contract["model_signature"]:
             raise RuntimeError("LDF resume model structure contract does not match")
         super().on_load_checkpoint(checkpoint)
         if not torch.equal(

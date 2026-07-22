@@ -72,75 +72,7 @@ def mix_fixed_noise(
     )
 
 
-def flow_velocity_target(
-    clean_motion: HybridMotion,
-    noise: HybridMotion,
-) -> HybridMotion:
-    """Return the normalized flow target v*=x0-epsilon."""
-
-    clean_motion.validate()
-    noise.validate()
-    return HybridMotion(
-        clean_motion.root_motion - noise.root_motion,
-        clean_motion.latent_motion - noise.latent_motion,
-    )
-
-
-def recover_clean_for_self_forcing(
-    noisy_value: torch.Tensor,
-    beta: torch.Tensor,
-    predicted_velocity: torch.Tensor,
-) -> torch.Tensor:
-    """Low-error clean estimate used only at a self-forcing boundary."""
-
-    if tuple(noisy_value.shape) != tuple(predicted_velocity.shape):
-        raise ValueError("noisy_value and predicted_velocity must share shape")
-    while beta.ndim < noisy_value.ndim:
-        beta = beta.unsqueeze(-1)
-    return noisy_value + beta.to(noisy_value) * predicted_velocity
-
-
-def endpoint_estimate(
-    current_motion: HybridMotion,
-    beta: torch.Tensor,
-    predicted_velocity: HybridMotion,
-) -> HybridMotion:
-    """Estimate the clean endpoint from an arbitrary solver state.
-
-    On the ideal bridge this is identical to the ordinary v-predict recovery;
-    off the bridge it defines the endpoint-stabilizing rollout objective.
-    """
-
-    current_motion.validate()
-    predicted_velocity.validate()
-    if tuple(beta.shape) != tuple(current_motion.root_motion.shape[:2]):
-        raise ValueError("beta must match current_motion [B,T]")
-    return HybridMotion(
-        current_motion.root_motion
-        + beta[..., None, None].to(current_motion.root_motion)
-        * predicted_velocity.root_motion,
-        current_motion.latent_motion
-        + beta[..., None].to(current_motion.latent_motion)
-        * predicted_velocity.latent_motion,
-    )
-
-
-def recover_clean_for_full_gradient_auxiliary(
-    predicted_velocity: torch.Tensor,
-    noise: torch.Tensor,
-) -> torch.Tensor:
-    """Full-gradient clean estimate reserved for future auxiliary losses."""
-
-    if tuple(predicted_velocity.shape) != tuple(noise.shape):
-        raise ValueError("predicted_velocity and noise must share shape")
-    return predicted_velocity + noise
-
-
 __all__ = [
     "build_span_beta",
-    "endpoint_estimate",
-    "flow_velocity_target",
     "mix_fixed_noise",
-    "recover_clean_for_full_gradient_auxiliary",
-    "recover_clean_for_self_forcing",
 ]

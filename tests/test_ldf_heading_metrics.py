@@ -75,16 +75,16 @@ def test_heading_metrics_measure_root_target_and_rendered_body_angles():
         atol=1e-5,
     )
     assert torch.allclose(
-        metrics["root_body_heading_angle_deg"], torch.tensor(30.0), atol=1e-5
+        metrics["root_body_heading_angle_deg"], torch.tensor(60.0), atol=1e-5
     )
     assert torch.allclose(
-        metrics["root_feet_heading_angle_deg"], torch.tensor(30.0), atol=1e-5
+        metrics["root_feet_heading_angle_deg"], torch.tensor(60.0), atol=1e-5
     )
     assert torch.allclose(
-        metrics["body_gt_body_heading_angle_deg"], torch.tensor(60.0), atol=1e-5
+        metrics["body_gt_body_heading_angle_deg"], torch.tensor(30.0), atol=1e-5
     )
     assert torch.allclose(
-        metrics["feet_gt_feet_heading_angle_deg"], torch.tensor(60.0), atol=1e-5
+        metrics["feet_gt_feet_heading_angle_deg"], torch.tensor(30.0), atol=1e-5
     )
     assert torch.allclose(
         metrics["gt_root_body_heading_angle_deg"], torch.tensor(0.0), atol=1e-5

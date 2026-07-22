@@ -11,7 +11,7 @@ WEB_RUNTIME_BLOCKER = (
     "BLOCKED_ON_LDF_CHECKPOINT: the strict four-frame BodyVAE and atomic "
     "InferenceSession runtime are ready, but no formally trained hybrid LDF "
     "checkpoint/loader contract exists yet. Finish LDF training, freeze its "
-    "root statistics and checkpoint schema, then configure Web model paths."
+    "Root/Body prediction and checkpoint schema, then configure Web model paths."
 )
 
 

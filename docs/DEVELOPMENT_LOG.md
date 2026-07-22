@@ -5728,3 +5728,211 @@
 
 - 需要在目标训练服务器上实际运行训练入口，确认远端checkpoint、statistics、T5表和probe文件均存在。
 - 本轮未运行全仓测试；配置定向测试已覆盖远端profile及训练合同断言。
+
+## 2026-07-22 · step-180000固定样本Dense-XZ对比
+
+改动类型：调试工具兼容 / checkpoint定量对比
+
+实际改动内容：
+
+- 更新gitignored的`debug/audit_dense_xz_root_ablation.py`，适配当前`compute_heading_metrics()`接口：传入target body，并读取新的Root/GT heading指标名称。
+- 为该工具增加显式`--cfg-scale-joint`参数，避免配置默认CFG变化后破坏不同checkpoint之间的同协议对比。
+- 使用EMA、Joint CFG=1、dense GT-XZ、dynamic future、最大horizon 10和固定seed 4321/4322/4323，对step-180000的`000021`与`001168`完成四种root消融。
+- 与昨天step-160000同协议结果相比，baseline Root/GT root heading均值分别由52.39°降至20.82°、由36.21°降至21.13°；XZ ADE保持在2.8–3.7毫米，normalized latent RMSE与joint-position RMSE也整体下降。
+- 当前配置的Joint CFG默认值为3.0；曾启动的CFG=3 dense-XZ运行由于不具备可比性而提前停止，不用于结论。它同时暴露出强CFG会显著破坏dense-XZ控制，说明T2M最优CFG不能直接作为轨迹控制评测默认值。
+
+改动理由：
+
+- 本轮目标是判断step-180000相对step-160000在固定受控样本上的真实变化，必须锁定与昨天完全一致的CFG与随机种子，而不能沿用后来为T2M FID选择的CFG=3。
+- 调试工具应允许实验协议显式固定，避免全局配置调整让历史对比失效。
+
+验证：
+
+- `debug/audit_dense_xz_root_ablation.py`通过`py_compile`。
+- 两个样本、三个seed、四种root消融全部完成；汇总保存在`debug/results/dense_xz_root_ablation_step180000_joint_cfg1/summary.json`，并生成对应视频与feature文件。
+
+涉及文件：
+
+- `debug/audit_dense_xz_root_ablation.py`（gitignored）
+- `docs/DEVELOPMENT_LOG.md`
+
+## 2026-07-22 · Root-x0 / Body-velocity与physical-root/raw-mu合同收口
+
+改动类型：模型合同重构 / loss与solver统一 / statistics清理 / 配置与工具收口
+
+实际改动内容：
+
+- 将LDF的唯一生成状态冻结为physical root5与raw deterministic VAE `mu`。`BodyVAE.tokenize()/tokenize_window()`直接返回posterior `mu`，`detokenize()/detokenize_step()`直接消费raw latent；删除latent mean/std buffers、z-score接口和ready状态。
+- 将VAE公共checkpoint入口改为“checkpoint path + architecture params -> frozen BodyVAE”。loader从checkpoint提取`body_cont_mean/std`与`local_root_mean/std`构造模型，再应用EMA shadow并strict-load；历史300k checkpoint中的占位latent buffers只为兼容加载而丢弃。
+- 将LDF原生预测拆为独立`root_prediction_type/body_prediction_type`，只接受`x0/velocity`。正式默认Root-x0、Body-velocity；`LDFPrediction`统一暴露raw Root/Body输出、canonical clean motion与solver velocity。CFG在raw输出空间完成组合后才投影Root heading。
+- Root/Body共同使用`create_input()/denoise_step()/commit_step()`：history和inactive token保留authoritative state，active beta必须严格大于0，solver endpoint转换不对history除法；commit/rebase/rolling直接处理physical root5。
+- 重写LDF loss。Root-x0对未投影physical XZ、height、heading三块分别SmoothL1并等权相加；删除旧cosine/vector heading辅助及inverse-beta权重。Body ideal继续MSE监督`x0-noise`，persistent状态改为在真实beta上对`(current+beta*v-target)/beta`做SmoothL1，不再使用`offpath_beta_min`。heading角度、raw norm与antipodal ratio保留为detached指标。
+- 删除LDF training step中的冗余target velocity与`flow.py`中已经失去唯一所有权的旧recovery/endpoint helpers；训练/runtime的clean endpoint解释只保留在LDF模型接口。
+- 删除LDF root normalization、root statistics与latent statistics的所有运行时/训练依赖；inference condition、world/model坐标恢复、generation artifact命名均切换到physical-root/raw-mu语义。
+- 将LDF resume合同升级，只硬性比较Root/Body网络结构、prediction type和实际EMA VAE内容；window、noise/chunk scheduler参数、self-forcing、loss、CFG、batch、路径与文本表不再作为恢复门闩。旧LDF checkpoint缺少新合同会明确失败。
+- `ldf_base.yaml`成为唯一训练语义来源：50-token/C5、K=1/2/3/5、constraint dropout 0.2、dense/waypoint/goal=0.5/0.25/0.25、joint CFG 3.0、AdamW 1e-4、Root-x0/Body-velocity。remote/local/multi只覆盖路径、设备、batch、worker、数据源和本地评测开关。
+- 删除`compute_vae_latent_stats.py`、`compute_ldf_root_stats.py`及对应测试；资产入口仅保留`pre-vae`与`verify`，前者生成processed motion、VAE physical statistics和T5表，后者用自包含EMA VAE checkpoint验证LDF启动资产。
+- 更新README、VAE/data/training/config/streaming实现文档和Web blocker说明，移除旧normalized root/latent、beta floor和post-vae资产流程。
+
+改动理由：
+
+- Root的XZ/height/heading是显式、低维、可控制的物理状态，直接预测clean root5比把heading误差包装成source-relative velocity再用`1/beta`辅助补偿更清楚；投影前heading vector监督在180度反向点也保留梯度。
+- Body latent维度高且已有velocity生成基础，因此继续保留flow velocity；persistent状态使用velocity-space corrective error可直接监督部署state所需方向，并由SmoothL1限制梯度，无需人为beta floor。
+- root/latent离线z-score使checkpoint、statistics和runtime坐标事务出现重复生命周期。VAE physical normalization仍属于decoder计算边界，而LDF状态本身无需额外artifact。
+
+验证：
+
+- 真实`20260715_164325_vae_body265/last.ckpt`（386MB）通过新EMA loader：latent_dim 128、110个state entries、四个physical buffers恢复、全部参数冻结。
+- remote/local/multi resolved config的training、self-forcing、loss、model、optimizer与scheduler完全一致；均为Root-x0、Body-velocity、constraint dropout 0.2、joint CFG 3.0。
+- Root/Body四种prediction组合、raw CFG后projection、history beta0保护、active beta0 fail-fast、180度heading梯度、beta 1.0/0.1 corrective gradient、persistent cold/runtime parity与两进程静态DDP图均由测试覆盖。
+- LDF/VAE/数据/推理/资产定向测试：`153 passed`。
+- 全仓测试：`323 passed`。
+- 关键模块`py_compile`通过；`git diff --check`通过。
+
+涉及文件：
+
+- `models/{vae_wan_1d,diffusion_forcing_wan}.py`
+- `utils/conditions/ldf.py`
+- `utils/training/{vae,ldf}/**`
+- `utils/inference/{condition,session}.py`
+- `train_ldf.py`
+- `configs/{ldf,ldf_base,ldf_s5,ldf_multi,vae,vae_multi,stream}.yaml`
+- `tools/prepare_training_assets.py`
+- `tools/{compute_vae_latent_stats,compute_ldf_root_stats}.py`（删除）
+- `tests/**`
+- `README.md`、`web_demo/README.md`、`docs/rearchitecture/**`
+
+尚未完成的后续事项：
+
+- 新LDF合同明确从头训练，本轮没有启动GPU长训，也没有迁移旧LDF权重。
+- 磁盘上已有root/latent statistics NPZ未删除；它们只是不再被代码读取。
+
+## 2026-07-22 · Root-x0 heading投影时机消融与HumanML rotation身份收口
+
+改动类型：受控模型消融 / cold-start可观测性 / 表征语义澄清
+
+实际改动内容：
+
+- 为LDF增加`root_heading_projection_mode={every_step,commit_only}`。默认
+  `every_step`保持原行为：raw Root-x0先投影单位圆，再作为solver endpoint；
+  `commit_only`让solver在整个token生命周期运输到raw Root-x0，只在
+  `commit_step()`写入persistent state时投影heading。
+- 两种模式都单独构造同一个projected physical clean-root view，Root→Body的
+  local-root4和absolute heading condition只读取该view。因此消融不改变Body输入，
+  只改变Root iterative state；Root Transformer继续读取当前noisy body latent。
+- Root heading日志增加raw norm的10%分位数和`norm<0.25`比例。persistent-cold
+  validation现有四个phase会自然输出`root_heading_angle_degrees`、raw norm mean/p10、
+  low-norm ratio和antipodal ratio，可区分初始方向错误与raw向量塌缩。
+- 投影模式进入模型数学语义与resume signature；非法值在模型和训练入口均
+  fail-fast。文档给出同seed、同数据、同优化器的两条CLI消融命令。
+- 将body265 rotation block明确降级为`HumanML IK gauge`：它来自263D IK-derived
+  channels的层级组合，不是原生SMPL rotation，也不是physical facing，禁止直接
+  与root5 yaw比较。代码注释、转换器说明和架构文档统一该身份。
+- 记录下一版root-heading-local VAE的边界：该变化需要重新发布body表示、统计、
+  重训VAE、验证stream/direct/FK几何与reconstruction FID，并令LDF从头训练；不与
+  本轮Root solver投影消融同时改变。
+
+验证：
+
+- 新增数值测试证明`every_step`的solver endpoint heading为单位向量、
+  `commit_only`保留raw模长，而两者physical clean view和commit结果完全一致。
+- 新增低模长且180度反向的指标测试，确认angle=180°、raw norm/p10=0.1、
+  low-norm ratio=1和antipodal ratio=1。
+- persistent-cold validation测试确认新的angle/norm指标均随phase loss返回。
+- LDF模型、训练、配置、persistent solver和stream定向测试：`145 passed`。
+- 全仓测试：`329 passed`。
+
+尚未完成的后续事项：
+
+- 尚未启动两组从头训练，因而当前只证明消融合同与数值路径正确，不能预判
+  `commit_only`会提高或降低cold heading质量。
+- root-heading-local VAE仍是下一轮独立表征实验；现有VAE与artifact没有修改。
+
+## 2026-07-22 · Root-x0投影合同进一步简化为commit-only
+
+改动类型：实验开关删除 / 单一solver合同冻结
+
+实际改动内容：
+
+- 取消尚未进入正式训练的`every_step/commit_only`消融开关，不在模型、配置、
+  resume signature或训练入口保留`root_heading_projection_mode`。
+- Root solver唯一语义固定为运输到raw Root-x0。active/noisy state允许heading模长
+  不为1；Root→Body仍读取临时单位圆投影后的physical clean-root view；
+  `commit_step()`是唯一将heading投影后写入persistent history的事务边界。
+- 将双模式测试替换为单一合同测试：solver endpoint严格等于raw x0，Body view
+  heading模长为1，完整Euler到beta0后保留raw模长，commit结果模长恢复为1。
+- 保留cold phase的raw heading norm mean/p10、low-norm ratio、angle和antipodal
+  指标，用于判断模型是否真正学习单位heading，而非依赖commit投影掩盖错误。
+- 实现和训练文档删除消融命令及模式说明；下一版root-heading-local VAE继续作为
+  独立实验，不与当前Root solver合同混合。
+
+验证：
+
+- Root/Body forward、CFG、训练、persistent cold、stream和配置定向测试：
+  `143 passed`。
+- 全仓测试：`325 passed`；关键模块`py_compile`与`git diff --check`通过。
+
+## 2026-07-22 · Root5 / Body259本地身体表示正式落地
+
+改动类型：数据合同重构 / HumanML263双向转换 / VAE与LDF资产生命周期收口
+
+实际改动内容：
+
+- 将正式运动合同冻结为physical Root5与heading-local Body259。Root5保存世界
+  `xyz + cos/sin(yaw)`；Body259依次保存63维完整Root XYZ相对位置、126维
+  heading-frame cumulative HumanML IK rotation6d、66维current-heading-local
+  backward velocity和4维contact。
+- 在`utils/motion_process.py`集中冻结22关节parent、foot索引、Body259切片、
+  rotation6D列约定及FK辅助。Body位置减去完整Root XYZ，速度使用当前帧heading
+  和20 FPS backward difference；cold-start速度置零且mask无效。
+- 新增唯一公共HumanML263适配器`tools/convert_motion_263_to_259.py`。转换中
+  显式区分HumanML world-to-heading canonical rotation `C`与physical
+  heading-to-world rotation `R=C^T`，Body rotation保存`B=R^T A`，不将
+  IK-derived累计旋转误称为原生SMPL rotation。
+- 新增`metrics/humanml.py`的Body259评测逆转换。转换先移除初始XZ与初始yaw，
+  对Root第一层子关节使用HumanML canonical root特殊公式，使用恢复world position
+  的forward difference生成评测velocity；`F`个physical pose输出精确`F-1`行263D。
+- Dataset、artifact writer和资产验证器均严格要求float32 Root5/Body259、bool
+  feature mask、finite、单位heading和四帧对齐。旧Body265 artifact不会被静默接受。
+- HumanML和BABEL预处理共用同一个263D转换器，分别发布为
+  `HumanML3D_motion_local`和`BABEL_motion_local`，结构统一为
+  `split/all + artifacts + texts`。
+- `prepare_training_assets pre-vae`现在一次发布两套local数据，只从HumanML
+  train计算VAE physical statistics，并从`all.txt`验证/补齐HumanML及Multi T5表。
+  删除root statistics、latent statistics和旧263→265工具入口。
+- BodyVAE正式输入/输出改为259维，token空间直接使用deterministic raw posterior
+  `mu`，不保存或加载latent mean/std。LDF保持physical Root5、Root-x0与
+  Body-velocity，不读取root/latent statistics；新VAE与新LDF均须从头训练。
+- yaw增强现在只同步旋转Root5的XZ和heading，Body259及其mask逐元素保持不变。
+  VAE评估增加world MPJPE、source/reconstruction FK误差、脚方向、反向比例和
+  ankle-toe长度；训练日志增加posterior mu mean/RMS/channel std、logvar、KL、
+  sigma与active latent fraction。
+- 更新README、数据/VAE/LDF设计文档、远端/本机/Multi配置与迁移guard，明确旧
+  Body265 artifact、statistics、VAE和LDF checkpoint均不兼容。
+
+几何与真实数据验证：
+
+- 真实HumanML样本`000021`完成263→Root5/Body259→263：position最大误差
+  `2.98e-7`，root最大误差`6.03e-7`，rotation最大误差`6.11e-7`；velocity的
+  非零差异来自按恢复world positions重新计算forward velocity，而非复用源冗余通道。
+- 使用32个真实HumanML test样本和官方T2M evaluator验证exact-drop转换：motion
+  embedding cosine=`0.9999986887`、embedding L2=`0.00379194`、round-trip
+  FID=`0.0001703281`。该结果确认初始heading移除、Root第一层rotation公式和
+  evaluator兼容路径没有引入可观测分布漂移。
+- 单元测试覆盖全局XYZ平移不变性、0/45/90/180度及随机yaw不变性、`A=RB`、
+  world position恢复、current-heading backward velocity、cold mask、FK与脚部
+  几何，以及HumanML/BABEL同输入同输出。
+
+验证：
+
+- Root5/Body259、HumanML adapter、VAE/LDF、资产入口等定向测试：`82 passed`。
+- 全仓测试：`340 passed`。
+- 全仓Python文件`py_compile`与`git diff --check`通过。
+
+尚未完成的后续事项：
+
+- 本轮没有执行完整`pre-vae`数据发布；全量HumanML/BABEL转换和T5补表需要在训练
+  服务器上运行，避免在代码验收过程中重复消耗数小时。
+- 新local artifact与新VAE尚未生成，因此没有宣称单卡VAE/LDF短训练或两卡DDP
+  smoke已经通过。正确顺序是先运行`prepare_training_assets pre-vae`，训练新VAE，
+  再用`prepare_training_assets verify --vae-checkpoint ...`验证LDF启动资产。

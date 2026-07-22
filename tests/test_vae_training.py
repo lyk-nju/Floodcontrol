@@ -44,10 +44,10 @@ def test_formal_vae_training_config_matches_frozen_recipe():
     assert cfg.data.train_batch_size == 128
     assert cfg.data.val_batch_size == 128
     assert list(cfg.data.train_meta_paths) == [
-        f"{cfg.dirs.raw_data}/HumanML3D_motion/train.txt"
+        f"{cfg.dirs.raw_data}/HumanML3D_motion_local/train.txt"
     ]
     assert list(cfg.data.val_meta_paths) == [
-        f"{cfg.dirs.raw_data}/HumanML3D_motion/val.txt"
+        f"{cfg.dirs.raw_data}/HumanML3D_motion_local/val.txt"
     ]
     assert cfg.data.artifact_path == "artifacts"
     assert cfg.data.text_path is None
@@ -58,10 +58,10 @@ def test_formal_vae_training_config_matches_frozen_recipe():
     assert cfg.data.min_frames == 20
     assert cfg.data.max_frames == 200
     assert cfg.model.params.motion_stats_path == (
-        f"{cfg.dirs.raw_data}/HumanML3D_motion/motion_stats.npz"
+        f"{cfg.dirs.raw_data}/HumanML3D_motion_local/motion_stats.npz"
     )
     assert cfg.model.target == "models.vae_wan_1d.BodyVAE"
-    assert cfg.model.params.latent_stats_path is None
+    assert "latent_stats_path" not in cfg.model.params
     assert "fps" not in cfg.model.params
     assert "allow_identity_statistics" not in cfg.model.params
     assert "require_latent_statistics" not in cfg.model.params
@@ -85,7 +85,7 @@ def test_multi_vae_config_keeps_source_datasets_explicit():
     ]
     assert [entry.text_path for entry in cfg.data.datasets] == [None, "texts"]
     assert cfg.model.params.motion_stats_path == (
-        f"{cfg.dirs.raw_data}/HumanML3D_BABEL_motion_stats.npz"
+        f"{cfg.dirs.raw_data}/HumanML3D_motion_local/motion_stats.npz"
     )
     assert "fps" not in cfg.model.params
     assert cfg.trainer.devices == 1
@@ -142,7 +142,7 @@ def test_wandb_logger_uses_configured_wandb_info(tmp_path, monkeypatch):
     assert logger == "wandb-logger"
     assert captured["project"] == cfg.wandb_info.project
     assert captured["entity"] == cfg.wandb_info.entity
-    assert captured["name"] == "vae_body265_test"
+    assert captured["name"] == "vae_body259_test"
     assert train_vae.os.environ["WANDB_API_KEY"] == cfg.wandb_info.key
 
 
@@ -152,7 +152,6 @@ def test_resume_checkpoint_rejects_statistics_before_loading():
         hidden_dim=8,
         encoder_layers=1,
         decoder_layers=1,
-        with_latent_stats=False,
     )
     checkpoint = {
         "state_dict": {

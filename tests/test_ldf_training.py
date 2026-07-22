@@ -18,12 +18,11 @@ from utils.training.ldf.conditioning import (
     sample_future_horizon_tokens,
     sample_xz_constraint_mask,
 )
-from utils.training.ldf.losses import compute_velocity_loss
+from utils.training.ldf.losses import compute_ldf_loss
 from utils.training.ldf.data import LDFSpanCollator
 from utils.training.ldf.lightning_module import (
     LDFLightningModule,
     _create_curriculum_generator,
-    _file_sha256,
     _persistent_cold_validation_phases,
 )
 from utils.training.ldf.solver import run_training_solver
@@ -46,12 +45,9 @@ def _write_vae_checkpoint(path, model: BodyVAE) -> None:
 
 
 def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
-    motion_stats, latent_stats = write_statistics(
-        tmp_path, latent_dim=8, latent_mean=2.0, latent_std=3.0
-    )
+    motion_stats = write_statistics(tmp_path)
     vae = BodyVAE(
         motion_stats_path=motion_stats,
-        latent_stats_path=latent_stats,
         latent_dim=8,
         hidden_dim=16,
         encoder_layers=1,
@@ -59,12 +55,6 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
     )
     checkpoint = tmp_path / "vae.ckpt"
     _write_vae_checkpoint(checkpoint, vae)
-    root_stats = tmp_path / "root_stats.npz"
-    np.savez(
-        root_stats,
-        root_mean=np.array([1.0, 2.0, 3.0, 0.0, 0.0], dtype=np.float32),
-        root_std=np.array([2.0, 2.0, 2.0, 0.5, 0.5], dtype=np.float32),
-    )
     text_embeddings = tmp_path / "text_embeddings.pt"
     embedding_values = {
         "": torch.zeros(2, 8),
@@ -115,8 +105,6 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
                 "target": "models.vae_wan_1d.BodyVAE",
                 "checkpoint_path": str(checkpoint),
                 "params": {
-                    "motion_stats_path": str(motion_stats),
-                    "latent_stats_path": str(latent_stats),
                     "latent_dim": 8,
                     "hidden_dim": 16,
                     "encoder_layers": 1,
@@ -126,7 +114,6 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
                 },
             },
             "data": {
-                "root_stats_path": str(root_stats),
                 "text_embeddings_path": str(text_embeddings),
             },
             "model": {
@@ -144,6 +131,8 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
                     "chunk_size": chunk_size,
                     "noise_steps": noise_steps,
                     "fps": 20.0,
+                    "root_prediction_type": "x0",
+                    "body_prediction_type": "velocity",
                 },
             },
         }
@@ -155,9 +144,9 @@ def _make_step_batch():
     root[..., 3] = 1.0
     return {
         "root_motion": root,
-        "body_motion": torch.randn(1, 8, 265),
+        "body_motion": torch.randn(1, 8, 259),
         "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
-        "body_with_context": torch.randn(1, 8, 265),
+        "body_with_context": torch.randn(1, 8, 259),
         "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
         "context_token_count": torch.zeros(1, dtype=torch.long),
         "previous_root_frame": torch.zeros(1, 5),
@@ -345,8 +334,12 @@ def test_validation_can_force_a_deterministic_persistent_cold_microstep(
         "cold_persistent_microstep": 1,
         "completed_commits": 2,
     }
-    assert "anchor_root_offpath_endpoint" in losses
-    assert "latent_body_offpath_endpoint" in losses
+    assert "anchor_root_x0" in losses
+    assert "latent_body_corrective_velocity" in losses
+    assert "root_heading_angle_degrees" in losses
+    assert "root_heading_raw_norm" in losses
+    assert "root_heading_raw_norm_p10" in losses
+    assert "root_heading_low_norm_ratio" in losses
     assert torch.isfinite(losses["total"])
 
 
@@ -383,7 +376,7 @@ def test_ldf_training_bridge_uses_frozen_ema_vae_and_shared_statistics(tmp_path)
 
 def test_create_clean_motion_aligns_root_latent_and_padding(tmp_path):
     module = LDFLightningModule(_make_config(tmp_path)).eval()
-    body_with_context = torch.randn(2, 8, 265)
+    body_with_context = torch.randn(2, 8, 259)
     encoder_frame_valid = torch.ones(2, 8, dtype=torch.bool)
     context_count = torch.tensor([0, 1], dtype=torch.long)
     root = torch.zeros(2, 8, 5)
@@ -413,10 +406,7 @@ def test_create_clean_motion_aligns_root_latent_and_padding(tmp_path):
     assert motion.root_motion.shape == (2, 2, 4, 5)
     assert motion.latent_motion.shape == (2, 2, 8)
     assert torch.equal(motion.latent_motion, expected_latent)
-    expected_first_root = (
-        root[0, :4] - module.model.root_mean
-    ) / module.model.root_std
-    assert torch.allclose(motion.root_motion[0, 0], expected_first_root)
+    assert torch.equal(motion.root_motion[0, 0], root[0, :4])
     assert not motion.root_motion[1, 1].any()
     assert not motion.latent_motion[1, 1].any()
     assert not motion.root_motion.requires_grad
@@ -724,9 +714,9 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
     root[..., 3] = 1.0
     batch = {
         "root_motion": root,
-        "body_motion": torch.randn(1, 8, 265),
+        "body_motion": torch.randn(1, 8, 259),
         "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
-        "body_with_context": torch.randn(1, 8, 265),
+        "body_with_context": torch.randn(1, 8, 259),
         "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
         "context_token_count": torch.zeros(1, dtype=torch.long),
         "previous_root_frame": torch.zeros(1, 5),
@@ -745,21 +735,17 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
     module.model.forward = recording_forward
     losses = module._step(batch, is_training=True, initial_history_tokens=0)
     assert set(losses) == {
-        "anchor_root_flow_v",
-        "anchor_root_flow_xz",
-        "anchor_root_flow_height",
-        "anchor_root_flow_heading",
-        "latent_body_flow_v",
-        "anchor_root_offpath_endpoint",
-        "anchor_root_offpath_xz",
-        "anchor_root_offpath_height",
-        "anchor_root_offpath_heading",
-        "latent_body_offpath_endpoint",
-        "root_heading_cosine",
-        "root_heading_cosine_weighted",
-        "root_heading_vector",
-        "root_heading_vector_weighted",
-        "root_heading_raw_norm_mean",
+        "anchor_root_x0",
+        "anchor_root_flow_velocity",
+        "anchor_root_corrective_velocity",
+        "anchor_root_xz",
+        "anchor_root_height",
+        "anchor_root_heading",
+        "latent_body_x0",
+        "latent_body_flow_velocity",
+        "latent_body_corrective_velocity",
+        "root_heading_angle_degrees",
+        "root_heading_raw_norm",
         "root_heading_raw_norm_p10",
         "root_heading_low_norm_ratio",
         "root_heading_antipodal_ratio",
@@ -801,9 +787,9 @@ def test_validation_plan_and_noise_are_repeatable_with_fixed_generator(tmp_path)
     root[..., 3] = 1.0
     batch = {
         "root_motion": root,
-        "body_motion": torch.randn(1, 8, 265),
+        "body_motion": torch.randn(1, 8, 259),
         "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
-        "body_with_context": torch.randn(1, 8, 265),
+        "body_with_context": torch.randn(1, 8, 259),
         "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
         "context_token_count": torch.zeros(1, dtype=torch.long),
         "previous_root_frame": torch.zeros(1, 5),
@@ -829,210 +815,60 @@ def test_validation_plan_and_noise_are_repeatable_with_fixed_generator(tmp_path)
     assert all(torch.equal(first[name], second[name]) for name in first)
 
 
-def test_ldf_resume_rejects_statistics_before_overwriting_model(tmp_path):
-    cfg = _make_config(tmp_path / "source")
-    module = LDFLightningModule(cfg)
+def _saved_resume_checkpoint(module):
     checkpoint = {}
     module.on_save_checkpoint(checkpoint)
-
-    resumed = LDFLightningModule(cfg)
-    resumed.on_load_checkpoint(checkpoint)
-    original = resumed.model.root_mean.clone()
-
-    bad_checkpoint = dict(checkpoint)
-    bad_checkpoint["state_dict"] = dict(checkpoint["state_dict"])
-    bad_checkpoint["state_dict"]["root_mean"] = original + 1.0
-    with pytest.raises(RuntimeError, match="statistics mismatch for root_mean"):
-        resumed.on_load_checkpoint(bad_checkpoint)
-    assert torch.equal(resumed.model.root_mean, original)
+    return checkpoint
 
 
-def test_ldf_resume_rejects_changed_vae_statistics_contract(tmp_path):
+def test_ldf_resume_accepts_changed_training_policy(tmp_path):
     cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-    checkpoint["ldf_resume_contract"]["vae_statistics"]["latent_mean"] += 1
-
-    resumed = LDFLightningModule(cfg)
-    with pytest.raises(RuntimeError, match="VAE statistics mismatch for latent_mean"):
-        resumed.on_load_checkpoint(checkpoint)
-
-
-def test_ldf_resume_warns_but_accepts_changed_compatible_text_embeddings(tmp_path):
-    cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-
-    path = tmp_path / "text_embeddings.pt"
-    payload = torch.load(path, map_location="cpu", weights_only=True)
-    payload["embeddings"]["walk"] = torch.full((2, 8), 9.0)
-    payload["content_id"] = create_text_embedding_content_id(
-        payload["embeddings"], text_dim=8, text_len=8
-    )
-    torch.save(payload, path)
-
-    resumed = LDFLightningModule(cfg)
-    with pytest.warns(UserWarning, match="text embedding content changed"):
-        resumed.on_load_checkpoint(checkpoint)
-
-
-def test_ldf_resume_accepts_changed_training_and_cfg_policy(tmp_path):
-    cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-
+    checkpoint = _saved_resume_checkpoint(LDFLightningModule(cfg))
     resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    resumed_cfg.training.window.max_tokens = 80
-    resumed_cfg.training.max_horizon_token = 17
-    resumed_cfg.self_forcing.k_schedule = [[0, 1], [2, 2]]
-    resumed_cfg.self_forcing.teacher_replay = {2: 0.75}
-    resumed_cfg.self_forcing.cold_start_replay = 0.25
+    resumed_cfg.training.constraint_dropout = 0.2
     resumed_cfg.loss.root_weight = 3.0
-    resumed_cfg.loss.root_heading_cosine_weight = 0.2
-    resumed_cfg.loss.root_heading_vector_weight = 0.3
     resumed_cfg.model.params.cfg_mode = "separated"
-    resumed_cfg.model.params.cfg_scale_text = 2.0
-    resumed_cfg.model.params.cfg_scale_constraint = 3.0
-    resumed_cfg.model.params.cfg_scale_joint = 4.0
-
+    resumed_cfg.model.params.cfg_scale_joint = 2.5
+    resumed_cfg.model.params.noise_steps = 2
+    resumed_cfg.model.params.chunk_size = 1
+    resumed_cfg.self_forcing.k_schedule = [[0, 1], [1, 2]]
+    resumed_cfg.self_forcing.teacher_replay = {2: 0.5}
     LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
 
 
-def test_ldf_resume_rejects_changed_model_semantics_with_same_state_shapes(tmp_path):
+def test_ldf_resume_rejects_prediction_contract_change(tmp_path):
     cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-
+    checkpoint = _saved_resume_checkpoint(LDFLightningModule(cfg))
     resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    resumed_cfg.model.params.num_heads = 4
+    resumed_cfg.model.params.root_prediction_type = "velocity"
     with pytest.raises(RuntimeError, match="model structure contract"):
         LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
 
 
-def test_ldf_resume_uses_loaded_ema_tokenizer_identity_not_checkpoint_bytes(tmp_path):
-    source_root = tmp_path / "source"
-    cfg = _make_config(source_root)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-
-    repacked_path = tmp_path / "repacked_vae.ckpt"
-    payload = torch.load(cfg.vae.checkpoint_path, map_location="cpu", weights_only=False)
-    payload["unrelated_training_metadata"] = {"step": 123}
-    torch.save(payload, repacked_path)
-    assert _file_sha256(repacked_path) != _file_sha256(cfg.vae.checkpoint_path)
-
-    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    resumed_cfg.vae.checkpoint_path = str(repacked_path)
-    LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
-
-
-def test_ldf_resume_rejects_changed_loaded_ema_tokenizer_weights(tmp_path):
+def test_ldf_resume_rejects_changed_vae_content(tmp_path):
     cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-
-    payload = torch.load(cfg.vae.checkpoint_path, map_location="cpu", weights_only=False)
-    payload["ema_state"]["shadow_params"][0] += 1.0
-    torch.save(payload, cfg.vae.checkpoint_path)
-
+    checkpoint = _saved_resume_checkpoint(LDFLightningModule(cfg))
+    checkpoint["ldf_resume_contract"]["vae_tokenizer_content_id"] = "different"
     with pytest.raises(RuntimeError, match="VAE tokenizer content"):
         LDFLightningModule(cfg).on_load_checkpoint(checkpoint)
 
 
-def test_ldf_resume_accepts_legacy_contract_with_matching_vae_file(tmp_path):
+def test_ldf_resume_rejects_checkpoint_without_new_contract(tmp_path):
     cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-    contract = checkpoint.pop("ldf_resume_contract")
-    contract.pop("resume_contract_version")
-    contract.pop("vae_tokenizer_content_id")
-    contract["vae_checkpoint_content_id"] = _file_sha256(cfg.vae.checkpoint_path)
-    contract["model"] = {
-        "target": str(cfg.model.target),
-        "params": OmegaConf.to_container(cfg.model.params, resolve=True),
-    }
-    contract.pop("model_signature")
-    contract["training"] = {
-        "window": OmegaConf.to_container(cfg.training.window, resolve=True),
-        "max_horizon_token": int(cfg.training.max_horizon_token),
-        "self_forcing": OmegaConf.to_container(cfg.self_forcing, resolve=True),
-        "root_statistics": None,
-    }
-    checkpoint["ldf_training_contract"] = contract
-
-    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    resumed_cfg.self_forcing.k_schedule = [[0, 1], [1, 2]]
-    resumed_cfg.self_forcing.teacher_replay = {2: 0.5}
-    LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
-
-
-def test_ldf_resume_accepts_preidentity_path_contract_with_warnings(tmp_path):
-    cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
-    current = checkpoint.pop("ldf_resume_contract")
-    checkpoint["ldf_training_contract"] = {
-        "paths": {
-            "vae_checkpoint_path": str(cfg.vae.checkpoint_path),
-            "text_embeddings_path": str(cfg.data.text_embeddings_path),
-        },
-        "text_embedding_content_id": current["text_embedding_content_id"],
-        "vae_statistics": current["vae_statistics"],
-    }
-
-    resumed_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    resumed_cfg.self_forcing.k_schedule = [[0, 1], [1, 2]]
-    resumed_cfg.self_forcing.teacher_replay = {2: 0.5}
-    with pytest.warns(UserWarning) as warnings:
-        LDFLightningModule(resumed_cfg).on_load_checkpoint(checkpoint)
-    messages = [str(item.message) for item in warnings]
-    assert any("predates VAE content identities" in message for message in messages)
-    assert any("predates model signatures" in message for message in messages)
-
-
-def test_ldf_resume_rejects_checkpoint_without_frozen_contract(tmp_path):
-    cfg = _make_config(tmp_path)
-    module = LDFLightningModule(cfg)
-    checkpoint = {}
-    module.on_save_checkpoint(checkpoint)
+    checkpoint = _saved_resume_checkpoint(LDFLightningModule(cfg))
     checkpoint.pop("ldf_resume_contract")
-
     with pytest.raises(RuntimeError, match="no resume contract"):
         LDFLightningModule(cfg).on_load_checkpoint(checkpoint)
 
 
-def test_ldf_resume_accepts_identical_assets_at_different_paths(tmp_path):
+def test_ldf_resume_accepts_identical_vae_at_different_path(tmp_path):
     source_cfg = _make_config(tmp_path / "source")
-    source = LDFLightningModule(source_cfg)
-    checkpoint = {}
-    source.on_save_checkpoint(checkpoint)
-
-    target_root = tmp_path / "target"
-    target_root.mkdir()
+    checkpoint = _saved_resume_checkpoint(LDFLightningModule(source_cfg))
+    copied = tmp_path / "copied_vae.ckpt"
+    shutil.copyfile(source_cfg.vae.checkpoint_path, copied)
     target_cfg = OmegaConf.create(OmegaConf.to_container(source_cfg, resolve=True))
-    copies = {
-        "vae.checkpoint_path": "vae.ckpt",
-        "vae.params.motion_stats_path": "motion_stats.npz",
-        "vae.params.latent_stats_path": "latent_stats.npz",
-        "data.root_stats_path": "root_stats.npz",
-        "data.text_embeddings_path": "text_embeddings.pt",
-    }
-    for key, filename in copies.items():
-        source_path = OmegaConf.select(target_cfg, key)
-        target_path = target_root / filename
-        shutil.copyfile(source_path, target_path)
-        OmegaConf.update(target_cfg, key, str(target_path))
-
+    target_cfg.vae.checkpoint_path = str(copied)
     LDFLightningModule(target_cfg).on_load_checkpoint(checkpoint)
-
 
 def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
     tmp_path,
@@ -1045,7 +881,7 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
     root[:, 0] = np.arange(56, dtype=np.float32)
     root[:, 2] = np.arange(56, dtype=np.float32) * 0.5
     root[:, 3] = 1.0
-    body = np.random.default_rng(3).standard_normal((56, 265)).astype(np.float32)
+    body = np.random.default_rng(3).standard_normal((56, 259)).astype(np.float32)
     np.savez(
         artifacts / "sample.npz",
         root_motion=root,
@@ -1096,13 +932,11 @@ def test_real_dataset_vae_and_self_forcing_kernel_backpropagate_only_final_step(
         previous_root_valid_mask=anchored["previous_root_valid_mask"],
         condition_builder=condition_builder,
     )
-    from utils.training.ldf.losses import compute_offpath_loss
-
-    losses = compute_offpath_loss(
+    losses = compute_ldf_loss(
         result.prediction,
         result.final_step,
-        root_mean=module.model.root_mean,
-        root_std=module.model.root_std,
+        root_prediction_type=module.model.root_prediction_type,
+        body_prediction_type=module.model.body_prediction_type,
     )
     losses["total"].backward()
 
