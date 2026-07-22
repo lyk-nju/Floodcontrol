@@ -84,3 +84,43 @@ def test_exception_callback_restores_training_parameters():
     assert torch.equal(module.model.weight, training)
     assert module.ema.collected_params is None
     assert not module._ema_parameters_active
+
+
+def test_prefit_inference_validation_keeps_ema_trainable():
+    module = _Module()
+    _set_training_and_ema(module)
+
+    # Reproduce the persistent storage type created when an EMA transfer or
+    # checkpoint load happened under Lightning's inference-mode validation.
+    with torch.inference_mode():
+        module.ema.shadow_params = [
+            value.to(dtype=torch.float64).to(dtype=value.dtype)
+            for value in module.ema.shadow_params
+        ]
+    assert all(torch.is_inference(value) for value in module.ema.shadow_params)
+
+    with torch.inference_mode():
+        module._activate_ema_parameters()
+        module._restore_training_parameters()
+    module.on_fit_start()
+
+    assert all(
+        not torch.is_inference(value) for value in module.ema.shadow_params
+    )
+    module.ema.update()
+
+
+def test_checkpoint_loading_inside_inference_mode_keeps_ema_trainable():
+    source = _Module()
+    _set_training_and_ema(source)
+    checkpoint = {}
+    source.on_save_checkpoint(checkpoint)
+
+    target = _Module()
+    with torch.inference_mode():
+        target.on_load_checkpoint(checkpoint)
+
+    assert all(
+        not torch.is_inference(value) for value in target.ema.shadow_params
+    )
+    target.ema.update()

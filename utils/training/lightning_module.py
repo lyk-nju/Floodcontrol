@@ -43,6 +43,30 @@ class BasicLightningModule(LightningModule):
         self._skip_next_lightning_load_state_dict = False
         self._ema_parameters_active = False
 
+    def _move_ema_storage(self, device) -> None:
+        """Move EMA buffers without retaining inference tensors.
+
+        Lightning validation runs inside ``torch.inference_mode()`` by
+        default.  A tensor created by ``ema.to(device)`` in that scope cannot
+        later be updated in-place during training.  Disable inference mode for
+        the transfer and repair any storage inherited from an older validation
+        or checkpoint-loading path.
+        """
+
+        with torch.inference_mode(False):
+            self.ema.to(device)
+            self.ema.shadow_params = [
+                value.detach().clone() if torch.is_inference(value) else value
+                for value in self.ema.shadow_params
+            ]
+            if self.ema.collected_params is not None:
+                self.ema.collected_params = [
+                    value.detach().clone()
+                    if torch.is_inference(value)
+                    else value
+                    for value in self.ema.collected_params
+                ]
+
     def configure_optimizers(self):
         optim_target = self.cfg.optimizer.target
         if len(optim_target.split(".")) == 1:
@@ -83,18 +107,20 @@ class BasicLightningModule(LightningModule):
 
     def on_load_checkpoint(self, checkpoint):
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
-        if "ema_state" in checkpoint:
-            self.ema.load_state_dict(checkpoint["ema_state"])
-            # Older checkpoints may contain the temporary parameter copy made by
-            # torch_ema.average_parameters(). It is never part of the EMA model.
-            self.ema.collected_params = None
-            rank_zero_info("init ema from ckpt")
-        else:
-            self.ema = ExponentialMovingAverage(
-                self._trainable_parameters,
-                decay=self.cfg.model.ema_decay,
-            )
-            rank_zero_info("init ema from current model weights")
+        with torch.inference_mode(False):
+            if "ema_state" in checkpoint:
+                self.ema.load_state_dict(checkpoint["ema_state"])
+                # Older checkpoints may contain the temporary parameter copy made by
+                # torch_ema.average_parameters(). It is never part of the EMA model.
+                self.ema.collected_params = None
+                rank_zero_info("init ema from ckpt")
+            else:
+                self.ema = ExponentialMovingAverage(
+                    self._trainable_parameters,
+                    decay=self.cfg.model.ema_decay,
+                )
+                rank_zero_info("init ema from current model weights")
+        self._move_ema_storage(self.device)
         self.ema.collected_params = None
         self._ema_parameters_active = False
 
@@ -122,9 +148,10 @@ class BasicLightningModule(LightningModule):
 
         if self._ema_parameters_active:
             return
-        self.ema.to(self.device)
-        with torch.no_grad():
+        self._move_ema_storage(self.device)
+        with torch.inference_mode(False), torch.no_grad():
             self.ema.store(self._trainable_parameters)
+        with torch.no_grad():
             self.ema.copy_to(self._trainable_parameters)
         self._ema_parameters_active = True
 
@@ -158,7 +185,7 @@ class BasicLightningModule(LightningModule):
         raise NotImplementedError
 
     def on_fit_start(self):
-        self.ema.to(self.device)
+        self._move_ema_storage(self.device)
 
     def on_validation_start(self):
         self._activate_ema_parameters()

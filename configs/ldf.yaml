@@ -8,8 +8,8 @@ seed: 1234
 debug: false
 train: true
 save_dir: ./outputs/ldf
-resume_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260720_203317_ldf_hybrid/step_160000.ckpt
-test_ckpt: /data/home/shengqiuProf_user_yuankai/Floodcontrol/outputs/ldf/20260720_203317_ldf_hybrid/step_160000.ckpt
+resume_ckpt: null
+test_ckpt: null
 
 wandb_info:
   project: Floodcontrol
@@ -46,7 +46,7 @@ validation:
     video_yaw_degrees: [0, 90, 180]
 
   t2m:
-    enabled: false
+    enabled: true
     steps: 10000
     cfg_mode: nocfg
 
@@ -81,7 +81,7 @@ data:
   min_frames: 20
   max_frames: 200
   random_yaw: true
-  train_batch_size: 64
+  train_batch_size: 32
   val_batch_size: 32
   num_workers: 2
   pin_memory: true
@@ -128,16 +128,16 @@ metrics:
 
 training:
   text_dropout: 0.1
-  constraint_dropout: 0.1
+  constraint_dropout: 0.2
   window:
     max_tokens: 50
     generation_tokens: 5
     sampling: random_generation_start
   max_horizon_token: 45
   constraint_sampling:
-    dense_probability: 1.0
-    waypoint_probability: 0.0
-    goal_probability: 0.0
+    dense_probability: 0.5
+    waypoint_probability: 0.25
+    goal_probability: 0.25
     max_waypoint_count: 4
 
 loss:
@@ -146,8 +146,8 @@ loss:
   rollout_weight: 1.0
   offpath_beta_min: 0.1
   root_boundary_weight: 0.0
-  root_heading_cosine_weight: 0.3
-  root_heading_vector_weight: 0.3
+  root_heading_cosine_weight: 0.1
+  root_heading_vector_weight: 0.1
   root_heading_beta_min: 0.1
   root_heading_cosine_min_norm: 0.05
 

@@ -5630,3 +5630,101 @@
 尚未完成的后续事项：
 
 - 当前本机`/data1/.../HumanML3D_motion/test_min.txt`仍包含8个sample ID；在它被改为只含`000021`与`001168`前，代码会按唯一来源原则为8条sample都生成三种yaw视频。
+
+## 2026-07-22 · Prefit Validation后的EMA可训练性修复
+
+改动类型：训练阻断修复 / EMA生命周期
+
+实际改动内容：
+
+- EMA shadow的device迁移、checkpoint加载和validation临时参数复制显式在`torch.inference_mode(False)`下执行。
+- `on_fit_start()`会修复任何由旧路径遗留的inference EMA storage；只对实际的inference tensor执行clone，正常路径不增加完整模型副本。
+- 新增从头训练前validation与validation内checkpoint加载两种回归测试，随后直接执行`ema.update()`验证storage仍可原地更新。
+
+改动理由：
+
+- Lightning默认在`inference_mode`中运行standalone validation。fit前先执行`trainer.validate()`时，旧实现会在该作用域中将EMA搬到GPU，使shadow成为inference tensor；从头训练不会在`trainer.fit()`中重新加载EMA，因此首个train batch结束时必然在`ema.update()`报错。
+- 修复限定在EMA storage生命周期，不关闭整个validation的inference mode，也不改变模型forward、optimizer或checkpoint数值。
+
+验证：
+
+- EMA生命周期测试：`6 passed`。
+- EMA、LDF/VAE训练及generation evaluation联合定向测试：`62 passed`。
+
+涉及文件：
+
+- `utils/training/lightning_module.py`
+- `tests/test_ema_lifecycle.py`
+- `docs/rearchitecture/07_LDF_TRAINING_EVALUATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+## 2026-07-22 · T2M Joint CFG 3.0 默认值
+
+改动类型：评测配置调整 / CFG sweep结论固化 / 文档与测试同步
+
+实际改动内容：
+
+- 将基础配置和远端正式配置的`validation.t2m.cfg_mode`从`nocfg`改为`joint`，并将`model.params.cfg_scale_joint`统一设为`3.0`；`ldf_s5.yaml`与`ldf_multi.yaml`通过`ldf_base.yaml`继承该默认值。
+- 更新配置回归测试，锁定正式T2M使用Joint CFG且scale为3.0。
+- 更新训练配置与评测文档，移除T2M nocfg作为正式默认值的旧描述。
+- 使用step-160000 EMA、完整1450条HumanML3D validation、固定seed 4321、stream生成协议完成Joint CFG sweep。离散结果在3.125达到最低FID 0.729040；3.0为0.762898，3.25为0.741022，随后随CFG增大持续恶化，5.0为1.461324。按用户决定，正式默认采用更简单且相邻表现接近的3.0。
+- 用户停止进一步精扫后，中断尚未完成的3.1875点；该点只生成到768/1450，没有写入或报告不完整FID。
+
+改动理由：
+
+- 仅修改模型scale而保留T2M的`nocfg`覆盖不会实际启用CFG，因此模式与scale必须同时更新。
+- sweep表明继续增大CFG不会无限改善FID；3.0位于稳定低值区间，且便于后续不同checkpoint统一比较。
+
+验证：
+
+- 配置迁移定向测试：`47 passed`。
+- `git diff --check`通过。
+- CFG sweep每个完成点均使用同一EMA checkpoint、validation split、seed、stream协议和1450个样本；结果保存在gitignored的`debug/results/joint_cfg_sweep_step160000_headingloss/`。
+
+涉及文件：
+
+- `configs/{ldf,ldf_base}.yaml`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/{05_TRAINING_CONFIG,07_LDF_TRAINING_EVALUATION}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮没有重跑全仓测试；修改仅涉及配置默认值、对应guard和文档，已运行配置定向测试。
+- 3.1875精扫按用户要求停止；正式选择已固定为3.0，不再继续追踪更细的连续极小值。
+
+## 2026-07-22 · 远端训练服务器Profile同步
+
+改动类型：远端训练配置同步 / 配置回归测试与文档修正
+
+实际改动内容：
+
+- 按用户提供的另一台训练服务器配置同步`configs/ldf.yaml`：清空`resume_ckpt/test_ckpt`，开启每10k步T2M并使用`nocfg`，单卡batch改为32，constraint dropout改为0.2。
+- 轨迹约束采样恢复为dense/waypoint/goal=`0.5/0.25/0.25`，root heading cosine/vector辅助权重均改为0.1。
+- 远端模型评测默认Joint scale改为1.0；该服务器profile只修改独立的`ldf.yaml`，不覆盖`ldf_base.yaml`所定义的本机与Multi研究默认Joint scale 3.0。
+- 保留学习率的`1.0e-4`数值写法，而不是附件中的`1e-4`字面量；二者数学等价，但普通YAML解析器会把后者读取为字符串。
+- 更新远端配置guard及架构文档，明确基础研究默认和远端训练快照可以显式不同。
+
+改动理由：
+
+- 远端配置需要与实际训练服务器使用的batch、dropout、约束混合、T2M评测和辅助loss保持一致，避免本仓库配置与在训作业产生隐式漂移。
+- 附件是远端实验profile，不应反向覆盖本机和HumanML+BABEL共享的基础配置。
+
+验证：
+
+- 将附件与`configs/ldf.yaml`分别按YAML解析，并仅对科学计数法学习率做数值类型归一化后比较：全部字段一致，无不同顶层键。
+- 配置迁移定向测试：`47 passed`。
+- `git diff --check`通过。
+- 真实训练入口校验在本机按预期停于`ROOT_STATISTICS_REQUIRED`：远端路径`/data/home/.../root_stats.npz`不在本机文件系统中；未宣称远端资产存在性已在本机通过。
+
+涉及文件：
+
+- `configs/ldf.yaml`
+- `tests/test_migration_guards.py`
+- `docs/rearchitecture/{05_TRAINING_CONFIG,07_LDF_TRAINING_EVALUATION}.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 需要在目标训练服务器上实际运行训练入口，确认远端checkpoint、statistics、T5表和probe文件均存在。
+- 本轮未运行全仓测试；配置定向测试已覆盖远端profile及训练合同断言。

@@ -54,14 +54,14 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert "cold_start_probability" not in cfg.data
     assert "length_bucket_frames" not in cfg.data
     assert cfg.training.text_dropout == pytest.approx(0.1)
-    assert cfg.training.constraint_dropout == pytest.approx(0.1)
+    assert cfg.training.constraint_dropout == pytest.approx(0.2)
     assert cfg.training.window.max_tokens == 50
     assert cfg.training.window.generation_tokens == 5
     assert cfg.training.window.sampling == "random_generation_start"
     assert cfg.training.max_horizon_token == 45
-    assert cfg.training.constraint_sampling.dense_probability == pytest.approx(1.0)
-    assert cfg.training.constraint_sampling.waypoint_probability == pytest.approx(0.0)
-    assert cfg.training.constraint_sampling.goal_probability == pytest.approx(0.0)
+    assert cfg.training.constraint_sampling.dense_probability == pytest.approx(0.5)
+    assert cfg.training.constraint_sampling.waypoint_probability == pytest.approx(0.25)
+    assert cfg.training.constraint_sampling.goal_probability == pytest.approx(0.25)
     assert cfg.training.constraint_sampling.max_waypoint_count == 4
     assert cfg.data.text_embeddings_path.endswith(
         "HumanML3D_motion/t5_text_embeddings.pt"
@@ -86,7 +86,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.data.test_probe_meta_paths.dense_xz[0].endswith(
         "HumanML3D_motion/test_min.txt"
     )
-    assert cfg.validation.t2m.enabled is False
+    assert cfg.validation.t2m.enabled is True
     assert "max_samples" not in cfg.validation.t2m
     assert "enabled" not in cfg.self_forcing
     assert "phase_start_step" not in cfg.self_forcing
@@ -102,16 +102,16 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert dict(cfg.self_forcing.teacher_replay) == {2: 0.1, 5: 0.1}
     assert cfg.trainer.max_steps == 500000
     assert cfg.trainer.devices == 8
-    assert cfg.data.train_batch_size == 64
+    assert cfg.data.train_batch_size == 32
     assert cfg.data.num_workers == 2
     assert cfg.dirs.raw_data.startswith("/data/home/shengqiuProf_user_yuankai/")
-    assert cfg.resume_ckpt == cfg.test_ckpt
-    assert str(cfg.resume_ckpt).endswith("step_160000.ckpt")
+    assert cfg.resume_ckpt is None
+    assert cfg.test_ckpt is None
     assert cfg.loss.rollout_weight == pytest.approx(1.0)
     assert cfg.loss.offpath_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_boundary_weight == pytest.approx(0.0)
-    assert cfg.loss.root_heading_cosine_weight == pytest.approx(0.3)
-    assert cfg.loss.root_heading_vector_weight == pytest.approx(0.3)
+    assert cfg.loss.root_heading_cosine_weight == pytest.approx(0.1)
+    assert cfg.loss.root_heading_vector_weight == pytest.approx(0.1)
     assert cfg.loss.root_heading_beta_min == pytest.approx(0.1)
     assert cfg.loss.root_heading_cosine_min_norm == pytest.approx(0.05)
     assert cfg.loss.body_weight == pytest.approx(1.0)
@@ -133,10 +133,11 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
         assert injected_name not in cfg.model.params
 
 
-def test_formal_t2m_evaluation_is_available_but_disabled_by_default():
+def test_remote_t2m_evaluation_matches_the_training_server_profile():
     cfg = load_config(str(REMOTE_LDF_CONFIG))
-    assert cfg.validation.t2m.enabled is False
+    assert cfg.validation.t2m.enabled is True
     assert cfg.validation.t2m.cfg_mode == "nocfg"
+    assert cfg.model.params.cfg_scale_joint == pytest.approx(1.0)
 
 
 def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
