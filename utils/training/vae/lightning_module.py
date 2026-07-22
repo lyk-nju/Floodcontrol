@@ -9,6 +9,7 @@ from utils.training.lightning_module import BasicLightningModule
 
 from .checkpoint import PHYSICAL_STATISTIC_BUFFERS
 from .losses import VAELoss
+from .metrics import reconstruction_geometry_metrics
 
 
 def validate_resume_checkpoint(
@@ -90,6 +91,12 @@ class VAELightningModule(BasicLightningModule):
                 "reconstruction", "total",
             ):
                 losses[f"mu_{name}"] = mu_losses[name]
+            geometry_metrics = reconstruction_geometry_metrics(
+                inputs,
+                mu_prediction.body,
+            )
+            for name, value in geometry_metrics.items():
+                losses[f"metric/{name}"] = value
         return losses
 
 

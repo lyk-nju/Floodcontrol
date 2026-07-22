@@ -134,3 +134,8 @@ python -m tools.prepare_training_assets verify \
 - `263 -> Root5/Body259 -> 263`可观测字段与T2M feature漂移受控；
 - direct/FK差异不显著超过源HumanML自身基线；
 - Dataset、VAE collator和LDF collator真实样本smoke通过。
+
+Root5/Body259已经完成的单样本闭环、32样本T2M冒烟、1450条完整val round-trip、
+固定/随机yaw旋转FID及tail策略对照的协议和数值，统一记录在
+[`02_VAE_AND_BODY_REPRESENTATION.md`第8节](02_VAE_AND_BODY_REPRESENTATION.md#8-root5--body259-表征实验记录)。
+这些结果验证数据表示与evaluator adapter，不替代新VAE的MPJPE/FK重构验收。

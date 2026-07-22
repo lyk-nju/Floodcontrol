@@ -5936,3 +5936,132 @@
 - 新local artifact与新VAE尚未生成，因此没有宣称单卡VAE/LDF短训练或两卡DDP
   smoke已经通过。正确顺序是先运行`prepare_training_assets pre-vae`，训练新VAE，
   再用`prepare_training_assets verify --vae-checkpoint ...`验证LDF启动资产。
+
+## 2026-07-23 · Root5 / Body259全验证集旋转FID测试
+
+改动类型：评测工具扩展 / 全局yaw不变性验证
+
+实际改动内容：
+
+- 扩展`tools/compare_humanml_adapter.py`，在原有HumanML263往返误差和T2M evaluator
+  drift之外，支持对Root5/Body259施加可配置的全局yaw，再转换回canonical
+  HumanML263并计算特征误差、motion embedding L2/cosine与FID。
+- 默认覆盖0°、45°、90°、180°及seed固定的逐样本`Uniform[0,360°)`旋转；同长度
+  旋转变体组成batch送入官方HumanML motion evaluator，避免为每个角度重复单样本
+  forward。CLI增加角度、随机旋转开关与seed，并为全量测试增加每100条进度输出。
+- 在HumanML3D完整val split的1450条动作上完成GPU评测。所有旋转相对未旋转
+  round-trip的FID均处于`0`到`5.52e-10`；45°/90°/180°/随机旋转的最大逐元素
+  误差分别不超过`1.42e-6`、`1.88e-6`、`1.49e-6`、`1.91e-6`。
+- 各旋转结果相对原始HumanML263的FID稳定为约`8.29e-6`，与未旋转exact-drop
+  adapter的`8.2877e-6`一致，没有角度相关的分布漂移。这验证的是representation与
+  evaluator adapter的旋转身份，不是VAE重构或LDF生成FID。
+
+验证：
+
+- 8样本GPU冒烟：固定角与随机角相对未旋转round-trip的FID均为数值零。
+- 1450样本完整val GPU评测通过，结果保存于gitignored的
+  `debug/results/body259_rotation_fid_val1450.json`。
+- `python -m pytest tests/test_humanml_adapter.py -q`：`8 passed`。
+- `python -m py_compile tools/compare_humanml_adapter.py`与`git diff --check`通过。
+
+涉及文件：
+
+- `tools/compare_humanml_adapter.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 本轮不涉及新VAE/LDF checkpoint，因此没有运行VAE重构FID、LDF生成FID或训练。
+
+## 2026-07-23 · VAE validation MPJPE与FK诊断指标
+
+改动类型：VAE验证指标 / 几何一致性诊断 / 测试
+
+实际改动内容：
+
+- VAE validation在EMA参数和deterministic posterior `mu`重构路径上新增四个米制
+  几何指标：`world_mpjpe_m`、`source_fk_direct_mpjpe_m`、
+  `reconstruction_fk_direct_mpjpe_m`与`reconstruction_fk_target_mpjpe_m`。
+- `world_mpjpe_m`度量直接position通道的世界关节误差；source FK/direct作为
+  HumanML表示本身的基线；两个reconstruction FK指标分别度量预测rotation与预测
+  direct position的内部一致性，以及预测rotation相对GT direct position的误差。
+  因此后续是否启用FK或position-consistency loss可以依据重建指标相对source基线的
+  差距判断，而不是把数据表示自身的FK误差误归因给VAE。
+- validation几何计算统一使用float32、逐样本首个完整有效姿态推导HumanML骨架长度，
+  并同时遵守frame/feature mask；右侧batch padding不会进入MPJPE。
+- 通用Lightning validation日志支持`metric/`返回键，并将其记录到独立的
+  `val_metric/*`命名空间；这些诊断量不进入`val_loss/total`和反向传播。
+- 新增测试覆盖perfect reconstruction、直接position与rotation/FK分支的错误隔离，
+  以及右侧padding屏蔽。
+
+改动理由：
+
+- 仅观察归一化feature reconstruction loss无法回答真实关节误差多大，也无法区分
+  “直接位置头不准”和“rotation/direct position不一致”。分离这四项后，正式VAE
+  训练可以先观测真实几何差距，再决定是否增加昂贵且可能与HumanML IK gauge基线
+  冲突的FK训练约束。
+
+验证：
+
+- `pytest tests/test_vae_validation_metrics.py tests/test_vae_eval.py -q`：`7 passed`。
+- VAE contract/data/eval/loss/model/tokenizer与新增metrics定向测试：`21 passed`。
+- `pytest tests/test_vae_training.py -q -k 'not formal_vae_training_config_matches_frozen_recipe'`：
+  `8 passed, 1 deselected`；被排除的配置冻结测试与用户当前正在调整的500k/BS256
+  `configs/vae.yaml`有关，不属于本次validation指标修改。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/vae/metrics.py`
+- `utils/training/vae/lightning_module.py`
+- `utils/training/lightning_module.py`
+- `tests/test_vae_validation_metrics.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 新Body259 VAE尚未开始正式训练，因此本轮没有报告真实validation MPJPE数值，也未
+  据此启用`lambda_fk`或`lambda_position_consistency`；应先观察重建FK指标相对
+  source FK/direct基线的差值后再决定。
+
+## 2026-07-23 · Root5 / Body259表征实验写入正式设计文档
+
+改动类型：实验记录固化 / 架构文档补充
+
+实际改动内容：
+
+- 在VAE与身体表示文档新增独立实验章节，集中记录真实样本`000021`数值闭环、32条
+  T2M早期冒烟、HumanML完整val 1450条round-trip、0/45/90/180度与随机yaw旋转
+  FID，以及exact-drop/approximate-tail尾帧策略对照。
+- 将完整val的root/position/rotation/velocity/contact误差、embedding cosine/L2、
+  FID和旋转不变性数值从开发日志与gitignored JSON固化到受版本控制的正式文档。
+- 明确实验结论边界：结果验证Root5/Body259 codec与HumanML evaluator adapter，
+  不证明新VAE重构质量、LDF生成质量或HumanML IK rotation等价于原生SMPL rotation。
+- 记录FK当前状态：合成合同测试已覆盖`A=RB`、正交性、world position恢复和FK helper；
+  真实VAE是否需要FK/position-consistency loss必须比较validation reconstruction FK
+  指标与source FK/direct基线后决定。
+- 数据管线文档的发布验收链接到该实验章节，避免在多份文档重复维护同一组数值。
+
+改动理由：
+
+- 原有正式文档只列验收门槛，关键实验数值散落在开发日志和被Git忽略的调试结果中，
+  不利于跨服务器训练和后续审查。集中记录协议、结果及不可外推的结论可以避免把接近
+  零的adapter FID误解为VAE或LDF已经通过质量验收。
+
+验证：
+
+- 对照`debug/results/body259_rotation_fid_val1450.json`逐项核对1450条val的feature、
+  embedding、FID和yaw结果。
+- `git diff --check`通过；本轮仅修改Markdown，未运行Python测试。
+
+涉及文件：
+
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 等新Body259 VAE开始训练后，将真实validation MPJPE、source/reconstruction FK
+  gap、rotation geodesic与reconstruction FID追加为模型实验；本轮不预设FK loss
+  必须开启。

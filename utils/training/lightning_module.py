@@ -255,8 +255,12 @@ class BasicLightningModule(LightningModule):
         loss_dict = self._step(batch, is_training=False)
         batch_size = int(batch["body_motion"].shape[0])
         for key, value in loss_dict.items():
+            if key.startswith("metric/"):
+                log_name = f"val_metric/{key.removeprefix('metric/')}"
+            else:
+                log_name = f"val_loss/{key}"
             self.log(
-                f"val_loss/{key}",
+                log_name,
                 value,
                 on_step=False,
                 on_epoch=True,

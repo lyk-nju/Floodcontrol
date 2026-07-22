@@ -10,7 +10,7 @@ wandb_info:
   project: VAE_Flood
 
 trainer:
-  max_steps: 300000
+  max_steps: 500000
   accelerator: gpu
   devices: 1
   strategy: auto
@@ -28,7 +28,7 @@ data:
     - ${dirs.raw_data}/HumanML3D_motion_local/val.txt
   artifact_path: artifacts
   text_path: null
-  train_batch_size: 128
+  train_batch_size: 256
   val_batch_size: 128
   num_workers: 16
   min_frames: 20
@@ -53,6 +53,13 @@ loss:
   lambda_velocity: 1.0
   lambda_contact: 1.0
   lambda_skating: 0.01
+
+  lambda_geodesic: 0.1
+  lambda_velocity_consistency: 0.05
+
+  lambda_fk: 0.0
+  lambda_position_consistency: 0.0
+
   beta_kl: 1.0e-5
   kl_warmup_steps: 0
 
