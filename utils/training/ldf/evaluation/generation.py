@@ -206,6 +206,7 @@ def generate_evaluation_sequence(
     *,
     mode: str,
     guidance_mode: str | None = None,
+    cfg_scale_joint: float | None = None,
     seed: int,
     frame_count: int,
     dense_xz: bool,
@@ -263,7 +264,11 @@ def generate_evaluation_sequence(
             ),
             scale_text=module.model.cfg_scale_text,
             scale_constraint=module.model.cfg_scale_constraint,
-            scale_joint=module.model.cfg_scale_joint,
+            scale_joint=(
+                module.model.cfg_scale_joint
+                if cfg_scale_joint is None
+                else float(cfg_scale_joint)
+            ),
         ),
         seed=int(seed),
         initial_world_xz=target_root[0, [0, 2]].tolist(),

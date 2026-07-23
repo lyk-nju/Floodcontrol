@@ -28,7 +28,7 @@ data:
     - ${dirs.raw_data}/HumanML3D_motion_local/val.txt
   test_probe_meta_paths:
     dense_xz:
-      - ${dirs.raw_data}/HumanML3D_motion_local/test.txt
+      - ${dirs.raw_data}/HumanML3D_motion_local/test_min.txt
   artifact_path: artifacts
   text_path: texts
   train_batch_size: 32

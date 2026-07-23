@@ -70,6 +70,9 @@ def _zero_prediction(self, inputs, **kwargs):
     seen_cfg_modes = getattr(self, "_seen_cfg_modes", None)
     if seen_cfg_modes is not None:
         seen_cfg_modes.append(kwargs.get("mode"))
+    seen_cfg_scales = getattr(self, "_seen_cfg_scales", None)
+    if seen_cfg_scales is not None:
+        seen_cfg_scales.append(kwargs.get("cfg_scale_joint"))
     root_velocity = torch.zeros_like(inputs.noisy_motion.root_motion)
     latent_velocity = torch.zeros_like(inputs.noisy_motion.latent_motion)
     local = torch.zeros(*root_velocity.shape[:3], 4, device=root_velocity.device)
@@ -766,3 +769,44 @@ def test_generation_evaluation_can_override_model_guidance_mode():
     assert module.model.cfg_mode == "separated"
     assert module.model._seen_cfg_modes
     assert set(module.model._seen_cfg_modes) == {"nocfg"}
+
+
+def test_generation_evaluation_can_override_joint_cfg_scale():
+    module = _evaluation_module()
+    module.model.cfg_scale_joint = 9.0
+    module.model._seen_cfg_scales = []
+    root = torch.zeros(8, 5)
+    root[:, 1] = 1.0
+    root[:, 3] = 1.0
+    sample = {
+        "dataset": "HumanML3D",
+        "name": "sample",
+        "root_motion": root,
+        "body_motion": torch.zeros(8, 259),
+        "text_data": [
+            {
+                "text": "walk",
+                "tokens": ["walk/VERB"],
+                "start_frame": 0,
+                "end_frame": 8,
+            }
+        ],
+    }
+
+    generate_evaluation_sequence(
+        module,
+        sample,
+        mode="stream",
+        guidance_mode="joint",
+        cfg_scale_joint=2.0,
+        seed=7,
+        frame_count=8,
+        dense_xz=False,
+        rolling_window_tokens=4,
+        max_horizon_token=2,
+        num_denoise_steps=2,
+    )
+
+    assert module.model.cfg_scale_joint == 9.0
+    assert module.model._seen_cfg_scales
+    assert set(module.model._seen_cfg_scales) == {2.0}
