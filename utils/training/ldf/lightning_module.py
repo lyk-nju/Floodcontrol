@@ -259,6 +259,9 @@ class LDFLightningModule(BasicLightningModule):
             batch["body_with_context"],
             batch["body_with_context_frame_valid_mask"],
             batch["context_token_count"],
+            body_feature_valid_mask=batch[
+                "body_with_context_feature_valid_mask"
+            ],
         )
         if tuple(latent.shape[:2]) != (root.shape[0], tokens):
             raise ValueError(

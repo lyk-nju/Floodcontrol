@@ -9,7 +9,10 @@ from utils.motion_process import (
     BODY_ROTATION_DIM,
     NUM_JOINTS,
 )
-from utils.training.vae.metrics import reconstruction_geometry_metrics
+from utils.training.vae.metrics import (
+    _fk_joint_valid_mask,
+    reconstruction_geometry_metrics,
+)
 
 
 def _geometry_case(frames: int = 8) -> tuple[VAEInput, BodyPrediction]:
@@ -70,3 +73,15 @@ def test_validation_geometry_metrics_ignore_right_padding():
     prediction.continuous_body[:, 4:, :BODY_POSITION_DIM] = 100.0
     metrics = reconstruction_geometry_metrics(inputs, prediction)
     assert all(value.item() == pytest.approx(0.0) for value in metrics.values())
+
+
+def test_fk_validity_requires_each_joint_cumulative_rotation():
+    frame_valid = torch.ones(1, 2, dtype=torch.bool)
+    rotation_valid = torch.ones(
+        1, 2, NUM_JOINTS - 1, dtype=torch.bool
+    )
+    rotation_valid[..., 1] = False
+    joint_valid = _fk_joint_valid_mask(frame_valid, rotation_valid)
+    assert joint_valid[..., 0].all()
+    assert joint_valid[..., 1].all()
+    assert not joint_valid[..., 2].any()

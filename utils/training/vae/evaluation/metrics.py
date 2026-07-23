@@ -117,9 +117,16 @@ def reconstruction_metrics(
 
     target_contact = target[:, BODY_CONTINUOUS_DIM:].bool()
     predicted_contact = result.streamed_body.contact_logits[0].sigmoid() >= 0.5
-    true_positive = int((predicted_contact & target_contact).sum())
-    false_positive = int((predicted_contact & ~target_contact).sum())
-    false_negative = int((~predicted_contact & target_contact).sum())
+    contact_valid = feature_valid[:, BODY_CONTINUOUS_DIM:]
+    true_positive = int(
+        (predicted_contact & target_contact & contact_valid).sum()
+    )
+    false_positive = int(
+        (predicted_contact & ~target_contact & contact_valid).sum()
+    )
+    false_negative = int(
+        (~predicted_contact & target_contact & contact_valid).sum()
+    )
     precision = true_positive / max(true_positive + false_positive, 1)
     recall = true_positive / max(true_positive + false_negative, 1)
 
@@ -181,7 +188,6 @@ def reconstruction_metrics(
     ).all(dim=-1).index_select(1, foot_indices - 1)
     transition_valid = torch.zeros_like(foot_position_valid)
     transition_valid[1:] = foot_position_valid[1:] & foot_position_valid[:-1]
-    contact_valid = feature_valid[:, BODY_CONTINUOUS_DIM:]
     position_skating_valid = transition_valid & contact_valid
 
     predicted_velocity = predicted[:, velocity_start:].reshape(-1, NUM_JOINTS, 3)
@@ -217,7 +223,10 @@ def reconstruction_metrics(
             velocity_error, feature_valid[:, velocity_start:BODY_CONTINUOUS_DIM]
         ),
         "rotation_geodesic_deg": _masked_mean(rotation_error, rotation_valid),
-        "contact_accuracy": float((predicted_contact == target_contact).float().mean()),
+        "contact_accuracy": _masked_mean(
+            (predicted_contact == target_contact).float(),
+            contact_valid,
+        ),
         "contact_precision": precision,
         "contact_recall": recall,
         "contact_f1": 2.0 * precision * recall / max(precision + recall, 1e-12),

@@ -6,9 +6,14 @@ import torch
 
 from datasets.humanml3d import HumanML3DDataset
 from tools.compute_vae_stats import compute_motion_statistics, main as compute_stats_main
-from tools.convert_motion_263_to_259 import convert_motion_263_to_259, recover_root_263
+from tools.convert_motion_263_to_259 import (
+    HUMANML_CONTACT_SLICE,
+    convert_motion_263_to_259,
+    detect_foot_contacts,
+    recover_root_263,
+)
 from tools.preprocess_humanml3d import build_dataset
-from utils.motion_process import rotate_motion_yaw, unpack_body
+from utils.motion_process import CONTACT_SLICE, rotate_motion_yaw, unpack_body
 from utils.training.vae.data import VAEWindowCollator
 
 
@@ -53,8 +58,9 @@ def write_processed_sample(root, name="sample", frames=12, *, legacy_metadata=Tr
 
 
 def test_humanml263_conversion_recovers_root_body_and_backward_velocity():
+    source = torch.from_numpy(make_humanml263())
     root, body, valid = convert_motion_263_to_259(
-        torch.from_numpy(make_humanml263()), fps=20
+        source, fps=20
     )
     assert root.shape == (8, 5)
     assert body.shape == (8, 259)
@@ -63,6 +69,28 @@ def test_humanml263_conversion_recovers_root_body_and_backward_velocity():
     assert torch.allclose(parts["joint_velocities"][1:, 0, 0], torch.ones(7))
     assert not valid[0, 189:255].any()
     assert valid[1:, 189:255].all()
+    assert not body[0, CONTACT_SLICE].any()
+    assert not valid[0, CONTACT_SLICE].any()
+    assert torch.equal(
+        body[1:, CONTACT_SLICE],
+        source[:-1, HUMANML_CONTACT_SLICE],
+    )
+    assert valid[1:, CONTACT_SLICE].all()
+
+
+def test_detected_contacts_use_backward_transition_and_mark_cold_start_invalid():
+    positions = torch.zeros(1, 4, 22, 3)
+    positions[..., 1] = 0.05
+    contacts, valid = detect_foot_contacts(
+        positions,
+        fps=20,
+        height_threshold=0.15,
+        speed_threshold=0.10,
+    )
+    assert not contacts[:, 0].any()
+    assert not valid[:, 0].any()
+    assert contacts[:, 1:].all()
+    assert valid[:, 1:].all()
 
 
 def test_humanml263_root_recovery_preserves_floating_dtype():
@@ -158,7 +186,19 @@ def test_vae_validation_collator_uses_prefix_rebase_previous_root_and_padding(tm
     assert batch["frame_valid_mask"][1, :8].all()
     assert not batch["frame_valid_mask"][1, 8:].any()
     assert torch.equal(batch["root_motion"][:, 0, [0, 2]], torch.zeros(2, 2))
+    assert torch.equal(
+        batch["root_motion"][1, 8:, 3:5],
+        torch.tensor([1.0, 0.0]).expand(4, 2),
+    )
+    assert torch.equal(
+        batch["root_motion"][..., 3:5].norm(dim=-1),
+        torch.ones(2, 12),
+    )
     assert not batch["previous_root_valid_mask"].any()
+    assert torch.equal(
+        batch["previous_root_frame"][:, 3:5],
+        torch.tensor([1.0, 0.0]).expand(2, 2),
+    )
     assert not batch["body_feature_valid_mask"][1, 8:].any()
 
 

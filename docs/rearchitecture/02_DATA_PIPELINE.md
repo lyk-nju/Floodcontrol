@@ -58,7 +58,10 @@ recompute current-heading-local backward velocity in m/s
 pack Root5 + Body259 + validity mask
 ```
 
-Body position减去完整root XYZ。cold-start的Body velocity为零且对应66维mask为false；其余连续/rotation/contact feature有效。Body中的root velocity不拥有最终root运动。
+Body position减去完整root XYZ。Body velocity与contact统一使用backward/current
+transition语义；cold-start两者均为零，对应66维velocity和4维contact mask为false。
+HumanML源的forward contact在转换时向后平移一帧，评测回写时执行严格逆平移。
+其余position/rotation feature有效。Body中的root velocity不拥有最终root运动。
 
 HumanML/BABEL的caption文件原样复制。`all.txt`严格等于已发布正式split的唯一sample ID并集；T5预编码从`all.txt`覆盖全部caption，而不是只读train/val。BABEL任意frame文本区间在LDF collator中按四帧token最大重叠编译，不要求原始边界token-aligned。
 
@@ -109,7 +112,9 @@ python -m tools.prepare_training_assets pre-vae \
 4. 复用已有T5表并补齐缺失caption，或从`all.txt`新建；
 5. 全量验证每个split ID的motion/text、全部artifact字段/shape/dtype/finite/heading以及T5 caption覆盖率。
 
-重复执行会跳过字段、shape、dtype和数值合同均正确的artifact；格式错误或旧Body265 artifact会被重建。输出使用原子替换，不将半成品当作完成阶段。
+重复执行会跳过字段、shape、dtype和数值合同均正确的artifact；格式错误、旧Body265
+或cold-start contact validity仍采用旧forward语义的artifact会被重建。输出使用
+原子替换，不将半成品当作完成阶段。
 
 VAE训练完成后：
 

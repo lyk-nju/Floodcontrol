@@ -46,10 +46,9 @@ def _fk_joint_valid_mask(
     valid[..., 0] = frame_valid_mask
     for joint in range(1, NUM_JOINTS):
         parent = HUMANML22_PARENTS[joint]
-        parent_valid = valid[..., parent]
-        if parent > 0:
-            parent_valid = parent_valid & rotation_valid_mask[..., parent - 1]
-        valid[..., joint] = parent_valid
+        valid[..., joint] = (
+            valid[..., parent] & rotation_valid_mask[..., joint - 1]
+        )
     return valid
 
 

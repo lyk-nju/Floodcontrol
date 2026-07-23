@@ -140,6 +140,8 @@ def test_body259_velocity_uses_current_heading_backward_difference():
     assert torch.allclose(parts["joint_velocities"], expected_local, atol=1e-6)
     assert not valid[:, 0, VELOCITY_SLICE].any()
     assert valid[:, 1:, VELOCITY_SLICE].all()
+    assert not valid[:, 0, CONTACT_SLICE].any()
+    assert valid[:, 1:, CONTACT_SLICE].all()
 
 
 def test_heading_frame_rotation6d_is_orthogonal_and_world_relation_is_a_eq_rb():

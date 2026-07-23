@@ -28,7 +28,7 @@ data:
     - ${dirs.raw_data}/HumanML3D_motion_local/val.txt
   artifact_path: artifacts
   text_path: null
-  train_batch_size: 256
+  train_batch_size: 128
   val_batch_size: 128
   num_workers: 16
   min_frames: 20

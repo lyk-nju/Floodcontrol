@@ -152,7 +152,7 @@ def test_independent_prediction_types_share_one_clean_endpoint_contract(
         model,
     )
     model._predict_body = types.MethodType(
-        lambda self, call_inputs, condition, local, valid, heading: raw_body,
+        lambda self, call_inputs, condition, local, valid: raw_body,
         model,
     )
     prediction = model(inputs)
@@ -207,7 +207,7 @@ def test_root_x0_solver_uses_raw_endpoint_and_commit_projects_heading():
         model,
     )
     model._predict_body = types.MethodType(
-        lambda self, call_inputs, condition, local, valid, heading: raw_body,
+        lambda self, call_inputs, condition, local, valid: raw_body,
         model,
     )
 
@@ -440,14 +440,50 @@ def test_bfloat16_text_runs_with_float32_model_without_autocast():
     assert output.solver_velocity.root_motion.dtype == torch.float32
 
 
-def test_body_heading_is_derived_from_clean_root():
-    model = make_model()
+def test_body_stage_does_not_read_absolute_root_heading():
+    model = make_model().eval()
     inputs = make_input(batch=1, tokens=4)
-    clean = torch.zeros_like(inputs.noisy_motion.root_motion)
-    clean[..., 3] = 0
-    clean[..., 4] = 1
-    heading = model._body_heading_condition(clean, inputs)
-    assert torch.allclose(heading, torch.tensor([[0.0, 1.0]]))
+    rotated_root = inputs.noisy_motion.root_motion.clone()
+    rotated_root[..., 3] = 0.0
+    rotated_root[..., 4] = 1.0
+    rotated = LDFInput(
+        **{
+            **inputs.__dict__,
+            "noisy_motion": HybridMotion(
+                rotated_root,
+                inputs.noisy_motion.latent_motion,
+            ),
+        }
+    )
+    local = torch.randn(1, 4, 4, 4)
+    local_valid = torch.ones_like(local, dtype=torch.bool)
+    with torch.no_grad():
+        original = model.body_transformer(
+            inputs, inputs.condition, local, local_valid
+        )
+        changed = model.body_transformer(
+            rotated, rotated.condition, local, local_valid
+        )
+    assert torch.equal(original, changed)
+
+
+def test_body_observations_fail_until_read_only_projection_is_implemented():
+    model = make_model().eval()
+    inputs = make_input(batch=1, tokens=4)
+    condition = LDFCondition(
+        inputs.condition.text_context,
+        inputs.condition.text_null_context,
+        body_condition_value=torch.zeros_like(
+            inputs.noisy_motion.latent_motion
+        ),
+        body_condition_mask=torch.ones_like(
+            inputs.noisy_motion.latent_motion,
+            dtype=torch.bool,
+        ),
+    )
+    conditioned = LDFInput(**{**inputs.__dict__, "condition": condition})
+    with pytest.raises(NotImplementedError, match="body observations"):
+        model(conditioned)
 
 
 def test_future_root_uses_generation_centered_rope_without_extending_body():

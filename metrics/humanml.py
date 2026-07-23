@@ -163,7 +163,9 @@ def convert_root5_body259_to_humanml263(
         ),
         joint_displacement,
     ).flatten(-2)
-    contacts = parts["foot_contacts"][:, :-1]
+    # Body259 row t describes t-1 -> t, whereas HumanML row t describes
+    # t -> t+1.  Shift back to HumanML's forward-transition convention.
+    contacts = parts["foot_contacts"][:, 1:]
 
     exact = torch.cat(
         [

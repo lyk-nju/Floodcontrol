@@ -231,7 +231,7 @@ class TransformerStage(nn.Module):
 
 
 class RootTransformer(TransformerStage):
-    """Predict normalized explicit-root velocity from the full hybrid state."""
+    """Predict native explicit-root output under the configured prediction type."""
 
     def __init__(
         self,
@@ -440,7 +440,12 @@ class BodyTransformer(TransformerStage):
         time_embedding_scale: float,
     ):
         local_patch_dim = FRAMES_PER_TOKEN * LOCAL_ROOT_DIM
-        input_dim = latent_dim + local_patch_dim + LOCAL_ROOT_DIM * FRAMES_PER_TOKEN + 2 + 3
+        input_dim = (
+            latent_dim
+            + local_patch_dim
+            + LOCAL_ROOT_DIM * FRAMES_PER_TOKEN
+            + 3
+        )
         super().__init__(
             input_dim=input_dim,
             output_dim=latent_dim,
@@ -461,23 +466,19 @@ class BodyTransformer(TransformerStage):
         condition: LDFCondition,
         normalized_local_root: torch.Tensor,
         local_root_valid: torch.Tensor,
-        body_heading_condition: torch.Tensor,
     ) -> torch.Tensor:
         latent = inputs.noisy_motion.latent_motion
-        body_value, body_mask = _prepare_condition(
-            condition.body_condition_value,
-            condition.body_condition_mask,
-            latent,
-        )
-        latent_view = torch.where(body_mask, body_value, latent)
-        if tuple(body_heading_condition.shape) != (latent.shape[0], 2):
-            raise ValueError("body_heading_condition must be [B,2]")
+        if condition.body_condition_mask is not None and bool(
+            condition.body_condition_mask.any()
+        ):
+            raise NotImplementedError(
+                "body observations are not implemented as read-only conditions"
+            )
         stage_input = torch.cat(
             [
-                latent_view,
+                latent,
                 normalized_local_root.flatten(2),
                 local_root_valid.flatten(2).float(),
-                body_heading_condition[:, None].expand(-1, latent.shape[1], -1),
                 inputs.beta[..., None],
                 inputs.history_mask[..., None].float(),
                 inputs.generation_mask[..., None].float(),
@@ -700,29 +701,11 @@ class LDF(nn.Module):
         condition: LDFCondition,
         normalized_local_root: torch.Tensor,
         local_valid: torch.Tensor,
-        body_heading_condition: torch.Tensor,
     ) -> torch.Tensor:
         local_for_body = normalized_local_root.detach() if self.training else normalized_local_root
-        heading_for_body = (
-            body_heading_condition.detach() if self.training else body_heading_condition
-        )
         return self.body_transformer(
-            inputs, condition, local_for_body, local_valid, heading_for_body
+            inputs, condition, local_for_body, local_valid
         )
-
-    def _body_heading_condition(
-        self, clean_root: torch.Tensor, inputs: LDFInput
-    ) -> torch.Tensor:
-        """Get absolute heading from the first valid clean root frame.
-
-        The value is derived only from the authoritative Root Stage result.  It
-        never reads a raw root constraint directly.
-        """
-        valid = inputs.history_mask | inputs.generation_mask
-        first_token = valid.to(torch.int64).argmax(dim=1)
-        batch_index = torch.arange(clean_root.shape[0], device=clean_root.device)
-        root_frame = clean_root[batch_index, first_token, 0]
-        return project_root_heading(root_frame)[..., 3:5]
 
     def _build_prediction(
         self,
@@ -760,9 +743,8 @@ class LDF(nn.Module):
             inputs.previous_root_frame,
             inputs.previous_root_valid_mask,
         )
-        heading = self._body_heading_condition(clean_root, inputs)
         raw_body_output = self._predict_body(
-            inputs, inputs.condition, normalized_local, local_valid, heading
+            inputs, inputs.condition, normalized_local, local_valid
         )
         return self._build_prediction(
             inputs,
@@ -840,31 +822,29 @@ class LDF(nn.Module):
             inputs.previous_root_frame,
             inputs.previous_root_valid_mask,
         )
-        heading = self._body_heading_condition(clean_root, inputs)
-
         if mode == "nocfg":
             raw_body_output = self._predict_body(
-                inputs, branches["joint"], normalized_local, local_valid, heading
+                inputs, branches["joint"], normalized_local, local_valid
             )
         elif mode == "joint":
             body_history = self._predict_body(
-                inputs, branches["history"], normalized_local, local_valid, heading
+                inputs, branches["history"], normalized_local, local_valid
             )
             body_joint = self._predict_body(
-                inputs, branches["joint"], normalized_local, local_valid, heading
+                inputs, branches["joint"], normalized_local, local_valid
             )
             raw_body_output = body_history + float(scale_joint) * (
                 body_joint - body_history
             )
         else:
             body_history = self._predict_body(
-                inputs, branches["history"], normalized_local, local_valid, heading
+                inputs, branches["history"], normalized_local, local_valid
             )
             body_text = self._predict_body(
-                inputs, branches["text"], normalized_local, local_valid, heading
+                inputs, branches["text"], normalized_local, local_valid
             )
             body_constraint = self._predict_body(
-                inputs, branches["constraint"], normalized_local, local_valid, heading
+                inputs, branches["constraint"], normalized_local, local_valid
             )
             raw_body_output = self._compose_cfg(
                 body_history,

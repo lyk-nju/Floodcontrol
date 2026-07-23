@@ -70,6 +70,7 @@ def stream_reconstruct(
 
     device = torch.device(device)
     body = sample.body_motion[None].to(device)
+    body_feature_valid = sample.body_feature_valid_mask[None].to(device)
     root = sample.root_motion[None].to(device)
     frame_valid = torch.ones(body.shape[:2], dtype=torch.bool, device=device)
     previous_root = (
@@ -82,7 +83,11 @@ def stream_reconstruct(
         if previous_root is not None
         else None
     )
-    posterior_mu = model.encode(body, frame_valid).mu
+    posterior_mu = model.encode(
+        body,
+        frame_valid,
+        body_feature_valid_mask=body_feature_valid,
+    ).mu
     local_root, local_valid = recover_local_root(
         root,
         previous_root,
@@ -203,6 +208,7 @@ def rolling_reconstruct(
         raise ValueError("rolling VAE evaluation requires history_tokens > 0")
     device = torch.device(device)
     body = sample.body_motion[None].to(device)
+    body_feature_valid = sample.body_feature_valid_mask[None].to(device)
     root = sample.root_motion[None].to(device)
     frame_valid = torch.ones(body.shape[:2], dtype=torch.bool, device=device)
     previous_root = (
@@ -215,7 +221,11 @@ def rolling_reconstruct(
         if previous_root is not None
         else None
     )
-    posterior_mu = model.encode(body, frame_valid).mu
+    posterior_mu = model.encode(
+        body,
+        frame_valid,
+        body_feature_valid_mask=body_feature_valid,
+    ).mu
     local_root, local_valid = recover_local_root(
         root,
         previous_root,

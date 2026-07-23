@@ -145,7 +145,10 @@ class BodyVAE(nn.Module):
         return (local_root_motion - self.local_root_mean) / self.local_root_std
 
     def encode(
-        self, body_motion: torch.Tensor, frame_valid_mask: torch.Tensor
+        self,
+        body_motion: torch.Tensor,
+        frame_valid_mask: torch.Tensor,
+        body_feature_valid_mask: torch.Tensor | None = None,
     ) -> VAEPosterior:
         """Encode physical body motion into a raw posterior."""
 
@@ -156,11 +159,21 @@ class BodyVAE(nn.Module):
             or frame_valid_mask.dtype != torch.bool
         ):
             raise ValueError("frame_valid_mask must be bool [B,F]")
+        if body_feature_valid_mask is not None:
+            if tuple(body_feature_valid_mask.shape) != tuple(body_motion.shape):
+                raise ValueError(
+                    "body_feature_valid_mask must match body_motion [B,F,D]"
+                )
+            if body_feature_valid_mask.dtype != torch.bool:
+                raise TypeError("body_feature_valid_mask must be bool")
         if not bool(torch.isfinite(body_motion[frame_valid_mask]).all()):
             raise ValueError("valid body_motion frames contain non-finite values")
         normalized = self.normalize_body(body_motion)
+        feature_valid = frame_valid_mask[..., None]
+        if body_feature_valid_mask is not None:
+            feature_valid = feature_valid & body_feature_valid_mask
         normalized = torch.where(
-            frame_valid_mask[..., None], normalized, torch.zeros_like(normalized)
+            feature_valid, normalized, torch.zeros_like(normalized)
         )
         posterior = self.model.encode(normalized)
         if not bool(torch.isfinite(posterior.mu).all()):
@@ -220,7 +233,11 @@ class BodyVAE(nn.Module):
         if not isinstance(inputs, VAEInput):
             raise TypeError("BodyVAE.forward requires VAEInput")
         inputs.validate()
-        posterior = self.encode(inputs.body_motion, inputs.frame_valid_mask)
+        posterior = self.encode(
+            inputs.body_motion,
+            inputs.frame_valid_mask,
+            inputs.body_feature_valid_mask,
+        )
         latent = posterior.sample()
         local_root, local_valid = recover_local_root(
             inputs.root_motion,
@@ -238,9 +255,16 @@ class BodyVAE(nn.Module):
 
     @torch.no_grad()
     def tokenize(
-        self, body_motion: torch.Tensor, frame_valid_mask: torch.Tensor
+        self,
+        body_motion: torch.Tensor,
+        frame_valid_mask: torch.Tensor,
+        body_feature_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.encode(body_motion, frame_valid_mask).mu
+        return self.encode(
+            body_motion,
+            frame_valid_mask,
+            body_feature_valid_mask,
+        ).mu
 
     @torch.no_grad()
     def tokenize_window(
@@ -248,6 +272,7 @@ class BodyVAE(nn.Module):
         body_with_context: torch.Tensor,
         frame_valid_mask: torch.Tensor,
         context_token_count: torch.Tensor,
+        body_feature_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode active motion as raw deterministic posterior means.
 
@@ -271,6 +296,13 @@ class BodyVAE(nn.Module):
             raise ValueError("frame_valid_mask must match body_with_context [B,F]")
         if frame_valid_mask.dtype != torch.bool:
             raise TypeError("frame_valid_mask must be bool [B,F]")
+        if body_feature_valid_mask is not None:
+            if tuple(body_feature_valid_mask.shape) != tuple(body_with_context.shape):
+                raise ValueError(
+                    "body_feature_valid_mask must match body_with_context [B,F,D]"
+                )
+            if body_feature_valid_mask.dtype != torch.bool:
+                raise TypeError("body_feature_valid_mask must be bool")
 
         frame_patches = frame_valid_mask.reshape(
             batch, total_tokens, FRAMES_PER_TOKEN
@@ -298,7 +330,11 @@ class BodyVAE(nn.Module):
         active_valid = active_offsets[None] < active_token_count[:, None]
         safe_index = gather_index.clamp(max=total_tokens - 1)
 
-        posterior = self.encode(body_with_context, frame_valid_mask)
+        posterior = self.encode(
+            body_with_context,
+            frame_valid_mask,
+            body_feature_valid_mask,
+        )
         latent_index = safe_index[..., None].expand(
             batch, max_active_tokens, posterior.mu.shape[-1]
         )

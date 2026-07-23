@@ -281,6 +281,7 @@ def build_motion(
     *,
     fps: float = 20.0,
     previous_positions: torch.Tensor | None = None,
+    foot_contact_valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build physical root5/body259 from world-space skeleton features.
 
@@ -290,9 +291,14 @@ def build_motion(
             matrices ``[B, F, 21, 3, 3]``.
         root_positions: World root translation ``[B, F, 3]``.
         root_yaw: Physical yaw ``[B, F]`` where zero faces +Z.
-        foot_contacts: Binary contacts ``[B, F, 4]``.
+        foot_contacts: Binary backward/current contacts ``[B, F, 4]``. Contact
+            row ``t`` describes the transition from frame ``t-1`` to ``t``.
         fps: Motion frame rate.
         previous_positions: Optional preceding world joints ``[B, 22, 3]``.
+        foot_contact_valid_mask: Optional contact validity ``[B,F,4]``. When
+            omitted it is inferred from the corresponding foot-velocity
+            validity. A true sequence start has no preceding transition and
+            is therefore invalid in its first row.
 
     Returns:
         ``(root_motion, body_motion, body_feature_valid_mask)`` with shapes
@@ -318,6 +324,11 @@ def build_motion(
         raise ValueError("root_yaw must be [B,F]")
     if tuple(foot_contacts.shape) != (batch, frames, BODY_CONTACT_DIM):
         raise ValueError("foot_contacts must be [B,F,4]")
+    if foot_contact_valid_mask is not None:
+        if tuple(foot_contact_valid_mask.shape) != tuple(foot_contacts.shape):
+            raise ValueError("foot_contact_valid_mask must match foot_contacts")
+        if foot_contact_valid_mask.dtype != torch.bool:
+            raise TypeError("foot_contact_valid_mask must be bool")
     for name, value in (
         ("global_positions", global_positions),
         ("heading_frame_rotations", heading_frame_rotations),
@@ -386,6 +397,15 @@ def build_motion(
     )
     feature_valid = torch.ones_like(body_motion, dtype=torch.bool)
     feature_valid[..., VELOCITY_SLICE] = velocity_valid.flatten(-2)
+    if foot_contact_valid_mask is None:
+        foot_indices = torch.as_tensor(
+            FOOT_JOINT_INDICES,
+            device=velocity_valid.device,
+        )
+        foot_contact_valid_mask = velocity_valid.index_select(
+            -2, foot_indices
+        ).all(dim=-1)
+    feature_valid[..., CONTACT_SLICE] = foot_contact_valid_mask
     return project_root_heading(root_motion), body_motion, feature_valid
 
 

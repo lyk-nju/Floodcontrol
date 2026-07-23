@@ -35,7 +35,7 @@ def test_vae_training_package_exports_model_specific_components():
 
 def test_formal_vae_training_config_matches_frozen_recipe():
     cfg = load_config(str(ROOT / "configs" / "vae.yaml"))
-    assert cfg.trainer.max_steps == 300_000
+    assert cfg.trainer.max_steps == 500_000
     assert cfg.trainer.devices == 1
     assert cfg.trainer.strategy == "auto"
     assert cfg.wandb_info.project == "VAE_Flood"

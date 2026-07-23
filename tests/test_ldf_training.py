@@ -142,12 +142,16 @@ def _make_config(tmp_path, *, chunk_size=1, noise_steps=1):
 def _make_step_batch():
     root = torch.zeros(1, 8, 5)
     root[..., 3] = 1.0
+    body_with_context = torch.randn(1, 8, 259)
     return {
         "root_motion": root,
         "body_motion": torch.randn(1, 8, 259),
         "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
-        "body_with_context": torch.randn(1, 8, 259),
+        "body_with_context": body_with_context,
         "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        "body_with_context_feature_valid_mask": torch.ones_like(
+            body_with_context, dtype=torch.bool
+        ),
         "context_token_count": torch.zeros(1, dtype=torch.long),
         "previous_root_frame": torch.zeros(1, 5),
         "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
@@ -378,6 +382,7 @@ def test_create_clean_motion_aligns_root_latent_and_padding(tmp_path):
     module = LDFLightningModule(_make_config(tmp_path)).eval()
     body_with_context = torch.randn(2, 8, 259)
     encoder_frame_valid = torch.ones(2, 8, dtype=torch.bool)
+    encoder_feature_valid = torch.ones_like(body_with_context, dtype=torch.bool)
     context_count = torch.tensor([0, 1], dtype=torch.long)
     root = torch.zeros(2, 8, 5)
     root[..., 3] = 1.0
@@ -394,11 +399,15 @@ def test_create_clean_motion_aligns_root_latent_and_padding(tmp_path):
         "frame_valid_mask": frame_valid,
         "body_with_context": body_with_context,
         "body_with_context_frame_valid_mask": encoder_frame_valid,
+        "body_with_context_feature_valid_mask": encoder_feature_valid,
         "context_token_count": context_count,
     }
 
     expected_latent = module.vae.tokenize_window(
-        body_with_context, encoder_frame_valid, context_count
+        body_with_context,
+        encoder_frame_valid,
+        context_count,
+        body_feature_valid_mask=encoder_feature_valid,
     )
     motion, token_valid = module._create_clean_motion(batch)
 
@@ -712,12 +721,16 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
     module = LDFLightningModule(_make_config(tmp_path)).train()
     root = torch.zeros(1, 8, 5)
     root[..., 3] = 1.0
+    body_with_context = torch.randn(1, 8, 259)
     batch = {
         "root_motion": root,
         "body_motion": torch.randn(1, 8, 259),
         "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
-        "body_with_context": torch.randn(1, 8, 259),
+        "body_with_context": body_with_context,
         "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        "body_with_context_feature_valid_mask": torch.ones_like(
+            body_with_context, dtype=torch.bool
+        ),
         "context_token_count": torch.zeros(1, dtype=torch.long),
         "previous_root_frame": torch.zeros(1, 5),
         "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),
@@ -785,12 +798,16 @@ def test_validation_plan_and_noise_are_repeatable_with_fixed_generator(tmp_path)
     module = LDFLightningModule(_make_config(tmp_path)).eval()
     root = torch.zeros(1, 8, 5)
     root[..., 3] = 1.0
+    body_with_context = torch.randn(1, 8, 259)
     batch = {
         "root_motion": root,
         "body_motion": torch.randn(1, 8, 259),
         "frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
-        "body_with_context": torch.randn(1, 8, 259),
+        "body_with_context": body_with_context,
         "body_with_context_frame_valid_mask": torch.ones(1, 8, dtype=torch.bool),
+        "body_with_context_feature_valid_mask": torch.ones_like(
+            body_with_context, dtype=torch.bool
+        ),
         "context_token_count": torch.zeros(1, dtype=torch.long),
         "previous_root_frame": torch.zeros(1, 5),
         "previous_root_valid_mask": torch.zeros(1, dtype=torch.bool),

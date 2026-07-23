@@ -13,7 +13,7 @@ body_motion [F,259]
   [0:63]    21个非Root关节的root-heading-local位置
   [63:189]  21个非Root关节的heading-frame cumulative IK rotation6d
   [189:255] 22个关节的current-heading-local backward velocity
-  [255:259] 4维foot contact
+  [255:259] 4维backward/current foot contact
 ```
 
 `Root5`是世界XYZ平移和绝对heading yaw的唯一所有者，不包含root pitch/roll。
@@ -25,7 +25,10 @@ p_world(t,j) = p_world(t,root) + R_t p_body(t,j)
 v_body(t,j) = R_t^T (p_world(t,j) - p_world(t-1,j)) * 20
 ```
 
-位置减去完整root XYZ，因此Body不携带绝对高度。速度使用当前帧heading、backward difference和m/s单位；cold-start第一帧速度置零且mask为false。Body中的root joint velocity只是重建/诊断信息，最终root运动始终由Root5决定。
+位置减去完整root XYZ，因此Body不携带绝对高度。速度使用当前帧heading、backward
+difference和m/s单位。contact row `t`与velocity row `t`共享同一时间语义，均描述
+`t-1 -> t`；真实cold-start第一帧的velocity与contact置零且mask为false。Body中的
+root joint velocity只是重建/诊断信息，最终root运动始终由Root5决定。
 
 世界平移或统一世界yaw只改变Root5；Body259保持数值不变。这是数据合同，不是近似增强目标。VAE/LDF collator的translation rebase和random yaw因此都只能修改Root5，不能旋转Body block。
 
@@ -58,10 +61,10 @@ Body259保存`B_j`的矩阵前两列6D，名称固定为`heading-frame cumulativ
 VAE只编码Body259，root不进入encoder：
 
 ```text
-encode()            physical Body259 -> raw posterior(mu, logvar)
+encode()            physical Body259 + frame/feature validity -> raw posterior(mu, logvar)
 decode()            raw latent + physical local-root4 -> physical Body259
 tokenize()          physical Body259 -> deterministic raw mu
-tokenize_window()   real context + active Body259 -> active raw mu
+tokenize_window()   real context + active Body259 + feature validity -> active raw mu
 detokenize()        raw mu + physical local-root4 -> Body259
 detokenize_step()   one raw mu token + explicit cache -> four physical frames
 ```
@@ -83,7 +86,11 @@ body_cont_mean/std  [255]
 local_root_mean/std [4]
 ```
 
-contacts保持0/1。statistics仅从HumanML train split计算；HumanML+BABEL VAE也复用同一组HumanML statistics。训练checkpoint自包含四个buffer；LDF/runtime通过公共loader加载EMA encoder+decoder，不读取统计NPZ。
+contacts保持0/1。连续值归一化后，所有feature-invalid输入（包括真实序列起点的
+velocity/contact）必须清零，不能把`(0-mean)/std`作为真实encoder信号。
+statistics仅从HumanML train split计算；HumanML+BABEL VAE也复用同一组HumanML
+statistics。训练checkpoint自包含四个buffer；LDF/runtime通过公共loader加载EMA
+encoder+decoder，不读取统计NPZ。
 
 ## 4. Token与causal合同
 
@@ -96,7 +103,10 @@ contacts保持0/1。statistics仅从HumanML train split计算；HumanML+BABEL VA
 
 ## 5. Loss与诊断
 
-基础重建分别对position、rotation、velocity做masked normalized SmoothL1，并对contact做BCE。position-derived skating只约束接触脚的世界位置速度，不代表脚方向或FK一致性。
+基础重建分别对position、rotation、velocity做masked normalized SmoothL1，并对
+backward/current contact做masked BCE。position-derived skating使用同一帧的
+`t-1 -> t`脚速与contact，因此真实序列第一帧不参与；它只约束接触脚的世界位置
+速度，不代表脚方向或FK一致性。
 
 正式训练持续记录posterior `mu` mean/RMS/channel std、logvar、KL、active latent fraction和sigma。VAE评测至少报告：
 
@@ -167,9 +177,11 @@ HumanML263
 | HumanML root block | `6.03e-7` |
 | parent-local rotation6d | `6.11e-7` |
 
-contacts逐元素不变。velocity没有要求逐元素严格闭环：逆转换按恢复后的world position
-重新计算官方forward velocity，而不是复制源263D中的冗余velocity。该策略保证评测
-velocity与恢复后的几何一致。
+HumanML contact row `t`描述`t -> t+1`，转换时平移为Body row `t+1`，逆转换再按
+相反方向平移，因此最终HumanML contact逐元素闭环；Body cold-start contact本身无效。
+velocity没有要求逐元素严格闭环：逆转换按恢复后的world position重新计算官方
+forward velocity，而不是复制源263D中的冗余velocity。该策略保证评测velocity与
+恢复后的几何一致。
 
 ### 8.2 32样本早期T2M冒烟
 

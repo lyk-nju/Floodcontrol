@@ -33,7 +33,10 @@ import numpy as np
 
 from datasets.babel import BABELDataset
 from datasets.humanml3d import HumanML3DDataset
-from tools.build_motion_artifact import atomic_write_text
+from tools.build_motion_artifact import (
+    artifact_arrays_are_current,
+    atomic_write_text,
+)
 from tools.pretokenize_t5_text import collect_unique_captions
 from utils.initialize import load_config
 from utils.motion_process import BODY_CONTINUOUS_DIM, BODY_DIM, ROOT_DIM
@@ -194,29 +197,12 @@ def _validate_motion_artifact(path: Path) -> int:
         root_motion = np.asarray(sample["root_motion"])
         body_motion = np.asarray(sample["body_motion"])
         feature_mask = np.asarray(sample["body_feature_valid_mask"])
-        if (
-            root_motion.ndim != 2
-            or root_motion.shape[-1] != ROOT_DIM
-            or root_motion.dtype != np.float32
-            or body_motion.ndim != 2
-            or body_motion.shape[-1] != BODY_DIM
-            or body_motion.dtype != np.float32
-            or feature_mask.shape != body_motion.shape
-            or feature_mask.dtype != np.bool_
-            or root_motion.shape[0] != body_motion.shape[0]
-            or root_motion.shape[0] < 4
-            or root_motion.shape[0] % 4
+        if not artifact_arrays_are_current(
+            root_motion,
+            body_motion,
+            feature_mask,
         ):
-            raise ValueError(f"invalid root5/body259 shapes or dtypes at {path}")
-        if not np.isfinite(root_motion).all() or not np.isfinite(body_motion).all():
-            raise ValueError(f"non-finite motion artifact at {path}")
-        if not np.allclose(
-            np.linalg.norm(root_motion[:, 3:5], axis=-1),
-            1.0,
-            atol=1e-5,
-            rtol=0.0,
-        ):
-            raise ValueError(f"non-unit root heading at {path}")
+            raise ValueError(f"motion artifact violates current Body259 contract at {path}")
     return int(root_motion.shape[0])
 
 

@@ -13,7 +13,12 @@ from tools.convert_motion_263_to_259 import (
     HUMANML_DIM,
     convert_motion_263_to_259,
 )
-from utils.motion_process import BODY_DIM, ROOT_DIM
+from utils.motion_process import (
+    BODY_DIM,
+    CONTACT_SLICE,
+    ROOT_DIM,
+    VELOCITY_SLICE,
+)
 from utils.token_frame import FRAMES_PER_TOKEN, aligned_frame_floor
 
 
@@ -32,6 +37,50 @@ def atomic_copy(source: Path, target: Path) -> None:
         temporary.replace(target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def artifact_arrays_are_current(
+    root: np.ndarray,
+    body: np.ndarray,
+    valid: np.ndarray,
+) -> bool:
+    """Validate the complete minimal artifact contract without metadata.
+
+    The cold-start validity pattern is intentionally part of the numeric
+    contract.  Besides rejecting malformed arrays, it distinguishes the
+    backward/current contact representation from older Body259 artifacts that
+    copied HumanML's forward contact labels unchanged.
+    """
+
+    if (
+        root.ndim != 2
+        or root.shape[-1] != ROOT_DIM
+        or root.dtype != np.float32
+        or body.ndim != 2
+        or body.shape[-1] != BODY_DIM
+        or body.dtype != np.float32
+        or valid.shape != body.shape
+        or valid.dtype != np.bool_
+        or root.shape[0] != body.shape[0]
+        or root.shape[0] < FRAMES_PER_TOKEN
+        or root.shape[0] % FRAMES_PER_TOKEN != 0
+        or not np.isfinite(root).all()
+        or not np.isfinite(body).all()
+    ):
+        return False
+    heading_norm = np.linalg.norm(root[:, 3:5], axis=-1)
+    if not np.allclose(heading_norm, 1.0, atol=1e-5, rtol=0.0):
+        return False
+    if not valid[:, : VELOCITY_SLICE.start].all():
+        return False
+    if valid[0, VELOCITY_SLICE].any() or valid[0, CONTACT_SLICE].any():
+        return False
+    if not valid[1:, VELOCITY_SLICE].all() or not valid[1:, CONTACT_SLICE].all():
+        return False
+    return bool(
+        np.allclose(body[0, VELOCITY_SLICE], 0.0)
+        and np.allclose(body[0, CONTACT_SLICE], 0.0)
+    )
 
 
 def artifact_is_current(source: Path, target: Path, *, fps: float) -> bool:
@@ -56,23 +105,7 @@ def artifact_is_current(source: Path, target: Path, *, fps: float) -> bool:
             root = np.asarray(data["root_motion"])
             body = np.asarray(data["body_motion"])
             valid = np.asarray(data["body_feature_valid_mask"])
-            heading_norm = np.linalg.norm(root[:, 3:5], axis=-1)
-            return bool(
-                root.ndim == 2
-                and root.shape[-1] == ROOT_DIM
-                and root.dtype == np.float32
-                and body.ndim == 2
-                and body.shape[-1] == BODY_DIM
-                and body.dtype == np.float32
-                and valid.shape == body.shape
-                and valid.dtype == np.bool_
-                and root.shape[0] == body.shape[0]
-                and root.shape[0] >= FRAMES_PER_TOKEN
-                and root.shape[0] % FRAMES_PER_TOKEN == 0
-                and np.isfinite(root).all()
-                and np.isfinite(body).all()
-                and np.allclose(heading_norm, 1.0, atol=1e-5, rtol=0.0)
-            )
+            return artifact_arrays_are_current(root, body, valid)
     except (IndexError, KeyError, OSError, ValueError):
         return False
 
@@ -107,6 +140,7 @@ def process_file(source: Path, target: Path, *, fps: float = 20.0) -> dict:
 
 
 __all__ = [
+    "artifact_arrays_are_current",
     "artifact_is_current",
     "atomic_copy",
     "atomic_write_text",

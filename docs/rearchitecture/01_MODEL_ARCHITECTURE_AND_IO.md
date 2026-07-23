@@ -363,6 +363,12 @@ shared conditions:
 
 `LOCKED`：Body stage 不再接收 noisy `root_t` 作为第二个 root source；root constraint只影响 Root Transformer 的条件分支，Root Transformer预测的 clean root dynamics通过 `LocalRootMotionCodec` 唯一进入 body generation。
 
+Body259和raw VAE `mu`对统一世界yaw严格不变，因此Body stage也不得重新读取窗口级
+absolute heading。它只读取由clean Root5派生的
+`[yaw_rate, current-heading-local vx, vz, root_y]`；世界绝对heading仅由Root Stage
+拥有。当前V1尚未实现稀疏body observation的只读projection，非空
+`body_condition_mask`必须明确失败，禁止用hard overwrite临时替代条件建模。
+
 Body Transformer 与 Root Transformer参数独立，采用 non-causal window attention，并输出：
 
 ```text

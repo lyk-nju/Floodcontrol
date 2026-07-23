@@ -35,12 +35,15 @@ def _sample(frames: int = 12) -> MotionSample:
     root[:, 3] = 1.0
     body = torch.randn(frames, 259)
     body[:, 255:] = torch.randint(0, 2, (frames, 4)).float()
+    feature_valid = torch.ones_like(body, dtype=torch.bool)
+    body[0, 189:259] = 0.0
+    feature_valid[0, 189:259] = False
     return MotionSample(
         sample_id="sample",
         dataset="HumanML3D",
         root_motion=root,
         body_motion=body,
-        body_feature_valid_mask=torch.ones_like(body, dtype=torch.bool),
+        body_feature_valid_mask=feature_valid,
         previous_root_frame=None,
         fps=20.0,
     )
@@ -72,6 +75,26 @@ def test_stream_reconstruction_uses_deterministic_mu_and_matches_offline():
         "ankle_toe_length_mae_m",
     ):
         assert torch.isfinite(torch.tensor(metrics[name]))
+
+
+def test_reconstruction_contact_metrics_ignore_invalid_cold_start_row():
+    sample = _sample()
+    sample.body_motion[:, 255:] = 0.0
+    sample.body_motion[0, 255:] = 1.0
+    continuous = torch.zeros(1, sample.body_motion.shape[0], 255)
+    logits = torch.full((1, sample.body_motion.shape[0], 4), -100.0)
+    body = BodyPrediction(continuous, logits)
+    result = ReconstructionResult(
+        protocol="test",
+        posterior_mu=torch.zeros(1, 3, 8),
+        local_root_motion=torch.zeros(1, 3, 4, 4),
+        local_root_valid_mask=torch.ones(1, 3, 4, 4, dtype=torch.bool),
+        streamed_body=body,
+        offline_body=body,
+        stream_offline_max_abs=0.0,
+    )
+    metrics = reconstruction_metrics(sample, result)
+    assert metrics["contact_accuracy"] == 1.0
 
 
 def test_recover_joint_positions_adds_full_explicit_root_xyz():

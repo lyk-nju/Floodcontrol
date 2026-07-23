@@ -32,6 +32,25 @@ def test_four_frame_shapes_and_deterministic_tokenize():
     assert decoded.contact_logits.shape == (2, 12, 4)
 
 
+def test_encoder_ignores_feature_invalid_values():
+    model = make_model()
+    body = torch.randn(1, 8, 259)
+    changed = body.clone()
+    frame_mask = torch.ones(1, 8, dtype=torch.bool)
+    feature_mask = torch.ones_like(body, dtype=torch.bool)
+    feature_mask[:, :4, 189:259] = False
+    changed[:, :4, 189:259] = 1000.0
+
+    original = model.encode(body, frame_mask, feature_mask)
+    modified = model.encode(changed, frame_mask, feature_mask)
+    assert torch.equal(original.mu, modified.mu)
+    assert torch.equal(original.logvar, modified.logvar)
+    assert torch.equal(
+        model.tokenize(body, frame_mask, feature_mask),
+        original.mu,
+    )
+
+
 @pytest.mark.parametrize("kernel_size", [1, 2, 4])
 def test_causal_vae_rejects_unsafe_kernel_sizes(kernel_size):
     with pytest.raises(ValueError, match="odd and at least three"):
@@ -98,12 +117,14 @@ def test_tokenize_window_mixed_batch_gathers_active_tokens_and_zeros_padding(tmp
     )
     full_body = torch.randn(len(specs), 20 * 4, 259)
     full_mask = torch.ones(len(specs), 20 * 4, dtype=torch.bool)
-    full_posterior = model.encode(full_body, full_mask)
+    full_feature_mask = torch.ones_like(full_body, dtype=torch.bool)
+    full_posterior = model.encode(full_body, full_mask, full_feature_mask)
 
     window_tokens = [context + active for _, context, active in specs]
     max_window_tokens = max(window_tokens)
     body_with_context = torch.zeros(len(specs), max_window_tokens * 4, 259)
     window_mask = torch.zeros(len(specs), max_window_tokens * 4, dtype=torch.bool)
+    window_feature_mask = torch.zeros_like(body_with_context, dtype=torch.bool)
     for batch_index, (start, context, active) in enumerate(specs):
         source = full_body[
             batch_index,
@@ -111,10 +132,14 @@ def test_tokenize_window_mixed_batch_gathers_active_tokens_and_zeros_padding(tmp
         ]
         body_with_context[batch_index, : source.shape[0]] = source
         window_mask[batch_index, : source.shape[0]] = True
+        window_feature_mask[batch_index, : source.shape[0]] = True
 
     context_count = torch.tensor([item[1] for item in specs], dtype=torch.long)
     raw_mu = model.tokenize_window(
-        body_with_context, window_mask, context_count
+        body_with_context,
+        window_mask,
+        context_count,
+        body_feature_valid_mask=window_feature_mask,
     )
 
     max_active = max(item[2] for item in specs)

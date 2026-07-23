@@ -103,9 +103,15 @@ class VAEWindowCollator:
         batch_size = len(windows)
         body = torch.zeros(batch_size, max_frames, BODY_DIM)
         root = torch.zeros(batch_size, max_frames, ROOT_DIM)
+        # Padding remains mask-invalid, but every Root5 value must still be a
+        # structurally valid physical state.  A zero heading cannot be passed
+        # through world-position/FK diagnostics before masking, so use the
+        # neutral unit heading for padded frames.
+        root[..., 3] = 1.0
         frame_mask = torch.zeros(batch_size, max_frames, dtype=torch.bool)
         feature_mask = torch.zeros(batch_size, max_frames, BODY_DIM, dtype=torch.bool)
         previous = torch.zeros(batch_size, ROOT_DIM)
+        previous[..., 3] = 1.0
         previous_valid = torch.zeros(batch_size, dtype=torch.bool)
         for index, item in enumerate(windows):
             frames = int(item["body_motion"].shape[0])

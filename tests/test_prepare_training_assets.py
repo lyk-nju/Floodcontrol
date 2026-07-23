@@ -78,6 +78,9 @@ def test_pre_vae_pipeline_builds_and_resumes_all_non_t5_assets(tmp_path):
         assert human_motion["root_motion"].dtype == np.float32
         assert human_motion["body_motion"].dtype == np.float32
         assert human_motion["body_feature_valid_mask"].dtype == np.bool_
+        assert not human_motion["body_feature_valid_mask"][0, 189:259].any()
+        assert human_motion["body_feature_valid_mask"][1:, 189:259].all()
+        assert not human_motion["body_motion"][0, 189:259].any()
     fields = {"local_root_mean", "local_root_std", "body_cont_mean", "body_cont_std"}
     for path in (human / "motion_stats.npz",):
         with np.load(path, allow_pickle=False) as values:
@@ -102,6 +105,23 @@ def test_pre_vae_pipeline_builds_and_resumes_all_non_t5_assets(tmp_path):
         "humanml_motion_statistics",
     ):
         assert second_report["stages"][stage]["status"] == "reused"
+
+    # Old Body259 artifacts copied HumanML's forward contact without marking
+    # the true sequence start invalid.  The resumable pipeline must detect and
+    # rebuild that semantic mismatch even though shape and dtype still match.
+    artifact = human / "artifacts" / "human.npz"
+    with np.load(artifact, allow_pickle=False) as values:
+        arrays = {name: np.asarray(values[name]).copy() for name in values.files}
+    arrays["body_feature_valid_mask"][0, 255:259] = True
+    np.savez_compressed(artifact, **arrays)
+    main(arguments)
+    third_report = json.loads(report_path.read_text())
+    assert third_report["stages"]["humanml_motion"]["status"] == "completed"
+    assert third_report["stages"]["babel_motion"]["status"] == "reused"
+    assert (
+        third_report["stages"]["humanml_motion_statistics"]["status"]
+        == "reused"
+    )
 
 
 def test_verify_uses_a_self_contained_ema_vae_checkpoint(tmp_path):

@@ -14,7 +14,7 @@ Floodcontrol target layout:
     body259 = heading-local non-root positions [63]
             + heading-frame cumulative IK rotation6d [126]
             + current-heading-local backward velocity [66]
-            + contacts [4]
+            + backward/current contacts [4]
 
 This module is an offline source adapter. Runtime models and datasets consume
 only the converted root5/body259 artifact and must not import this file.
@@ -185,16 +185,24 @@ def detect_foot_contacts(
     foot_joint_indices: tuple[int, int, int, int] = FOOT_JOINT_INDICES,
     height_threshold: float = 0.15,
     speed_threshold: float = 0.10,
-) -> torch.Tensor:
-    """Detect contacts for offline sources that do not supply contact labels."""
-    velocities, _ = compute_joint_velocities(global_positions, fps=fps)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Detect causal backward/current contacts and their validity.
+
+    Contact row ``t`` is derived from the transition ``t-1 -> t``.  At a true
+    sequence start there is no preceding frame, so the first contact row is
+    zero and invalid.
+    """
+    velocities, velocity_valid = compute_joint_velocities(global_positions, fps=fps)
     indices = torch.as_tensor(foot_joint_indices, device=global_positions.device)
     foot_positions = global_positions.index_select(-2, indices)
     foot_velocities = velocities.index_select(-2, indices)
-    return (
+    contact_valid = velocity_valid.index_select(-2, indices).all(dim=-1)
+    contacts = (
         (foot_positions[..., 1] < float(height_threshold))
         & (foot_velocities.norm(dim=-1) < float(speed_threshold))
     ).to(global_positions.dtype)
+    contacts = torch.where(contact_valid, contacts, torch.zeros_like(contacts))
+    return contacts, contact_valid
 
 
 def convert_motion_263_to_259(
@@ -233,7 +241,15 @@ def convert_motion_263_to_259(
         root_rotation.transpose(-1, -2)[..., None, :, :]
         @ humanml_cumulative_rotations[..., 1:, :, :]
     )
-    contacts = motion[..., HUMANML_CONTACT_SLICE]
+    # HumanML row t stores the forward transition t -> t+1.  Body259 freezes
+    # all dynamics to backward/current semantics, so shift the observable
+    # labels by one frame.  HumanML's final forward transition has no matching
+    # Body259 frame and is intentionally outside the exact inverse range.
+    humanml_contacts = motion[..., HUMANML_CONTACT_SLICE]
+    contacts = torch.zeros_like(humanml_contacts)
+    contact_valid = torch.zeros_like(humanml_contacts, dtype=torch.bool)
+    contacts[..., 1:, :] = humanml_contacts[..., :-1, :]
+    contact_valid[..., 1:, :] = True
     root, body, feature_valid = build_motion(
         global_positions,
         heading_frame_rotations,
@@ -241,6 +257,7 @@ def convert_motion_263_to_259(
         root_yaw,
         contacts,
         fps=fps,
+        foot_contact_valid_mask=contact_valid,
     )
     if squeeze:
         return root[0], body[0], feature_valid[0]

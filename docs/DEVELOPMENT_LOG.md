@@ -6065,3 +6065,140 @@
 - 等新Body259 VAE开始训练后，将真实validation MPJPE、source/reconstruction FK
   gap、rotation geodesic与reconstruction FID追加为模型实验；本轮不预设FK loss
   必须开启。
+
+## 2026-07-23 · VAE混合长度batch的Root5 padding修复
+
+改动类型：训练阻断bug修复 / 数据合同补强 / 回归测试
+
+实际改动内容：
+
+- 修复新Body259 VAE首次sanity validation在混合长度batch上报
+  `root heading must be non-zero`的问题。原因不是artifact损坏，而是collator把右侧
+  padding Root5补成全零，几何loss在mask归约前恢复world positions时先读取了无效的
+  `(cos,sin)=(0,0)`。
+- VAE collator现在将padded root和mask-invalid previous-root初始化为neutral physical
+  Root5：XYZ为零、heading为`(1,0)`。frame/feature/previous validity mask继续为false，
+  因此padding不参与loss；但张量本身始终满足Root5非零heading结构合同。
+- 增加回归断言，锁定混合8/12帧validation batch的所有Root5 heading均为单位向量，
+  padding和无效previous-root均为neutral heading。
+
+改动理由：
+
+- mask只决定数值是否进入最终归约，不应要求所有上游几何函数都能接受非法physical
+  placeholder。让padding保持“结构有效、语义无效”可同时保留严格Root5校验和批处理
+  几何/FK计算，不需要在`recover_root_yaw()`中放宽真实数据错误检查。
+
+验证：
+
+- `pytest tests/test_vae_data_pipeline.py tests/test_vae_loss.py tests/test_vae_validation_metrics.py -q`：
+  `17 passed`。
+- 修改文件`py_compile`与`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/vae/data.py`
+- `tests/test_vae_data_pipeline.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 失败的`20260723_033356_vae_body259`运行没有完成任何训练step；修复后需要重新启动
+  `train_vae.py`，无需重新生成HumanML/BABEL artifact或motion statistics。
+
+## 2026-07-23 · Body259动态语义、VAE有效性与Body Stage yaw合同修复
+
+改动类型：数据合同修复 / VAE输入修复 / LDF结构收口 / 诊断修复 / 回归测试
+
+实际改动内容：
+
+- 将Body259的foot contact冻结为与velocity一致的backward/current语义：Body row
+  `t`同时描述`t-1 -> t`速度和接触。HumanML forward contact在263D转259D时向后
+  平移一帧，真实序列第一帧contact置零且mask为false；回写HumanML evaluator格式时
+  执行严格逆平移。通用`build_motion()`在未显式提供contact validity时从脚部
+  backward velocity validity推导。
+- resumable artifact校验将cold-start velocity/contact的数值与validity模式纳入当前
+  Body259合同，因此旧forward-contact artifact即使shape/dtype相同也会被
+  `prepare_training_assets pre-vae`自动识别并重建，不依赖额外版本metadata。
+- VAE `encode()/tokenize()/tokenize_window()`新增可选逐feature validity输入。连续
+  特征归一化后按`frame_valid & feature_valid`清零，避免cold-start原始零速度经
+  normalization变成非零伪信号。VAE训练forward、LDF在线EMA编码和离线
+  reconstruction evaluation均已传入现有feature mask。
+- VAE reconstruction的contact accuracy/precision/recall/F1改为只统计有效contact，
+  与训练BCE和skating mask保持一致。
+- 从Body Transformer输入中删除窗口absolute heading及对应2维projection参数。
+  Body Stage现在只通过clean Root5派生的local-root4读取root动力学，使Body259/raw
+  VAE mu的global-yaw不变性成为结构性质。由于稀疏body observation尚无只读
+  projector，非空body mask现在明确`NotImplementedError`，不再hard overwrite
+  noisy latent state。
+- 修正VAE FK diagnostic的joint validity传播：每个非root joint现在要求parent chain
+  有效且该joint自己的cumulative rotation有效。同步修正Root Transformer过时的
+  velocity-only docstring。
+- 更新Body259、数据管线和两阶段LDF设计文档；补充HumanML contact双向平移、
+  feature-invalid encoder边界、Body Stage不得读取absolute heading以及body
+  observation fail-fast合同。
+- 补齐contact转换/检测/逆转换、feature-mask encoder不变性、FK current-joint
+  validity、Body global-yaw结构不变性、body observation fail-fast和LDF bridge
+  feature-mask传递测试。同步将正式VAE配置冻结测试的训练步数更新为当前实际
+  `500000`。
+
+改动理由：
+
+- 原HumanML contact描述`t -> t+1`，而Body velocity与skating使用`t-1 -> t`，直接
+  复制会使接触监督与脚速错开一帧，并让不同数据源产生两套时间合同。
+- 无效feature在归一化后不一定为零；只清整帧mask会让true cold-start encoder读取
+  数据合同明确标为无效的速度/contact。
+- Body latent已经对世界yaw不变，重复输入absolute heading既没有提供必要信息，又
+  迫使模型靠random-yaw augmentation学习忽略一个nuisance变量。
+- hard overwrite body observation会改变diffusion state/target配对；在正式实现只读
+  condition projection前应明确失败。
+
+验证：
+
+- 定向VAE/LDF测试：
+  `95 passed`。
+- 正式测试目录：
+  `PY=/home/yuankai/.conda/envs/flooddiffusion/bin/python ./scripts/run_pytest.sh tests -q`
+  得到`341 passed, 6 skipped`。
+- 修改Python文件`py_compile`通过，`git diff --check`通过。
+- 直接从仓库根运行裸`pytest -q`会额外收集gitignored的旧`debug/`实验脚本，并因
+  其中仍引用已删除Body265 adapter而在collection失败；正式测试入口`tests/`不包含
+  该私有调试目录。
+
+涉及文件：
+
+- `tools/convert_motion_263_to_259.py`
+- `tools/build_motion_artifact.py`
+- `tools/prepare_training_assets.py`
+- `utils/motion_process.py`
+- `metrics/humanml.py`
+- `models/vae_wan_1d.py`
+- `models/diffusion_forcing_wan.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/vae/metrics.py`
+- `utils/training/vae/evaluation/metrics.py`
+- `utils/training/vae/evaluation/reconstruction.py`
+- `tests/test_motion_local_contract.py`
+- `tests/test_prepare_training_assets.py`
+- `tests/test_vae_data_pipeline.py`
+- `tests/test_vae_model.py`
+- `tests/test_vae_eval.py`
+- `tests/test_vae_validation_metrics.py`
+- `tests/test_vae_training.py`
+- `tests/test_ldf_forward.py`
+- `tests/test_ldf_cfg.py`
+- `tests/test_ldf_training.py`
+- `docs/rearchitecture/01_MODEL_ARCHITECTURE_AND_IO.md`
+- `docs/rearchitecture/02_DATA_PIPELINE.md`
+- `docs/rearchitecture/02_VAE_AND_BODY_REPRESENTATION.md`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- 已生成的`HumanML3D_motion_local`与`BABEL_motion_local`仍含旧forward contact，必须
+  重新运行`prepare_training_assets pre-vae`重建artifact；该命令会自动识别旧
+  cold-start contact mask。`motion_stats.npz`只统计前255维连续特征，不包含contact，
+  因此可安全复用，无需为本次contact平移重新计算。正在使用旧artifact启动的
+  Body259 VAE必须从头重启，不能继续使用旧数据合同训练。
+- 删除Body Transformer的2维absolute-heading输入改变了LDF input projection shape；
+  新LDF应按既定计划从头训练，旧LDF checkpoint不兼容。
+- 稀疏body observation仍未实现；本轮只把错误的hard overwrite改成明确fail-fast。
