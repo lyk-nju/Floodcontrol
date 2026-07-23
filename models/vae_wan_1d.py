@@ -101,6 +101,10 @@ class BodyVAE(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        # Standalone encode/decode and inference are strict by default.
+        # Lightning temporarily disables only the expensive tensor-value
+        # scans between configured numerical-validation steps.
+        self.numerical_validation_enabled = True
         self.latent_dim = int(latent_dim)
         self.fps = MOTION_FPS
         if (motion_stats_path is None) == (motion_statistics is None):
@@ -166,7 +170,9 @@ class BodyVAE(nn.Module):
                 )
             if body_feature_valid_mask.dtype != torch.bool:
                 raise TypeError("body_feature_valid_mask must be bool")
-        if not bool(torch.isfinite(body_motion[frame_valid_mask]).all()):
+        if self.numerical_validation_enabled and not bool(
+            torch.isfinite(body_motion[frame_valid_mask]).all()
+        ):
             raise ValueError("valid body_motion frames contain non-finite values")
         normalized = self.normalize_body(body_motion)
         feature_valid = frame_valid_mask[..., None]
@@ -176,9 +182,13 @@ class BodyVAE(nn.Module):
             feature_valid, normalized, torch.zeros_like(normalized)
         )
         posterior = self.model.encode(normalized)
-        if not bool(torch.isfinite(posterior.mu).all()):
+        if self.numerical_validation_enabled and not bool(
+            torch.isfinite(posterior.mu).all()
+        ):
             raise ValueError("VAE posterior mu contains non-finite values")
-        if not bool(torch.isfinite(posterior.logvar).all()):
+        if self.numerical_validation_enabled and not bool(
+            torch.isfinite(posterior.logvar).all()
+        ):
             raise ValueError("VAE posterior logvar contains non-finite values")
         return posterior
 
@@ -191,9 +201,13 @@ class BodyVAE(nn.Module):
     ) -> BodyPrediction:
         """Decode raw latent tokens into physical body motion."""
 
-        if not bool(torch.isfinite(latent_tokens).all()):
+        if self.numerical_validation_enabled and not bool(
+            torch.isfinite(latent_tokens).all()
+        ):
             raise ValueError("latent_tokens contain non-finite values")
-        if not bool(torch.isfinite(local_root_motion).all()):
+        if self.numerical_validation_enabled and not bool(
+            torch.isfinite(local_root_motion).all()
+        ):
             raise ValueError("local_root_motion contains non-finite values")
 
         output = self.model.decode(
@@ -210,8 +224,9 @@ class BodyVAE(nn.Module):
     ) -> BodyPrediction:
         physical = output.continuous_body * self.body_cont_std + self.body_cont_mean
         contact_logits = output.contact_logits
-        if not bool(torch.isfinite(physical).all()) or not bool(
-            torch.isfinite(contact_logits).all()
+        if self.numerical_validation_enabled and (
+            not bool(torch.isfinite(physical).all())
+            or not bool(torch.isfinite(contact_logits).all())
         ):
             raise ValueError("VAE decoder produced non-finite values")
         if frame_valid_mask is not None:
@@ -233,6 +248,12 @@ class BodyVAE(nn.Module):
         if not isinstance(inputs, VAEInput):
             raise TypeError("BodyVAE.forward requires VAEInput")
         inputs.validate()
+        if self.numerical_validation_enabled:
+            valid_root = inputs.root_motion[inputs.frame_valid_mask]
+            if not bool(torch.isfinite(valid_root).all()):
+                raise ValueError("valid root_motion frames contain non-finite values")
+            if bool((valid_root[..., 3:5].square().sum(dim=-1) <= 1e-12).any()):
+                raise ValueError("valid root headings must be non-zero")
         posterior = self.encode(
             inputs.body_motion,
             inputs.frame_valid_mask,
@@ -370,9 +391,13 @@ class BodyVAE(nn.Module):
     ) -> tuple[VAEDecoderState, BodyPrediction]:
         """Decode one raw latent token with explicit causal caches."""
 
-        if not bool(torch.isfinite(latent_token).all()):
+        if self.numerical_validation_enabled and not bool(
+            torch.isfinite(latent_token).all()
+        ):
             raise ValueError("latent_token contains non-finite values")
-        if not bool(torch.isfinite(local_root_patch).all()):
+        if self.numerical_validation_enabled and not bool(
+            torch.isfinite(local_root_patch).all()
+        ):
             raise ValueError("local_root_patch contains non-finite values")
 
         next_caches, output = self.model.decode_step(

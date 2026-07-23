@@ -57,6 +57,39 @@ def test_heading_mask_must_be_paired():
         condition.validate(batch_size=1, token_length=2, latent_dim=8)
 
 
+def test_condition_compiler_can_skip_value_scans_but_keeps_structure_checks():
+    text, null = _text(tokens=1)
+    root = torch.zeros(1, 4, 5)
+    root[0, 0, 0] = float("nan")
+    mask = torch.zeros_like(root, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="finite"):
+        create_ldf_condition(
+            text_context=text,
+            text_null_context=null,
+            root_condition_value=root,
+            root_condition_mask=mask,
+        )
+
+    condition = create_ldf_condition(
+        text_context=text,
+        text_null_context=null,
+        root_condition_value=root,
+        root_condition_mask=mask,
+        validate_numerics=False,
+    )
+    assert torch.isnan(condition.root_condition_value).any()
+
+    with pytest.raises(TypeError, match="bool"):
+        create_ldf_condition(
+            text_context=text,
+            text_null_context=null,
+            root_condition_value=root,
+            root_condition_mask=mask.float(),
+            validate_numerics=False,
+        )
+
+
 def test_window_compile_packs_sparse_future_tokens_and_cfg_is_read_only():
     text, null = _text(tokens=4)
     active_root = torch.zeros(1, 16, 5)

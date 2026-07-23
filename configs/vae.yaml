@@ -60,7 +60,7 @@ loss:
   lambda_fk: 0.0
   lambda_position_consistency: 0.0
 
-  beta_kl: 1.0e-5
+  beta_kl: 1.0e-4
   kl_warmup_steps: 0
 
 optimizer:

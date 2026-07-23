@@ -94,6 +94,60 @@ def _mean_angle_degrees(
     return (angle * weight).sum() / weight.sum().clamp_min(1.0)
 
 
+def _unsigned_angle_degrees(
+    first_direction: torch.Tensor,
+    second_direction: torch.Tensor,
+) -> torch.Tensor:
+    first = torch.nn.functional.normalize(first_direction.float(), dim=-1)
+    second = torch.nn.functional.normalize(second_direction.float(), dim=-1)
+    cross = first[..., 0] * second[..., 1] - first[..., 1] * second[..., 0]
+    dot = (first * second).sum(dim=-1)
+    return torch.rad2deg(torch.atan2(cross.abs(), dot))
+
+
+def _signed_angle(
+    first_direction: torch.Tensor,
+    second_direction: torch.Tensor,
+) -> torch.Tensor:
+    first = torch.nn.functional.normalize(first_direction.float(), dim=-1)
+    second = torch.nn.functional.normalize(second_direction.float(), dim=-1)
+    cross = first[..., 0] * second[..., 1] - first[..., 1] * second[..., 0]
+    dot = (first * second).sum(dim=-1)
+    return torch.atan2(cross, dot)
+
+
+def _masked_scalar(
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    reduction: str,
+) -> torch.Tensor:
+    selected = value[mask]
+    if selected.numel() == 0:
+        return value.new_tensor(float("nan"))
+    if reduction == "mean":
+        return selected.mean()
+    if reduction == "max":
+        return selected.max()
+    if reduction == "p95":
+        return torch.quantile(selected.float(), 0.95)
+    raise ValueError(f"unsupported masked reduction {reduction!r}")
+
+
+def _relative_heading_error_degrees(
+    predicted_reference: torch.Tensor,
+    predicted_direction: torch.Tensor,
+    target_reference: torch.Tensor,
+    target_direction: torch.Tensor,
+) -> torch.Tensor:
+    predicted_relative = _signed_angle(
+        predicted_reference, predicted_direction
+    )
+    target_relative = _signed_angle(target_reference, target_direction)
+    delta = predicted_relative - target_relative
+    return torch.rad2deg(torch.atan2(torch.sin(delta), torch.cos(delta)).abs())
+
+
 def _root_forward_direction(root_motion: torch.Tensor) -> torch.Tensor:
     root = project_root_heading(root_motion)
     # root5 stores [cos(yaw), sin(yaw)], while a physical forward vector in
@@ -276,4 +330,143 @@ def compute_heading_metrics(
     }
 
 
-__all__ = ["compute_heading_metrics"]
+def compute_rollout_heading_metrics(
+    *,
+    predicted_root: torch.Tensor,
+    target_root: torch.Tensor,
+    predicted_body: torch.Tensor,
+    target_body: torch.Tensor,
+    frame_mask: torch.Tensor,
+    cold_frames: int = 4,
+) -> dict[str, torch.Tensor]:
+    """Measure the compact cold-start and full-rollout heading contract.
+
+    ``body_rel`` and ``feet_rel`` compare the generated-vs-GT relative
+    direction to Root. They deliberately do not force the rendered body or
+    feet to point in the same direction as Root, which would incorrectly
+    penalize side steps, backward walking, and turns.
+    """
+
+    if int(cold_frames) <= 0:
+        raise ValueError("cold_frames must be positive")
+    _validate_inputs(
+        predicted_root,
+        target_root,
+        predicted_body,
+        target_body,
+        frame_mask,
+        frame_mask,
+    )
+    root = _root_forward_direction(predicted_root)
+    target_root_direction = _root_forward_direction(target_root)
+    body, body_valid = _body_forward_direction(predicted_root, predicted_body)
+    target_body_direction, target_body_valid = _body_forward_direction(
+        target_root, target_body
+    )
+    feet, feet_valid = _foot_forward_directions(predicted_root, predicted_body)
+    target_feet, target_feet_valid = _foot_forward_directions(
+        target_root, target_body
+    )
+
+    root_angle = _unsigned_angle_degrees(root, target_root_direction)
+    body_angle = _unsigned_angle_degrees(body, target_body_direction)
+    feet_angle = _unsigned_angle_degrees(feet, target_feet)
+    body_relative = _relative_heading_error_degrees(
+        root,
+        body,
+        target_root_direction,
+        target_body_direction,
+    )
+    feet_relative = _relative_heading_error_degrees(
+        root[..., None, :].expand_as(feet),
+        feet,
+        target_root_direction[..., None, :].expand_as(target_feet),
+        target_feet,
+    )
+
+    root_mask = frame_mask
+    body_mask = frame_mask & body_valid & target_body_valid
+    feet_mask = frame_mask[..., None] & feet_valid & target_feet_valid
+    cold_mask = torch.zeros_like(frame_mask)
+    cold_mask[:, : min(int(cold_frames), frame_mask.shape[1])] = True
+    cold_root_mask = root_mask & cold_mask
+    cold_body_mask = body_mask & cold_mask
+    cold_feet_mask = feet_mask & cold_mask[..., None]
+
+    normalized_root = torch.nn.functional.normalize(root.float(), dim=-1)
+    normalized_target_root = torch.nn.functional.normalize(
+        target_root_direction.float(), dim=-1
+    )
+    root_antipodal = (
+        (normalized_root * normalized_target_root).sum(dim=-1) < -0.9
+    ).float()
+
+    normalized_feet = torch.nn.functional.normalize(feet.float(), dim=-1)
+    normalized_target_feet = torch.nn.functional.normalize(
+        target_feet.float(), dim=-1
+    )
+    predicted_reverse = (
+        normalized_feet
+        * normalized_root[..., None, :].expand_as(normalized_feet)
+    ).sum(dim=-1) < 0.0
+    target_reverse = (
+        normalized_target_feet
+        * normalized_target_root[..., None, :].expand_as(
+            normalized_target_feet
+        )
+    ).sum(dim=-1) < 0.0
+    excess_reverse = (predicted_reverse & ~target_reverse).float()
+
+    return {
+        "cold_root_deg": _masked_scalar(
+            root_angle, cold_root_mask, reduction="mean"
+        ),
+        "cold_root_max": _masked_scalar(
+            root_angle, cold_root_mask, reduction="max"
+        ),
+        "cold_root_anti": _masked_scalar(
+            root_antipodal, cold_root_mask, reduction="mean"
+        ),
+        "cold_body_deg": _masked_scalar(
+            body_angle, cold_body_mask, reduction="mean"
+        ),
+        "cold_feet_deg": _masked_scalar(
+            feet_angle, cold_feet_mask, reduction="mean"
+        ),
+        "roll_root_deg": _masked_scalar(
+            root_angle, root_mask, reduction="mean"
+        ),
+        "roll_root_p95": _masked_scalar(
+            root_angle, root_mask, reduction="p95"
+        ),
+        "roll_root_max": _masked_scalar(
+            root_angle, root_mask, reduction="max"
+        ),
+        "roll_root_anti": _masked_scalar(
+            root_antipodal, root_mask, reduction="mean"
+        ),
+        "roll_body_deg": _masked_scalar(
+            body_angle, body_mask, reduction="mean"
+        ),
+        "roll_feet_deg": _masked_scalar(
+            feet_angle, feet_mask, reduction="mean"
+        ),
+        "roll_body_rel": _masked_scalar(
+            body_relative, body_mask, reduction="mean"
+        ),
+        "roll_body_rel_max": _masked_scalar(
+            body_relative, body_mask, reduction="max"
+        ),
+        "roll_feet_rel": _masked_scalar(
+            feet_relative, feet_mask, reduction="mean"
+        ),
+        "roll_feet_rel_max": _masked_scalar(
+            feet_relative, feet_mask, reduction="max"
+        ),
+        "roll_feet_rev": _masked_scalar(
+            excess_reverse, feet_mask, reduction="mean"
+        ),
+    }
+
+
+__all__ = ["compute_heading_metrics", "compute_rollout_heading_metrics"]

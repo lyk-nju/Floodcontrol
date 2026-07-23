@@ -23,7 +23,6 @@ from utils.training.ldf.data import LDFSpanCollator
 from utils.training.ldf.lightning_module import (
     LDFLightningModule,
     _create_curriculum_generator,
-    _persistent_cold_validation_phases,
 )
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import ColdStartObjective, sample_window_plan
@@ -338,13 +337,40 @@ def test_validation_can_force_a_deterministic_persistent_cold_microstep(
         "cold_persistent_microstep": 1,
         "completed_commits": 2,
     }
-    assert "anchor_root_x0" in losses
-    assert "latent_body_corrective_velocity" in losses
-    assert "root_heading_angle_degrees" in losses
-    assert "root_heading_raw_norm" in losses
-    assert "root_heading_raw_norm_p10" in losses
-    assert "root_heading_low_norm_ratio" in losses
+    assert "loss_root" in losses
+    assert "loss_body" in losses
+    assert "heading_bias" in losses
+    assert "heading_norm" in losses
+    assert "heading_norm_p10" in losses
+    assert "heading_low_norm_ratio" in losses
     assert torch.isfinite(losses["total"])
+
+
+def test_validation_logs_only_three_comparable_loss_curves(tmp_path, monkeypatch):
+    module = LDFLightningModule(_make_config(tmp_path)).eval()
+    losses = {
+        "total": torch.tensor(3.0),
+        "loss_root": torch.tensor(1.0),
+        "loss_body": torch.tensor(2.0),
+        "loss_root_xz": torch.tensor(0.1),
+        "heading_norm_p10": torch.tensor(0.9),
+    }
+    monkeypatch.setattr(module, "_step", lambda *_args, **_kwargs: losses)
+    logged = {}
+
+    def record_log(name, value, **kwargs):
+        logged[name] = (value, kwargs)
+
+    monkeypatch.setattr(module, "log", record_log)
+    module.validation_step(_make_step_batch(), batch_idx=0)
+
+    assert set(logged) == {
+        "val/loss_total",
+        "val/loss_root",
+        "val/loss_body",
+    }
+    assert all(not options["on_step"] for _, options in logged.values())
+    assert all(options["on_epoch"] for _, options in logged.values())
 
 
 def test_curriculum_generator_is_global_step_deterministic_and_rank_independent():
@@ -352,19 +378,6 @@ def test_curriculum_generator_is_global_step_deterministic_and_rank_independent(
     second = _create_curriculum_generator(1234, 200_000)
     assert first.device == second.device == torch.device("cpu")
     assert torch.equal(torch.rand(8, generator=first), torch.rand(8, generator=second))
-
-
-def test_persistent_cold_validation_phases_match_formal_solver_geometry():
-    assert _persistent_cold_validation_phases(
-        noise_steps=10,
-        active_tokens=5,
-        rollout_commits=2,
-    ) == (
-        ("after_update_01", 0),
-        ("three_tokens_visible", 4),
-        ("first_commit", 9),
-        ("second_commit", 11),
-    )
 
 
 def test_ldf_training_bridge_uses_frozen_ema_vae_and_shared_statistics(tmp_path):
@@ -746,40 +759,36 @@ def test_complete_ldf_training_step_runs_with_frozen_vae_and_text_lookup(tmp_pat
         return original_forward(inputs)
 
     module.model.forward = recording_forward
+    module.vae.detokenize = lambda *_args, **_kwargs: pytest.fail(
+        "training must not decode Body solely for observation metrics"
+    )
     losses = module._step(batch, is_training=True, initial_history_tokens=0)
     assert set(losses) == {
-        "anchor_root_x0",
-        "anchor_root_flow_velocity",
-        "anchor_root_corrective_velocity",
-        "anchor_root_xz",
-        "anchor_root_height",
-        "anchor_root_heading",
-        "latent_body_x0",
-        "latent_body_flow_velocity",
-        "latent_body_corrective_velocity",
-        "root_heading_angle_degrees",
-        "root_heading_raw_norm",
-        "root_heading_raw_norm_p10",
-        "root_heading_low_norm_ratio",
-        "root_heading_antipodal_ratio",
-        "root_boundary_displacement",
+        "loss_root",
+        "loss_body",
+        "loss_root_xz",
+        "loss_root_height",
+        "loss_root_heading",
+        "heading_bias",
+        "heading_norm",
+        "heading_antipodal_ratio",
         "total",
     }
     assert torch.isfinite(losses["total"])
-    assert set(module._last_heading_metrics) == {
-        "root_gt_root_heading_angle_deg",
-        "body_gt_body_heading_angle_deg",
-        "feet_gt_feet_heading_angle_deg",
-        "root_trajectory_heading_angle_deg",
-        "root_body_heading_angle_deg",
-        "root_feet_heading_angle_deg",
-        "gt_root_body_heading_angle_deg",
-        "gt_root_feet_heading_angle_deg",
-        "root_feet_reverse_ratio",
+    assert {
+        module._training_log_name(key)
+        for key in losses
+    } == {
+        "train/loss_total",
+        "train/loss_root",
+        "train/loss_body",
+        "train/loss_root_xz",
+        "train/loss_root_height",
+        "train/loss_root_heading",
+        "train/heading_bias",
+        "train/heading_norm",
+        "train/heading_antipodal_ratio",
     }
-    assert all(
-        torch.isfinite(value) for value in module._last_heading_metrics.values()
-    )
     assert len(seen_conditions) == 1
     condition = seen_conditions[0]
     assert condition.root_condition_mask[:, 0, :, 0].all()

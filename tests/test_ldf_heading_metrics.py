@@ -3,7 +3,10 @@ from __future__ import annotations
 import torch
 
 from utils.motion_process import BODY_CONTINUOUS_DIM
-from utils.training.ldf.metrics import compute_heading_metrics
+from utils.training.ldf.metrics import (
+    compute_heading_metrics,
+    compute_rollout_heading_metrics,
+)
 
 
 def _root(yaw_degrees: list[float]) -> torch.Tensor:
@@ -194,3 +197,55 @@ def test_heading_metrics_compare_generated_body_and_feet_to_gt_geometry():
     assert torch.allclose(
         metrics["root_feet_reverse_ratio"], torch.tensor(1.0), atol=1e-6
     )
+
+
+def test_rollout_heading_metrics_preserve_valid_root_relative_body_motion():
+    predicted_root = _root([180.0])
+    target_root = _root([0.0])
+    predicted_body = _set_feet_facing(
+        _body_facing([(0.0, 1.0)]),
+        [(0.0, 1.0)],
+    )
+    target_body = _set_feet_facing(
+        _body_facing([(0.0, 1.0)]),
+        [(0.0, 1.0)],
+    )
+
+    metrics = compute_rollout_heading_metrics(
+        predicted_root=predicted_root,
+        target_root=target_root,
+        predicted_body=predicted_body,
+        target_body=target_body,
+        frame_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+
+    assert torch.allclose(metrics["cold_root_deg"], torch.tensor(180.0))
+    assert torch.allclose(metrics["cold_root_anti"], torch.tensor(1.0))
+    assert torch.allclose(metrics["roll_body_deg"], torch.tensor(180.0))
+    assert torch.allclose(metrics["roll_feet_deg"], torch.tensor(180.0))
+    assert torch.allclose(metrics["roll_body_rel"], torch.tensor(0.0), atol=1e-5)
+    assert torch.allclose(metrics["roll_feet_rel"], torch.tensor(0.0), atol=1e-5)
+    assert torch.allclose(metrics["roll_feet_rev"], torch.tensor(0.0))
+
+
+def test_rollout_heading_metrics_report_excess_reverse_feet():
+    root = _root([0.0])
+    predicted_body = _set_feet_facing(
+        _body_facing([(0.0, 1.0)]),
+        [(0.0, -1.0)],
+    )
+    target_body = _set_feet_facing(
+        _body_facing([(0.0, 1.0)]),
+        [(0.0, 1.0)],
+    )
+
+    metrics = compute_rollout_heading_metrics(
+        predicted_root=root,
+        target_root=root,
+        predicted_body=predicted_body,
+        target_body=target_body,
+        frame_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+
+    assert torch.allclose(metrics["roll_feet_rel"], torch.tensor(180.0))
+    assert torch.allclose(metrics["roll_feet_rev"], torch.tensor(1.0))

@@ -51,6 +51,20 @@ def test_encoder_ignores_feature_invalid_values():
     )
 
 
+def test_standalone_vae_is_strict_but_training_can_disable_value_scans():
+    model = make_model()
+    body = torch.zeros(1, 4, 259)
+    body[0, 0, 0] = float("nan")
+    mask = torch.ones(1, 4, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="non-finite"):
+        model.encode(body, mask)
+
+    model.numerical_validation_enabled = False
+    posterior = model.encode(body, mask)
+    assert torch.isnan(posterior.mu).any()
+
+
 @pytest.mark.parametrize("kernel_size", [1, 2, 4])
 def test_causal_vae_rejects_unsafe_kernel_sizes(kernel_size):
     with pytest.raises(ValueError, match="odd and at least three"):

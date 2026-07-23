@@ -11,8 +11,12 @@ from utils.training.lightning_module import (
 
 
 class _Module(BasicLightningModule):
-    def __init__(self):
-        cfg = SimpleNamespace(model=SimpleNamespace(ema_decay=0.9))
+    def __init__(self, *, debug=False):
+        cfg = SimpleNamespace(
+            model=SimpleNamespace(ema_decay=0.9),
+            debug=debug,
+            trainer=SimpleNamespace(log_every_n_steps=50),
+        )
         super().__init__(cfg, model=nn.Linear(2, 2, bias=False))
 
     def _step(self, batch, is_training=True):
@@ -124,3 +128,50 @@ def test_checkpoint_loading_inside_inference_mode_keeps_ema_trainable():
         not torch.is_inference(value) for value in target.ema.shadow_params
     )
     target.ema.update()
+
+
+def test_detailed_numerical_checks_are_periodic_and_debug_forces_them():
+    module = _Module()
+    assert module._detailed_numerical_check_due(step=0, is_training=True)
+    assert not module._detailed_numerical_check_due(step=1, is_training=True)
+    assert module._detailed_numerical_check_due(step=500, is_training=True)
+    assert module._detailed_numerical_check_due(step=1, is_training=False)
+
+    debug_module = _Module(debug=True)
+    assert debug_module._detailed_numerical_check_due(
+        step=1, is_training=True
+    )
+
+
+def test_numerical_scope_temporarily_changes_opted_in_modules():
+    module = _Module()
+    module.model.numerical_validation_enabled = True
+    module._detailed_numerical_check_due = lambda **_: False
+
+    with module._numerical_validation_scope(is_training=True):
+        assert not module.model.numerical_validation_enabled
+        assert not module._detailed_numerical_validation_active
+
+    assert module.model.numerical_validation_enabled
+    assert module._detailed_numerical_validation_active
+
+
+def test_final_loss_guard_remains_active_each_step():
+    finite = torch.tensor(1.0)
+    assert BasicLightningModule._validate_final_loss({"total": finite}) is finite
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        BasicLightningModule._validate_final_loss(
+            {"total": torch.tensor(float("nan"))}
+        )
+
+
+def test_cpu_step_timer_reports_forward_and_full_step_time():
+    module = _Module()
+    module._start_step_timing()
+    module.model(torch.ones(1, 2))
+    module._mark_forward_timing()
+    timings = module._finish_step_timing()
+
+    assert set(timings) == {"net_time", "step_time", "step_wall_time"}
+    assert 0.0 <= timings["net_time"] <= timings["step_time"]
+    assert timings["step_time"] <= timings["step_wall_time"]

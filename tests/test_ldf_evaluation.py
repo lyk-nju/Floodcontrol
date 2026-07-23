@@ -34,8 +34,10 @@ from utils.training.ldf.evaluation.generation import (
 from utils.training.ldf.evaluation.runner import (
     LDFEvaluationRunner,
     _all_gather_objects,
+    _compact_rollout_metrics,
     _distributed_barrier,
     _format_t2m_summary,
+    _standard_case_metrics,
 )
 
 
@@ -355,6 +357,85 @@ def test_dense_xz_summary_prioritizes_control_and_heading_metrics():
     assert summary["root_trajectory_heading_angle_deg_mean"] == pytest.approx(28.0)
     assert summary["root_body_heading_angle_deg_mean"] == pytest.approx(30.0)
     assert summary["root_feet_heading_angle_deg_mean"] == pytest.approx(35.0)
+
+
+def test_compact_rollout_and_standard_case_logs_use_short_names():
+    records = [
+        {
+            "name": "000021",
+            "cold_root_deg": 10.0,
+            "cold_root_max": 20.0,
+            "cold_root_anti": 0.0,
+            "cold_body_deg": 11.0,
+            "cold_feet_deg": 12.0,
+            "roll_root_deg": 13.0,
+            "roll_root_p95": 14.0,
+            "roll_root_max": 30.0,
+            "roll_root_anti": 0.1,
+            "roll_body_deg": 15.0,
+            "roll_feet_deg": 16.0,
+            "roll_body_rel": 4.0,
+            "roll_body_rel_max": 8.0,
+            "roll_feet_rel": 5.0,
+            "roll_feet_rel_max": 9.0,
+            "roll_feet_rev": 0.2,
+            "ade": 0.3,
+            "fde": 0.4,
+        },
+        {
+            "name": "000021",
+            "cold_root_deg": 30.0,
+            "cold_root_max": 40.0,
+            "cold_root_anti": 1.0,
+            "cold_body_deg": 31.0,
+            "cold_feet_deg": 32.0,
+            "roll_root_deg": 33.0,
+            "roll_root_p95": 34.0,
+            "roll_root_max": 50.0,
+            "roll_root_anti": 0.3,
+            "roll_body_deg": 35.0,
+            "roll_feet_deg": 36.0,
+            "roll_body_rel": 6.0,
+            "roll_body_rel_max": 10.0,
+            "roll_feet_rel": 7.0,
+            "roll_feet_rel_max": 11.0,
+            "roll_feet_rev": 0.4,
+            "ade": 0.5,
+            "fde": 0.6,
+        },
+    ]
+
+    compact = _compact_rollout_metrics(records)
+    assert compact["val/cold/root_deg"] == pytest.approx(20.0)
+    assert compact["val/roll/root_p95"] == pytest.approx(24.0)
+    assert compact["val/roll/feet_rev"] == pytest.approx(0.3)
+    assert compact["val/roll/ade"] == pytest.approx(0.4)
+    assert set(compact) == {
+        "val/cold/root_deg",
+        "val/cold/root_anti",
+        "val/cold/body_deg",
+        "val/cold/feet_deg",
+        "val/roll/root_deg",
+        "val/roll/root_p95",
+        "val/roll/root_anti",
+        "val/roll/body_deg",
+        "val/roll/feet_deg",
+        "val/roll/body_rel",
+        "val/roll/feet_rel",
+        "val/roll/feet_rev",
+        "val/roll/ade",
+        "val/roll/fde",
+    }
+
+    case = _standard_case_metrics(records, case_name="000021")
+    assert case["val/case/000021/cold_mean"] == pytest.approx(20.0)
+    assert case["val/case/000021/cold_max"] == pytest.approx(40.0)
+    assert case["val/case/000021/root_mean"] == pytest.approx(23.0)
+    assert case["val/case/000021/root_max"] == pytest.approx(50.0)
+    assert case["val/case/000021/body_rel_mean"] == pytest.approx(5.0)
+    assert case["val/case/000021/body_rel_max"] == pytest.approx(10.0)
+    assert case["val/case/000021/feet_rel_mean"] == pytest.approx(6.0)
+    assert case["val/case/000021/feet_rel_max"] == pytest.approx(11.0)
 
 
 def test_evaluation_prompt_is_deterministic_for_humanml_and_babel():

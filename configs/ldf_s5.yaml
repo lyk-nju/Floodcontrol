@@ -15,11 +15,11 @@ validation:
     enabled: false
 
 vae:
-  checkpoint_path: null
+  checkpoint_path: /data1/yuankai/text2Motion/Floodcontrol/vae/20260723_133259_vae_body259/step_300000.ckpt
 
 data:
   target: datasets.humanml3d.HumanML3DDataset
-  text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion_local/t5_text_embeddings.pt
+  text_embeddings_path: ${dirs.raw_data}/HumanML3D_motion/t5_text_embeddings.pt
   text_meta_paths:
     - ${dirs.raw_data}/HumanML3D_motion_local/all.txt
   train_meta_paths:
@@ -31,6 +31,6 @@ data:
       - ${dirs.raw_data}/HumanML3D_motion_local/test.txt
   artifact_path: artifacts
   text_path: texts
-  train_batch_size: 8
+  train_batch_size: 32
   val_batch_size: 16
   num_workers: 16

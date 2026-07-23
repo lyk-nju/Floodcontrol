@@ -812,17 +812,10 @@ def create_dataloaders(
             **common,
         )
 
-    validation = cfg.get("validation") or {}
-    required_tokens = generation_tokens + maximum_rollout
+    required_tokens = generation_tokens + 1
     continuation_dataset = MinimumFrameDataset(
         val_dataset,
         min_frames=required_tokens * FRAMES_PER_TOKEN,
-    )
-    persistent_cold_dataset = MinimumFrameDataset(
-        val_dataset,
-        min_frames=(
-            generation_tokens + cold_rollout_commits
-        ) * FRAMES_PER_TOKEN,
     )
 
     def validation_loader(
@@ -849,21 +842,12 @@ def create_dataloaders(
         )
 
     val_loaders = [
-        validation_loader("teacher_cold", dataset=val_dataset),
-        validation_loader("persistent_cold", dataset=persistent_cold_dataset),
         validation_loader(
             "teacher_continuation",
             dataset=continuation_dataset,
             positions=("early", "middle", "late"),
-        ),
-    ]
-    val_loaders.append(
-        validation_loader(
-            "self_forcing",
-            dataset=continuation_dataset,
-            positions=("early", "middle", "late"),
         )
-    )
+    ]
     return train_loader, val_loaders
 
 

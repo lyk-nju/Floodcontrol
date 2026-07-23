@@ -96,8 +96,13 @@ def _replace_token(
     root = motion.root_motion.clone()
     latent = motion.latent_motion.clone()
     batch_index = torch.arange(root.shape[0], device=root.device)
-    root[batch_index, token_index] = replacement.root_motion[:, 0]
-    latent[batch_index, token_index] = replacement.latent_motion[:, 0]
+    # AMP may keep the frozen-VAE clean latent in BF16 while one Euler update
+    # is promoted to FP32 by the float scheduler beta.  Advanced-index
+    # assignment requires an exact dtype match, so normalize each committed
+    # field to the persistent clean state's own dtype at this transaction
+    # boundary.
+    root[batch_index, token_index] = replacement.root_motion[:, 0].to(root)
+    latent[batch_index, token_index] = replacement.latent_motion[:, 0].to(latent)
     return HybridMotion(root, latent)
 
 

@@ -36,6 +36,7 @@ validation:
   dense_xz:
     enabled: true
     probe: dense_xz
+    standard_cases: ["000021", "001168"]
     video_yaw_degrees: [0, 90, 180]
 
   t2m:

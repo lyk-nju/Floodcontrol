@@ -526,6 +526,7 @@ def create_ldf_condition(
     future_root_condition_mask: torch.Tensor | None = None,
     future_timeline_position_ids: torch.Tensor | None = None,
     future_horizon_tokens: torch.Tensor | int | None = None,
+    validate_numerics: bool = True,
 ) -> LDFCondition:
     """Compile source-specific candidates into the sole model-facing condition.
 
@@ -641,7 +642,12 @@ def create_ldf_condition(
         future_horizon_tokens=future_horizon_tokens,
     )
     latent_dim = None if body_condition_value is None else body_condition_value.shape[-1]
-    condition.validate(
+    validator = (
+        condition.validate
+        if validate_numerics
+        else condition.validate_structure
+    )
+    validator(
         batch_size=batch_size,
         token_length=token_length,
         latent_dim=latent_dim,

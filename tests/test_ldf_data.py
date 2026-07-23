@@ -521,7 +521,7 @@ def test_continuation_validation_labels_early_middle_and_late_history_probes():
     assert batch["context_token_count"].tolist() == [0, 0, 0]
 
 
-def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
+def test_create_dataloaders_exposes_one_comparable_validation_probe(monkeypatch):
     dataset = MinimumFrameDataset(VariableLengthDataset(), min_frames=20)
     monkeypatch.setattr(
         "utils.training.ldf.data.create_dataset", lambda _cfg, _split: dataset
@@ -561,18 +561,11 @@ def test_create_dataloaders_exposes_named_validation_probes(monkeypatch):
     train, validation = create_dataloaders(cfg, encoder_context_tokens=2)
     assert train is not None
     # K=5 reserves four rollout tokens, so the five-token short clip is
-    # filtered from self-forcing training while remaining valid for K=1 cold val.
+    # filtered from training. Heavy cold/rollout abilities are measured by the
+    # generation runner rather than duplicated as validation loaders.
     assert next(iter(train))["name"] == ["valid"]
     validation_batches = [next(iter(loader)) for loader in validation]
     assert [batch["validation_probe"] for batch in validation_batches] == [
-        "teacher_cold",
-        "persistent_cold",
         "teacher_continuation",
-        "self_forcing",
     ]
-    assert validation_batches[0]["source_start_token"].tolist() == [0]
-    assert validation_batches[0]["context_token_count"].tolist() == [0]
-    assert not validation_batches[0]["previous_root_valid_mask"].any()
-    assert validation_batches[1]["source_start_token"].tolist() == [0]
-    assert validation_batches[1]["context_token_count"].tolist() == [0]
-    assert not validation_batches[1]["previous_root_valid_mask"].any()
+    assert validation_batches[0]["validation_position"] == ["early"]

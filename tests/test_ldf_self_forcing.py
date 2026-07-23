@@ -22,7 +22,7 @@ from utils.training.ldf.losses import (
     compute_root_x0_loss,
 )
 from utils.training.ldf.flow import build_span_beta
-from utils.training.ldf.solver import run_training_solver
+from utils.training.ldf.solver import _replace_token, run_training_solver
 from utils.training.ldf.window import (
     resolve_self_forcing_k,
     sample_cold_start_objective,
@@ -315,6 +315,31 @@ def test_training_steps_reuse_absolute_noise_and_keep_fixed_span_masks():
     assert torch.equal(first.inputs.noisy_motion.root_motion[:, 3], expected)
     expected_next = second.inputs.beta[:, 3, None, None] * root_noise[:, 3]
     assert torch.equal(second.inputs.noisy_motion.root_motion[:, 3], expected_next)
+
+
+def test_persistent_token_replacement_preserves_state_dtypes_under_amp():
+    motion = HybridMotion(
+        torch.zeros(2, 3, 4, 5, dtype=torch.float32),
+        torch.zeros(2, 3, 3, dtype=torch.bfloat16),
+    )
+    replacement = HybridMotion(
+        torch.ones(2, 1, 4, 5, dtype=torch.bfloat16),
+        torch.ones(2, 1, 3, dtype=torch.float32),
+    )
+
+    updated = _replace_token(
+        motion,
+        torch.tensor([1, 2], dtype=torch.long),
+        replacement,
+    )
+
+    assert updated.root_motion.dtype == torch.float32
+    assert updated.latent_motion.dtype == torch.bfloat16
+    assert torch.equal(updated.root_motion[0, 1], torch.ones(4, 5))
+    assert torch.equal(
+        updated.latent_motion[1, 2],
+        torch.ones(3, dtype=torch.bfloat16),
+    )
 
 
 @pytest.mark.parametrize("denoise_step", range(10))
@@ -950,11 +975,54 @@ def test_root_heading_observations_expose_low_norm_antipodal_output():
         root_prediction_type="x0",
         body_prediction_type="velocity",
     )
-    assert metrics["root_heading_angle_degrees"].item() == pytest.approx(180.0)
-    assert metrics["root_heading_raw_norm"].item() == pytest.approx(0.1)
-    assert metrics["root_heading_raw_norm_p10"].item() == pytest.approx(0.1)
-    assert metrics["root_heading_low_norm_ratio"].item() == pytest.approx(1.0)
-    assert metrics["root_heading_antipodal_ratio"].item() == pytest.approx(1.0)
+    assert metrics["heading_bias"].item() == pytest.approx(180.0)
+    assert metrics["heading_norm"].item() == pytest.approx(0.1)
+    assert metrics["heading_norm_p10"].item() == pytest.approx(0.1)
+    assert metrics["heading_low_norm_ratio"].item() == pytest.approx(1.0)
+    assert metrics["heading_antipodal_ratio"].item() == pytest.approx(1.0)
+
+
+def test_compact_ldf_loss_logs_weighted_contributions_and_raw_root_blocks():
+    step = _minimal_loss_step(beta_value=0.5, is_rollout=True)
+    raw_root = step.clean_motion.root_motion.clone()
+    raw_root[..., 0] = 2.0
+    raw_body = torch.ones_like(step.clean_motion.latent_motion)
+    local = torch.zeros(1, 1, 4, 4)
+    prediction = LDFPrediction(
+        raw_root_output=raw_root,
+        raw_body_output=raw_body,
+        clean_motion=step.clean_motion,
+        solver_velocity=HybridMotion(
+            torch.zeros_like(raw_root), raw_body
+        ),
+        local_root_motion=local,
+        local_root_feature_valid=torch.ones_like(local, dtype=torch.bool),
+    )
+    metrics = compute_ldf_loss(
+        prediction,
+        step,
+        root_prediction_type="x0",
+        body_prediction_type="velocity",
+        root_weight=3.0,
+        body_weight=5.0,
+        rollout_weight=2.0,
+        include_detailed_metrics=False,
+    )
+
+    raw_root_total = (
+        metrics["loss_root_xz"]
+        + metrics["loss_root_height"]
+        + metrics["loss_root_heading"]
+    )
+    assert metrics["loss_root"].item() == pytest.approx(
+        2.0 * 3.0 * raw_root_total.item()
+    )
+    assert metrics["loss_body"].item() > 0.0
+    assert metrics["total"].item() == pytest.approx(
+        metrics["loss_root"].item() + metrics["loss_body"].item()
+    )
+    assert "heading_norm_p10" not in metrics
+    assert "heading_low_norm_ratio" not in metrics
 
 
 @pytest.mark.parametrize("beta_value", [1.0, 0.1])

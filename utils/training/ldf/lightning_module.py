@@ -26,7 +26,6 @@ from utils.training.ldf.conditioning import (
     sample_xz_constraint_mask,
 )
 from utils.training.ldf.losses import compute_ldf_loss
-from utils.training.ldf.metrics import compute_heading_metrics
 from utils.training.ldf.solver import run_training_solver
 from utils.training.ldf.window import (
     ColdStartObjective,
@@ -63,37 +62,6 @@ def _create_curriculum_generator(seed: int, global_step: int) -> torch.Generator
         int(seed) + int(global_step) * 1_000_003 + 0x5E1F_F0CE
     ) % (2**63 - 1)
     return torch.Generator(device="cpu").manual_seed(mixed_seed)
-
-
-def _persistent_cold_validation_phases(
-    *,
-    noise_steps: int,
-    active_tokens: int,
-    rollout_commits: int,
-) -> tuple[tuple[str, int], ...]:
-    """Resolve stable observation points in one true-cold lifecycle."""
-
-    noise_steps = int(noise_steps)
-    active_tokens = int(active_tokens)
-    rollout_commits = int(rollout_commits)
-    if noise_steps <= 0 or active_tokens <= 0:
-        raise ValueError("persistent cold validation geometry must be positive")
-    if noise_steps % active_tokens:
-        raise ValueError(
-            "persistent cold validation requires divisible noise/active steps"
-        )
-    if rollout_commits < 2:
-        raise ValueError(
-            "persistent cold validation requires at least two rollout commits"
-        )
-    steps_per_commit = noise_steps // active_tokens
-    three_visible_index = (min(3, active_tokens) - 1) * steps_per_commit
-    return (
-        ("after_update_01", 0),
-        ("three_tokens_visible", three_visible_index),
-        ("first_commit", noise_steps - 1),
-        ("second_commit", noise_steps + steps_per_commit - 1),
-    )
 
 
 def _module_parameter_content_id(module: torch.nn.Module) -> str:
@@ -186,13 +154,33 @@ class LDFLightningModule(BasicLightningModule):
         ):
             raise RuntimeError("LDF and VAE local-root statistics do not match")
         self._vae_tokenizer_content_id = _module_parameter_content_id(self.vae)
-        self._last_heading_metrics: dict[str, torch.Tensor] = {}
 
     def train(self, mode: bool = True):
         super().train(mode)
         if hasattr(self, "vae"):
             self.vae.eval()
         return self
+
+    _TRAINING_LOG_NAMES = {
+        "total": "train/loss_total",
+        "loss_root": "train/loss_root",
+        "loss_body": "train/loss_body",
+        "loss_root_xz": "train/loss_root_xz",
+        "loss_root_height": "train/loss_root_height",
+        "loss_root_heading": "train/loss_root_heading",
+        "heading_bias": "train/heading_bias",
+        "heading_norm": "train/heading_norm",
+        "heading_antipodal_ratio": "train/heading_antipodal_ratio",
+    }
+
+    def _training_log_name(self, key: str) -> str:
+        try:
+            return self._TRAINING_LOG_NAMES[key]
+        except KeyError as error:
+            raise KeyError(f"unexpected LDF training log key {key!r}") from error
+
+    def _training_log_prog_bar(self, key: str) -> bool:
+        return key == "total"
 
     @torch.no_grad()
     def _encode_prompt_timeline(
@@ -293,7 +281,6 @@ class LDFLightningModule(BasicLightningModule):
         initial_history_tokens: int | torch.Tensor | None = None,
         cold_persistent_microstep_override: int | None = None,
     ):
-        self._last_heading_metrics = {}
         if generator is None and is_training:
             generator = torch.Generator(device=self.device).manual_seed(
                 int(self.cfg.get("seed", 0))
@@ -406,7 +393,9 @@ class LDFLightningModule(BasicLightningModule):
                 device=root_motion.device,
                 dtype=root_motion.dtype,
             )
-        validate_contract = bool(self.cfg.get("debug", False))
+        validate_contract = (
+            not is_training or self._detailed_numerical_validation_active
+        )
         plan = sample_window_plan(
             batch,
             active_tokens=self.model.chunk_size,
@@ -483,6 +472,7 @@ class LDFLightningModule(BasicLightningModule):
                 text_context=contexts,
                 text_null_context=null_contexts,
                 future_horizon_tokens=future_horizon_tokens,
+                validate_numerics=validate_contract,
             )
 
         result = run_training_solver(
@@ -499,12 +489,6 @@ class LDFLightningModule(BasicLightningModule):
         )
         if validate_contract:
             result.final_step.inputs.validate()
-        if self._should_observe_heading(is_training=is_training):
-            self._last_heading_metrics = self._observe_heading(
-                result,
-                token_valid_mask=token_valid,
-                target_body=batch["body_motion"],
-            )
         weights = self.cfg.get("loss") or {}
         return compute_ldf_loss(
             result.prediction,
@@ -517,81 +501,8 @@ class LDFLightningModule(BasicLightningModule):
             root_boundary_weight=float(
                 weights.get("root_boundary_weight", 0.0)
             ),
+            include_detailed_metrics=not is_training,
         )
-
-    def _should_observe_heading(self, *, is_training: bool) -> bool:
-        """Decode heading metrics sparsely in training and fully in validation."""
-
-        if not is_training:
-            return True
-        interval = max(1, int(self.cfg.trainer.get("log_every_n_steps", 1)))
-        return int(self.global_step) % interval == 0
-
-    @torch.no_grad()
-    def _observe_heading(
-        self,
-        result,
-        *,
-        token_valid_mask: torch.Tensor,
-        target_body: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Recover the current clean endpoint and measure physical headings."""
-
-        step = result.final_step
-        prediction = result.prediction
-        predicted_latent = prediction.clean_motion.latent_motion
-        frame_valid = token_valid_mask.repeat_interleave(
-            FRAMES_PER_TOKEN, dim=1
-        )
-        predicted_body = self.vae.detokenize(
-            predicted_latent,
-            prediction.local_root_motion,
-            prediction.local_root_feature_valid,
-            frame_valid,
-        ).continuous_body
-        predicted_root = prediction.clean_motion.root_motion.flatten(1, 2)
-        target_root = step.clean_motion.root_motion.flatten(1, 2)
-        metric_frames = step.loss_mask.repeat_interleave(
-            FRAMES_PER_TOKEN, dim=1
-        )
-        return compute_heading_metrics(
-            predicted_root=predicted_root,
-            target_root=target_root,
-            predicted_body=predicted_body,
-            target_body=target_body,
-            frame_mask=metric_frames,
-            frame_valid_mask=frame_valid,
-            fps=float(self.model.fps),
-        )
-
-    def _log_heading_metrics(
-        self,
-        prefix: str,
-        *,
-        batch_size: int,
-        on_step: bool,
-        on_epoch: bool,
-    ) -> None:
-        for name, value in self._last_heading_metrics.items():
-            self.log(
-                f"{prefix}/{name}",
-                value,
-                on_step=on_step,
-                on_epoch=on_epoch,
-                prog_bar=False,
-                sync_dist=True,
-                batch_size=batch_size,
-            )
-
-    def training_step(self, batch, batch_idx):
-        loss = super().training_step(batch, batch_idx)
-        self._log_heading_metrics(
-            "train_metric",
-            batch_size=int(batch["body_motion"].shape[0]),
-            on_step=True,
-            on_epoch=False,
-        )
-        return loss
 
     def _resume_contract(self) -> dict[str, object]:
         return {
@@ -640,83 +551,41 @@ class LDFLightningModule(BasicLightningModule):
             raise RuntimeError("resumed LDF local-root statistics do not match the VAE")
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        probe = str(batch.get("validation_probe", "teacher_cold"))
         validation = self.cfg.get("validation") or {}
         base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
         generator = torch.Generator(device=self.device).manual_seed(
-            base_seed + int(dataloader_idx) * 1_000_003 + int(batch_idx)
+            base_seed + int(batch_idx)
         )
-        persistent_microstep = None
-        metric_probe = probe
-        if probe == "teacher_cold":
-            rollout_steps = 1
-            history_tokens: int | torch.Tensor = torch.zeros_like(
-                batch["span_token_count"]
-            )
-        elif probe == "persistent_cold":
-            # Zero-based solver indices.  These correspond to the state after
-            # update 1, the first phase with roughly three visible tokens, the
-            # first commit, and the second commit respectively.  Cycling one
-            # phase per batch avoids multiplying persistent validation cost by
-            # four while keeping every phase deterministic across ranks.
-            rollout_steps = int(
-                (self.cfg.self_forcing.get("cold_start") or {}).get(
-                    "rollout_commits", 1
-                )
-            )
-            persistent_phases = _persistent_cold_validation_phases(
-                noise_steps=int(self.model.noise_steps),
-                active_tokens=int(self.model.chunk_size),
-                rollout_commits=rollout_steps,
-            )
-            phase_name, persistent_microstep = persistent_phases[
-                int(batch_idx) % len(persistent_phases)
-            ]
-            metric_probe = f"{probe}/{phase_name}"
-            history_tokens = torch.zeros_like(batch["span_token_count"])
-        elif probe == "teacher_continuation":
-            rollout_steps = 1
-            history_tokens = self._validation_history_tokens(
-                batch,
-                rollout_steps=rollout_steps,
-                fallback=1,
-            )
-        elif probe == "self_forcing":
-            rollout_steps = max(
-                int(row[1]) for row in self.cfg.self_forcing.k_schedule
-            )
-            history_tokens = self._validation_history_tokens(
-                batch,
-                rollout_steps=rollout_steps,
-                fallback=1,
-            )
-        else:
-            raise ValueError(f"unknown validation probe {probe!r}")
+        rollout_steps = 1
+        history_tokens = self._validation_history_tokens(
+            batch,
+            rollout_steps=rollout_steps,
+            fallback=1,
+        )
         loss_dict = self._step(
             batch,
             is_training=False,
             generator=generator,
             rollout_steps_override=rollout_steps,
             initial_history_tokens=history_tokens,
-            cold_persistent_microstep_override=persistent_microstep,
         )
+        self._validate_final_loss(loss_dict)
         batch_size = int(batch["body_motion"].shape[0])
-        for key, value in loss_dict.items():
+        names = {
+            "total": "val/loss_total",
+            "loss_root": "val/loss_root",
+            "loss_body": "val/loss_body",
+        }
+        for key, log_name in names.items():
             self.log(
-                f"val_loss/{metric_probe}/{key}",
-                value,
+                log_name,
+                loss_dict[key],
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=batch_size,
                 add_dataloader_idx=False,
             )
-        self._log_heading_metrics(
-            f"val_metric/{metric_probe}",
-            batch_size=batch_size,
-            on_step=False,
-            on_epoch=True,
-        )
         return loss_dict
 
     def _validation_history_tokens(

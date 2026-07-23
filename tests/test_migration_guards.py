@@ -81,6 +81,7 @@ def test_formal_ldf_config_uses_the_vae_as_contract_source():
     assert cfg.validation.dense_xz.enabled is True
     assert cfg.validation.dense_xz.probe == "dense_xz"
     assert "video_sample_ids" not in cfg.validation.dense_xz
+    assert list(cfg.validation.dense_xz.standard_cases) == ["000021", "001168"]
     assert list(cfg.validation.dense_xz.video_yaw_degrees) == [0, 90, 180]
     assert "segment_frames" not in cfg.validation.dense_xz
     assert cfg.data.test_probe_meta_paths.dense_xz[0].endswith(

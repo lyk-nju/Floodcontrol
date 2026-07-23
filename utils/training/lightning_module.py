@@ -14,6 +14,9 @@ from utils.initialize import (
     log_state_dict_summary,
 )
 
+_NUMERICAL_CHECK_INTERVAL_STEPS = 500
+_TIMING_INTERVAL_STEPS = 50
+
 
 class BasicLightningModule(LightningModule):
     def __init__(self, cfg, *, model=None):
@@ -40,8 +43,130 @@ class BasicLightningModule(LightningModule):
         log_model_parameters(self.model)
 
         self.last_batch_end_time, self.batch_ready_time = None, None
+        self._timing_active = False
+        self._timing_cpu_start = None
+        self._timing_cpu_forward_end = None
+        self._timing_cuda_start = None
+        self._timing_cuda_forward_end = None
+        self._detailed_numerical_validation_active = True
+        self._numerical_validation_modules_cache = None
         self._skip_next_lightning_load_state_dict = False
         self._ema_parameters_active = False
+
+    @staticmethod
+    def _config_get(config, name: str, default=None):
+        if config is None:
+            return default
+        getter = getattr(config, "get", None)
+        if callable(getter):
+            return getter(name, default)
+        return getattr(config, name, default)
+
+    def _detailed_numerical_check_due(
+        self, *, step: int, is_training: bool
+    ) -> bool:
+        if not is_training:
+            return True
+        if bool(self._config_get(self.cfg, "debug", False)):
+            return True
+        return int(step) % _NUMERICAL_CHECK_INTERVAL_STEPS == 0
+
+    @contextmanager
+    def _numerical_validation_scope(self, *, is_training: bool):
+        """Enable expensive tensor-value checks only at fixed periodic steps.
+
+        Shape and dtype checks remain active in every forward. Modules such as
+        ``BodyVAE`` opt into this scope through the
+        ``numerical_validation_enabled`` attribute. Standalone evaluation and
+        inference retain their strict default because the attribute is changed
+        only for the duration of a Lightning step.
+        """
+
+        enabled = self._detailed_numerical_check_due(
+            step=int(self.global_step),
+            is_training=is_training,
+        )
+        if self._numerical_validation_modules_cache is None:
+            self._numerical_validation_modules_cache = tuple(
+                module
+                for module in self.modules()
+                if hasattr(module, "numerical_validation_enabled")
+            )
+        previous = [
+            (module, bool(module.numerical_validation_enabled))
+            for module in self._numerical_validation_modules_cache
+        ]
+        for module, _ in previous:
+            module.numerical_validation_enabled = enabled
+        old_active = self._detailed_numerical_validation_active
+        self._detailed_numerical_validation_active = enabled
+        try:
+            yield
+        finally:
+            self._detailed_numerical_validation_active = old_active
+            for module, value in previous:
+                module.numerical_validation_enabled = value
+
+    @staticmethod
+    def _validate_final_loss(loss_dict) -> torch.Tensor:
+        """Keep one synchronous fail-fast check on the optimized scalar."""
+
+        if not isinstance(loss_dict, dict) or "total" not in loss_dict:
+            raise ValueError("_step() must return a dict containing total")
+        total = loss_dict["total"]
+        if not torch.is_tensor(total) or total.numel() != 1:
+            raise ValueError("loss_dict['total'] must be a scalar tensor")
+        if not bool(torch.isfinite(total).all()):
+            raise FloatingPointError("training loss is non-finite")
+        return total
+
+    def _timing_due(self) -> bool:
+        return bool(self._config_get(self.cfg, "debug", False)) or (
+            int(self.global_step) % _TIMING_INTERVAL_STEPS == 0
+        )
+
+    def _start_step_timing(self) -> None:
+        self._timing_cpu_start = time.perf_counter()
+        self._timing_cpu_forward_end = None
+        self._timing_cuda_start = None
+        self._timing_cuda_forward_end = None
+        if self.device.type == "cuda":
+            self._timing_cuda_start = torch.cuda.Event(enable_timing=True)
+            self._timing_cuda_forward_end = torch.cuda.Event(enable_timing=True)
+            self._timing_cuda_start.record()
+
+    def _mark_forward_timing(self) -> None:
+        self._timing_cpu_forward_end = time.perf_counter()
+        if self._timing_cuda_forward_end is not None:
+            self._timing_cuda_forward_end.record()
+
+    def _finish_step_timing(self) -> dict[str, float]:
+        if self._timing_cpu_start is None or self._timing_cpu_forward_end is None:
+            return {}
+        finish = time.perf_counter()
+        if self._timing_cuda_start is None:
+            return {
+                "net_time": self._timing_cpu_forward_end
+                - self._timing_cpu_start,
+                "step_time": finish - self._timing_cpu_start,
+                "step_wall_time": finish - self._timing_cpu_start,
+            }
+
+        cuda_step_end = torch.cuda.Event(enable_timing=True)
+        cuda_step_end.record()
+        # One intentional synchronization at the sparse timing interval gives
+        # truthful forward and forward+backward+optimizer GPU durations.
+        cuda_step_end.synchronize()
+        synchronized_finish = time.perf_counter()
+        return {
+            "net_time": self._timing_cuda_start.elapsed_time(
+                self._timing_cuda_forward_end
+            )
+            / 1000.0,
+            "step_time": self._timing_cuda_start.elapsed_time(cuda_step_end)
+            / 1000.0,
+            "step_wall_time": synchronized_finish - self._timing_cpu_start,
+        }
 
     def _move_ema_storage(self, device) -> None:
         """Move EMA buffers without retaining inference tensors.
@@ -184,6 +309,16 @@ class BasicLightningModule(LightningModule):
     def _step(self, batch, is_training=True):
         raise NotImplementedError
 
+    def _training_log_name(self, key: str) -> str:
+        """Map one loss-dict key to its public training metric name."""
+
+        return f"train_loss/{key}"
+
+    def _training_log_prog_bar(self, key: str) -> bool:
+        """Keep the default progress-bar behavior for existing trainers."""
+
+        return True
+
     def on_fit_start(self):
         self._move_ema_storage(self.device)
 
@@ -191,18 +326,17 @@ class BasicLightningModule(LightningModule):
         self._activate_ema_parameters()
 
     def on_train_batch_start(self, batch, batch_idx):
-        self.batch_ready_time = time.time()
+        self.batch_ready_time = time.perf_counter()
+        self._timing_active = self._timing_due()
 
     def training_step(self, batch, batch_idx):
-        net_start_time = time.time()
-        loss_dict = self._step(batch, is_training=True)
-        net_end_time = time.time()
-        data_time = (
-            self.batch_ready_time - self.last_batch_end_time
-            if self.last_batch_end_time is not None
-            else 0.0
-        )
-        net_time = net_end_time - net_start_time
+        if self._timing_active:
+            self._start_step_timing()
+        with self._numerical_validation_scope(is_training=True):
+            loss_dict = self._step(batch, is_training=True)
+        total = self._validate_final_loss(loss_dict)
+        if self._timing_active:
+            self._mark_forward_timing()
         batch_size = int(batch["body_motion"].shape[0])
         self.log(
             "lr",
@@ -210,12 +344,6 @@ class BasicLightningModule(LightningModule):
             on_step=True,
             prog_bar=True,
             batch_size=batch_size,
-        )
-        self.log(
-            "data_time", data_time, on_step=True, prog_bar=True, batch_size=batch_size
-        )
-        self.log(
-            "net_time", net_time, on_step=True, prog_bar=True, batch_size=batch_size
         )
         self.log(
             "ckpt_absolute_step",
@@ -226,18 +354,33 @@ class BasicLightningModule(LightningModule):
         )
         for key, value in loss_dict.items():
             self.log(
-                f"train_loss/{key}",
+                self._training_log_name(key),
                 value,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=True,
+                prog_bar=self._training_log_prog_bar(key),
                 sync_dist=True,
                 batch_size=batch_size,
             )
-        return loss_dict["total"]
+        return total
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        self.last_batch_end_time = time.time()
+        batch_size = int(batch["body_motion"].shape[0])
+        if self._timing_active:
+            timings = self._finish_step_timing()
+            timings["data_time"] = (
+                self.batch_ready_time - self.last_batch_end_time
+                if self.last_batch_end_time is not None
+                else 0.0
+            )
+            for name, value in timings.items():
+                self.log(
+                    name,
+                    value,
+                    on_step=True,
+                    prog_bar=name in {"data_time", "net_time", "step_time"},
+                    batch_size=batch_size,
+                )
         self.ema.update()
         if self.global_step % 100 == 0:
             self.log("ema_decay", self.ema.decay, sync_dist=False)
@@ -250,9 +393,13 @@ class BasicLightningModule(LightningModule):
                     total_n += parameter.numel()
                 avg_diff = total_abs / max(total_n, 1)
                 self.log("ema_diff/avg", avg_diff, sync_dist=True)
+        self.last_batch_end_time = time.perf_counter()
+        self._timing_active = False
 
     def validation_step(self, batch, batch_idx):
-        loss_dict = self._step(batch, is_training=False)
+        with self._numerical_validation_scope(is_training=False):
+            loss_dict = self._step(batch, is_training=False)
+        self._validate_final_loss(loss_dict)
         batch_size = int(batch["body_motion"].shape[0])
         for key, value in loss_dict.items():
             if key.startswith("metric/"):

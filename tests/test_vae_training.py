@@ -65,7 +65,7 @@ def test_formal_vae_training_config_matches_frozen_recipe():
     assert "fps" not in cfg.model.params
     assert "allow_identity_statistics" not in cfg.model.params
     assert "require_latent_statistics" not in cfg.model.params
-    assert cfg.loss.beta_kl == pytest.approx(1e-5)
+    assert cfg.loss.beta_kl == pytest.approx(1e-4)
     assert cfg.loss.kl_warmup_steps == 0
     assert cfg.loss.lambda_skating == pytest.approx(0.01)
     assert cfg.optimizer.target == "AdamW"

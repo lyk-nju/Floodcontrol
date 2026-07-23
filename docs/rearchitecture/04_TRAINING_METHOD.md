@@ -18,7 +18,7 @@ BodyTransformer = raw-latent velocity
 
 代码同时允许Root/Body各自选择`x0`或`velocity`用于消融，不接受`vel`别名。网络原生输出先完成CFG组合，再解释为统一的`clean_motion`和`solver_velocity`。Euler solver只读取`solver_velocity`；Root始终额外构造投影到heading单位圆的physical clean view，用它派生local root供Body Stage和VAE decoder使用。
 
-Root solver固定在token生命周期内运输到raw x0，只在commit写入persistent state时强制heading单位圆。Root→Body边界始终使用临时投影后的physical clean view，因此Body不会接收非单位heading。persistent-cold各phase持续观察`root_heading_angle_degrees`、`root_heading_raw_norm`、`root_heading_raw_norm_p10`和`root_heading_low_norm_ratio`。
+Root solver固定在token生命周期内运输到raw x0，只在commit写入persistent state时强制heading单位圆。Root→Body边界始终使用临时投影后的physical clean view，因此Body不会接收非单位heading。训练只记录`heading_bias`、`heading_norm`和`heading_antipodal_ratio`；persistent-cold validation各phase额外保留`heading_norm_p10`与`heading_low_norm_ratio`。
 
 ## 2. 窗口与课程
 
@@ -89,7 +89,7 @@ local_root_feature_valid
 - Dynamic Future、commit、translation rebase和condition重编译与runtime一致；
 - 不decode→encode body，不重新采样source。
 
-Validation的`persistent_cold` probe固定观察microstep `0/4/9/11`，分别对应首次update、中期可见性、第一commit边界和第二commit边界。它与只测ideal `H=0,K=1`的teacher-cold probe职责不同。
+普通validation不再用四个不同loader近似persistent cold，只保留一个确定性的continuation loss probe。真实cold能力由完整`H=0` stream直接测量首个commit四帧的Root/Body/feet角度、反向比例，并与全序列rollout指标一起写入生成评测；这避免把ideal单步loss误解为部署时cold生命周期表现。
 
 ## 6. XZ条件与文本
 

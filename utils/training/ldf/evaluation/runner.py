@@ -23,7 +23,10 @@ from metrics.trajectory import (
     summarize_dense_xz_records,
 )
 from utils.training.ldf.data import create_dataset
-from utils.training.ldf.metrics import compute_heading_metrics
+from utils.training.ldf.metrics import (
+    compute_heading_metrics,
+    compute_rollout_heading_metrics,
+)
 
 from .artifacts import (
     evaluation_artifact_dirs,
@@ -56,6 +59,73 @@ def _scalar_metrics(summary: dict[str, Any], prefix: str) -> dict[str, float]:
             number = float(value)
             if np.isfinite(number):
                 output[f"{prefix}/{key}"] = number
+    return output
+
+
+_ROLLOUT_LOG_NAMES = {
+    "cold_root_deg": "val/cold/root_deg",
+    "cold_root_anti": "val/cold/root_anti",
+    "cold_body_deg": "val/cold/body_deg",
+    "cold_feet_deg": "val/cold/feet_deg",
+    "roll_root_deg": "val/roll/root_deg",
+    "roll_root_p95": "val/roll/root_p95",
+    "roll_root_anti": "val/roll/root_anti",
+    "roll_body_deg": "val/roll/body_deg",
+    "roll_feet_deg": "val/roll/feet_deg",
+    "roll_body_rel": "val/roll/body_rel",
+    "roll_feet_rel": "val/roll/feet_rel",
+    "roll_feet_rev": "val/roll/feet_rev",
+    "ade": "val/roll/ade",
+    "fde": "val/roll/fde",
+}
+
+
+def _finite_values(records: list[dict[str, Any]], key: str) -> np.ndarray:
+    values = np.asarray(
+        [float(record[key]) for record in records if key in record],
+        dtype=np.float64,
+    )
+    return values[np.isfinite(values)]
+
+
+def _compact_rollout_metrics(
+    records: list[dict[str, Any]],
+) -> dict[str, float]:
+    output: dict[str, float] = {}
+    for record_key, log_name in _ROLLOUT_LOG_NAMES.items():
+        values = _finite_values(records, record_key)
+        if values.size:
+            output[log_name] = float(values.mean())
+    return output
+
+
+def _standard_case_metrics(
+    records: list[dict[str, Any]],
+    *,
+    case_name: str,
+) -> dict[str, float]:
+    case_records = [
+        record for record in records if str(record.get("name")) == str(case_name)
+    ]
+    if not case_records:
+        raise RuntimeError(f"standard validation case {case_name!r} was not generated")
+    definitions = {
+        "cold_mean": ("cold_root_deg", "mean"),
+        "cold_max": ("cold_root_max", "max"),
+        "root_mean": ("roll_root_deg", "mean"),
+        "root_max": ("roll_root_max", "max"),
+        "body_rel_mean": ("roll_body_rel", "mean"),
+        "body_rel_max": ("roll_body_rel_max", "max"),
+        "feet_rel_mean": ("roll_feet_rel", "mean"),
+        "feet_rel_max": ("roll_feet_rel_max", "max"),
+    }
+    output: dict[str, float] = {}
+    for log_suffix, (record_key, reduction) in definitions.items():
+        values = _finite_values(case_records, record_key)
+        if not values.size:
+            continue
+        value = values.mean() if reduction == "mean" else values.max()
+        output[f"val/case/{case_name}/{log_suffix}"] = float(value)
     return output
 
 
@@ -240,6 +310,7 @@ class LDFEvaluationRunner:
         dataset=None,
         limit: int,
         dataset_name: str | None = None,
+        sample_names: tuple[str, ...] | None = None,
     ) -> tuple[list[tuple[int, dict[str, object]]], int]:
         """Select globally, but load only the samples owned by this DDP rank."""
 
@@ -255,6 +326,8 @@ class LDFEvaluationRunner:
                 identity = (str(sample["dataset"]), str(sample["name"]))
             source_name, sample_name = identity
             if dataset_name is not None and source_name != dataset_name:
+                continue
+            if sample_names is not None and sample_name not in sample_names:
                 continue
             global_index = selected_count
             if global_index % world_size == rank:
@@ -460,11 +533,16 @@ class LDFEvaluationRunner:
         config = self._generation_config(validation)
         dense = validation.dense_xz
         yaw_degrees = self._yaw_video_config(dense)
+        standard_cases = tuple(
+            str(name)
+            for name in dense.get("standard_cases", ("000021", "001168"))
+        )
         probe = str(dense.probe)
         samples, _ = self._selected_sample_shard(
             module,
             dataset=self._probe_dataset(probe),
             limit=0,
+            sample_names=standard_cases,
         )
         maximum_frames = int(self.cfg.data.max_frames)
         base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
@@ -570,6 +648,12 @@ class LDFEvaluationRunner:
         config = self._generation_config(validation)
         dense = validation.dense_xz
         probe = str(dense.probe)
+        standard_cases = tuple(
+            str(name)
+            for name in dense.get("standard_cases", ("000021", "001168"))
+        )
+        if len(set(standard_cases)) != len(standard_cases):
+            raise ValueError("validation.dense_xz.standard_cases must be unique")
         samples, _ = self._selected_sample_shard(
             module,
             dataset=self._probe_dataset(probe),
@@ -583,21 +667,21 @@ class LDFEvaluationRunner:
         for mode in config["modes"]:
             local_records: list[dict[str, Any]] = []
             local_videos: list[str] = []
+            local_case_videos: list[str] = []
             for _, sample in samples:
                 frames = _frame_count(sample, maximum_frames)
                 target_root = sample["root_motion"][:frames]
                 target_body = sample["body_motion"][:frames]
                 for run_index in range(config["num_runs"]):
-                    seed = _stable_seed(
-                        base_seed,
-                        sample["dataset"],
-                        sample["name"],
-                        run_index,
-                    )
+                    # Dense-XZ uses the same three fixed sources for every
+                    # sample so checkpoints are compared under paired noise.
+                    # T2M retains its independent stable-hash seeding below.
+                    seed = base_seed + int(run_index)
                     generated = generate_evaluation_sequence(
                         module,
                         sample,
                         mode=mode,
+                        guidance_mode="joint",
                         seed=seed,
                         frame_count=frames,
                         dense_xz=True,
@@ -634,6 +718,24 @@ class LDFEvaluationRunner:
                         {
                             name: float(value.detach().cpu())
                             for name, value in heading.items()
+                        }
+                    )
+                    ability = compute_rollout_heading_metrics(
+                        predicted_root=generated.root_motion[None],
+                        target_root=target_root.to(generated.root_motion)[None],
+                        predicted_body=generated.body_motion[None],
+                        target_body=target_body.to(generated.body_motion)[None],
+                        frame_mask=torch.ones(
+                            1,
+                            frames,
+                            device=generated.root_motion.device,
+                            dtype=torch.bool,
+                        ),
+                    )
+                    record.update(
+                        {
+                            name: float(value.detach().cpu())
+                            for name, value in ability.items()
                         }
                     )
                     boundaries = compute_stream_boundary_metrics(
@@ -674,10 +776,26 @@ class LDFEvaluationRunner:
                         trajectory_mask=torch.ones(frames, dtype=torch.bool),
                         prompt_change_frames=generated.prompt.change_frames,
                         record=record,
-                        render=False,
+                        render=(
+                            config["render"]
+                            and mode == "stream"
+                            and str(sample["name"]) in standard_cases
+                        ),
                         fps=float(module.model.fps),
                     )
-                    if config["render"] and run_index == 0:
+                    if (
+                        config["render"]
+                        and mode == "stream"
+                        and str(sample["name"]) in standard_cases
+                    ):
+                        local_case_videos.append(
+                            str(dirs["composite"] / f"{sample_id}.mp4")
+                        )
+                    if (
+                        config["render"]
+                        and run_index == 0
+                        and str(sample["name"]) in standard_cases
+                    ):
                         try:
                             local_videos.extend(
                                 self._render_yaw_videos(
@@ -704,11 +822,16 @@ class LDFEvaluationRunner:
 
             gathered_records = _all_gather_objects(local_records)
             gathered_videos = _all_gather_objects(local_videos)
+            gathered_case_videos = _all_gather_objects(local_case_videos)
             if rank == 0:
+                all_records = [
+                    record
+                    for rank_records in gathered_records
+                    for record in rank_records
+                ]
                 by_dataset: dict[str, list[dict[str, Any]]] = {}
-                for rank_records in gathered_records:
-                    for record in rank_records:
-                        by_dataset.setdefault(str(record["dataset"]), []).append(record)
+                for record in all_records:
+                    by_dataset.setdefault(str(record["dataset"]), []).append(record)
                 for dataset, records in by_dataset.items():
                     records.sort(
                         key=lambda value: (
@@ -727,13 +850,6 @@ class LDFEvaluationRunner:
                         metric_dir / "summary.json",
                         {"summary": summary, "samples": records},
                     )
-                    self._log(
-                        module,
-                        _scalar_metrics(
-                            summary, f"eval/dense_xz/{mode}/{dataset}"
-                        ),
-                        step=step,
-                    )
                     rank_zero_info(
                         f"[dense-xz][{mode}][{dataset}][{step_tag}] "
                         f"ADE={summary.get('ade_mean', float('nan')):.4f} "
@@ -749,6 +865,35 @@ class LDFEvaluationRunner:
                         f"root-feet-heading="
                         f"{summary.get('root_feet_heading_angle_deg_mean', float('nan')):.2f}deg"
                     )
+                if mode == "stream":
+                    compact = _compact_rollout_metrics(all_records)
+                    for case_name in standard_cases:
+                        compact.update(
+                            _standard_case_metrics(
+                                all_records,
+                                case_name=case_name,
+                            )
+                        )
+                    self._log(module, compact, step=step)
+                    case_summary_path = (
+                        Path(self.cfg.save_dir)
+                        / "validation"
+                        / "cases"
+                        / step_tag
+                        / "summary.json"
+                    )
+                    write_json(
+                        case_summary_path,
+                        {
+                            "mode": mode,
+                            "seeds": [
+                                base_seed + run_index
+                                for run_index in range(config["num_runs"])
+                            ],
+                            "metrics": compact,
+                            "cases": list(standard_cases),
+                        },
+                    )
                 videos = [
                     Path(path)
                     for rank_paths in gathered_videos
@@ -758,9 +903,22 @@ class LDFEvaluationRunner:
                 self._log_videos(
                     module,
                     paths=videos,
-                    key=f"eval/dense_xz/{mode}/videos",
+                    key=f"val/roll/{mode}_videos",
                     step=step,
                 )
+                case_videos = [
+                    Path(path)
+                    for rank_paths in gathered_case_videos
+                    for path in rank_paths
+                ]
+                case_videos.sort(key=str)
+                if mode == "stream":
+                    self._log_videos(
+                        module,
+                        paths=case_videos,
+                        key="val/case/videos",
+                        step=step,
+                    )
             _distributed_barrier()
 
     def _run_t2m(self, module, *, step: int, step_tag: str) -> None:

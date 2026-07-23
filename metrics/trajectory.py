@@ -110,6 +110,22 @@ def summarize_dense_xz_records(records: Sequence[dict[str, Any]]) -> dict[str, A
         "gt_root_body_heading_angle_deg",
         "gt_root_feet_heading_angle_deg",
         "root_feet_reverse_ratio",
+        "cold_root_deg",
+        "cold_root_max",
+        "cold_root_anti",
+        "cold_body_deg",
+        "cold_feet_deg",
+        "roll_root_deg",
+        "roll_root_p95",
+        "roll_root_max",
+        "roll_root_anti",
+        "roll_body_deg",
+        "roll_feet_deg",
+        "roll_body_rel",
+        "roll_body_rel_max",
+        "roll_feet_rel",
+        "roll_feet_rel_max",
+        "roll_feet_rev",
     )
     for key in scalar_keys:
         values = np.asarray(

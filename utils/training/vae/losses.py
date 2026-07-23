@@ -21,7 +21,6 @@ from utils.motion_process import (
     rotation_to_matrix,
 )
 from utils.coordinate_transform import yaw_to_matrix
-from utils.motion_process import recover_root_yaw
 from utils.token_frame import MOTION_FPS, frame_valid_to_token_valid
 
 
@@ -88,8 +87,16 @@ class VAELoss(nn.Module):
             raise ValueError("FK losses require versioned skeleton_parents and skeleton_offsets")
 
     @staticmethod
+    def _root_yaw(root_motion: torch.Tensor) -> torch.Tensor:
+        # Root inputs have already crossed VAEInput's structural boundary.
+        # Avoid the public helper's repeated finite/nonzero GPU synchronizations
+        # inside the per-batch loss hot path; the Lightning scalar loss guard
+        # remains the numerical fail-fast boundary.
+        return torch.atan2(root_motion[..., 4], root_motion[..., 3])
+
+    @staticmethod
     def _global_positions(root_motion: torch.Tensor, non_root_positions: torch.Tensor) -> torch.Tensor:
-        rotation = yaw_to_matrix(recover_root_yaw(root_motion))
+        rotation = yaw_to_matrix(VAELoss._root_yaw(root_motion))
         positions = torch.einsum(
             "bfij,bfkj->bfki", rotation, non_root_positions
         ) + root_motion[..., None, :3]
@@ -238,7 +245,7 @@ class VAELoss(nn.Module):
             derived_velocity[:, 1:] = (
                 direct_positions[:, 1:] - direct_positions[:, :-1]
             ) * self.fps
-            root_rotation = yaw_to_matrix(recover_root_yaw(inputs.root_motion))
+            root_rotation = yaw_to_matrix(self._root_yaw(inputs.root_motion))
             derived_velocity = torch.einsum(
                 "bfij,bfkj->bfki",
                 root_rotation.transpose(-1, -2),

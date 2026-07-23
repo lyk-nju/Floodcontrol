@@ -298,6 +298,7 @@ def create_xz_condition(
     text_context: list[torch.Tensor],
     text_null_context: list[torch.Tensor],
     future_horizon_tokens: torch.Tensor,
+    validate_numerics: bool = True,
 ) -> LDFCondition:
     """Compile one persistent absolute XZ plan for the current rollout view."""
 
@@ -325,7 +326,7 @@ def create_xz_condition(
     ).reshape(-1)
     if tuple(horizon.shape) != (batch,):
         raise ValueError("future_horizon_tokens must be [B]")
-    if bool((horizon < 0).any()):
+    if validate_numerics and bool((horizon < 0).any()):
         raise ValueError("future_horizon_tokens must be non-negative")
     for name, value in (
         ("active_start", view.active_start),
@@ -372,6 +373,7 @@ def create_xz_condition(
         future_root_condition_mask=future_mask,
         future_timeline_position_ids=view.timeline_position_ids,
         future_horizon_tokens=horizon,
+        validate_numerics=validate_numerics,
     )
 
 

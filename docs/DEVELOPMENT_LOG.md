@@ -6202,3 +6202,125 @@
 - 删除Body Transformer的2维absolute-heading输入改变了LDF input projection shape；
   新LDF应按既定计划从头训练，旧LDF checkpoint不兼容。
 - 稀疏body observation仍未实现；本轮只把错误的hard overwrite改成明确fail-fast。
+
+## 2026-07-23 · 训练热路径数值检查降频与真实性能计时
+
+改动类型：训练性能优化 / 数值安全边界 / 可观测性 / 回归测试
+
+实际改动内容：
+
+- `BasicLightningModule`将训练期完整张量数值检查固定为每`500`步，将真实性能计时
+  固定为每`50`步。这两个内部性能策略不进入实验YAML；`debug=true`仍逐步执行完整
+  检查，validation始终完整检查。
+- BodyVAE独立调用保持严格数值检查；只有Lightning训练step的受控作用域会临时关闭
+  encode/decode/posterior/decoder输出的逐张量finite扫描。shape、dtype、feature
+  mask等结构校验仍逐步执行。
+- LDF条件编译在普通训练step只执行结构校验，在debug、周期检查step和validation执行
+  完整finite/mask语义校验；inference公共接口默认仍执行完整校验。
+- 每个train step保留唯一的最终`loss_dict["total"]`finite同步检查，确保NaN/Inf仍在
+  首个异常step失败；周期完整检查用于更早定位具体输入、posterior或condition字段。
+- VAE loss内部root yaw恢复改为已验证Root5边界上的纯`atan2`计算，避免skating和
+  velocity-consistency在同一batch重复调用带同步的公共输入校验。BodyVAE完整检查step
+  仍验证有效root frame finite且heading非零。
+- 原`time.time()`前向计时替换为稀疏CUDA Event计时。新增：
+  - `net_time`：真实GPU forward时间；
+  - `step_time`：真实GPU forward + backward + 当批optimizer update时间；
+  - `step_wall_time`：对应CPU wall time；
+  - `data_time`：上一个batch收尾到当前batch ready的等待时间。
+  CUDA只在固定计时间隔显式同步一次，普通step不为性能指标额外同步。
+
+改动理由：
+
+- `bool(torch.isfinite(cuda_tensor).all())`会立即同步GPU与CPU。VAE encode/decode和LDF
+  condition在每个batch、persistent rollout的多个阶段反复执行时，会把原本异步的
+  kernel流水线切碎；结构检查不需要读取accelerator数值，适合保留在每一步。
+- 原`time.time()`包围forward只测量CPU发射CUDA kernel的时间，不能反映真实网络耗时，
+  也完全遗漏backward与optimizer。稀疏CUDA Event既提供可解释数据，又避免每步为计时
+  强制同步。
+- 最终标量loss是优化器真正消费的数值边界；每步检查它可保留fail-fast，而周期完整
+  检查负责诊断具体张量，二者职责清晰。
+
+验证：
+
+- 数值检查作用域、debug/validation频率、最终loss fail-fast、CPU计时fallback和
+  LDF structure-only condition边界定向测试通过。
+- 正式测试目录：
+  `PY=/home/yuankai/.conda/envs/flooddiffusion/bin/python ./scripts/run_pytest.sh tests -q`
+  得到`347 passed, 6 skipped`。
+- 修改Python文件`py_compile`通过，`git diff --check`通过。
+
+涉及文件：
+
+- `utils/training/lightning_module.py`
+- `models/vae_wan_1d.py`
+- `utils/conditions/ldf.py`
+- `utils/training/ldf/conditioning.py`
+- `utils/training/ldf/lightning_module.py`
+- `utils/training/vae/losses.py`
+- `tests/test_ema_lifecycle.py`
+- `tests/test_ldf_conditions.py`
+- `tests/test_vae_model.py`
+- `docs/DEVELOPMENT_LOG.md`
+
+尚未完成的后续事项：
+
+- `net_time`现在是同步后的真实GPU时间，数值定义与旧版CPU launch time不同，不能将
+  新旧WandB曲线直接按绝对值比较。需用新字段跑同一配置若干百步后再判断实际提速。
+- 当前仍保留每步一次最终loss同步，这是有意的安全/吞吐折中；只有经过稳定长训证明
+  可以接受延迟发现NaN后，才考虑进一步改成异步assert或周期性最终检查。
+
+## 2026-07-23 · LDF训练日志合同收口
+
+改动类型：可观测性 / 训练热路径简化 / 日志语义冻结
+
+实际改动内容：
+
+- LDF训练只公开九个step+epoch指标：
+  `loss_total`、`loss_root`、`loss_body`、三个未加权Root子项，以及
+  `heading_bias`、`heading_norm`、`heading_antipodal_ratio`。
+- `loss_root`与`loss_body`记录它们对优化标量的实际贡献，包含各自配置权重和
+  rollout权重；`loss_root_xz/height/heading`保持未加权原值，因此三者之和是
+  加权前的Root objective。
+- 删除日志字典中为其他prediction type预留的恒零分支；默认关闭的boundary loss
+  不再产生恒零曲线。boundary公式和可选权重本身仍保留。
+- Root heading观测重命名：
+  `heading_bias`是与GT的角度偏差（度），`heading_norm`是单位圆投影前模长，
+  `heading_antipodal_ratio`是cosine小于`-0.9`的反向比例。
+- 训练不再为了九项Root/Body/feet物理朝向诊断执行冻结VAE decode。完整物理朝向
+  指标继续由validation与生成评测计算。
+- `heading_norm_p10`和`heading_low_norm_ratio`只在validation loss结果中生成，
+  不进入训练热路径或训练WandB面板。
+- `BasicLightningModule`增加可覆盖的训练日志命名与progress-bar hook；VAE等现有
+  trainer保持原命名，LDF使用清晰的`train/*`命名且进度条只展示总loss。
+
+验证：
+
+- LDF training/self-forcing定向测试：`62 passed`。
+- 测试锁定训练不得为观测指标调用`BodyVAE.detokenize()`，并验证加权Root/Body贡献、
+  未加权Root子项及精简后的九个公开训练日志名称。
+
+## 2026-07-23 · LDF validation日志与固定样本收口
+
+改动类型：可观测性 / 流式能力评测 / W&B面板简化
+
+实际改动内容：
+
+- 普通validation由四套teacher/persistent/self-forcing loader收口为一套确定性的
+  continuation probe，只记录`val/loss_total`、`val/loss_root`和`val/loss_body`。
+  它不再为每个batch解码Body或把大量phase诊断写入W&B。
+- cold与长程能力统一从真实`H=0`完整stream生成结果计算。首个commit四帧记录Root、
+  Body与feet相对GT的角度及Root近180度比例；完整序列记录Root mean/P95/antipodal、
+  Body/feet GT误差、Body/feet相对Root关系误差、paired excess reverse和ADE/FDE。
+- `body_rel/feet_rel`比较预测与GT各自的相对Root角度，不强制人物或脚平行Root，
+  因而不会错误惩罚倒退、侧步或转身。`feet_rev`只统计预测新增的反向脚状态。
+- `000021`与`001168`固定使用dense GT XZ、joint CFG和seed
+  `4321/4322/4323`。每个样本在W&B只公开cold/root/body-relative/feet-relative的
+  mean/max八项，三次完整视频和逐run详细指标继续保存到artifact目录。
+- dense-XZ的旧长名前缀指标不再全部写入W&B；完整旧诊断、边界、skating及max error
+  仍保存在每样本JSON和dataset summary JSON。T2M计算、命名、控制台输出与artifact
+  合同未修改。
+
+验证：
+
+- heading、evaluation、Dataset validation与LDF training定向测试：
+  `69 passed`。

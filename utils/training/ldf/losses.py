@@ -194,6 +194,7 @@ def _root_heading_metrics(
     step: LDFTrainingStep,
     *,
     root_prediction_type: str,
+    include_detailed_metrics: bool,
 ) -> dict[str, torch.Tensor]:
     """Observe raw clean heading angle/norm without contributing to loss."""
 
@@ -217,19 +218,25 @@ def _root_heading_metrics(
     angle_degrees = torch.rad2deg(torch.acos(cosine))
     frame_mask = mask[..., None].expand_as(cosine)
     selected_norm = predicted_norm[frame_mask]
-    return {
-        "root_heading_angle_degrees": angle_degrees[frame_mask].mean().detach(),
-        "root_heading_raw_norm": selected_norm.mean().detach(),
-        "root_heading_raw_norm_p10": torch.quantile(
-            selected_norm, 0.1
-        ).detach(),
-        "root_heading_low_norm_ratio": (
-            selected_norm < 0.25
-        ).float().mean().detach(),
-        "root_heading_antipodal_ratio": (
+    result = {
+        "heading_bias": angle_degrees[frame_mask].mean().detach(),
+        "heading_norm": selected_norm.mean().detach(),
+        "heading_antipodal_ratio": (
             cosine[frame_mask] < -0.9
         ).float().mean().detach(),
     }
+    if include_detailed_metrics:
+        result.update(
+            {
+                "heading_norm_p10": torch.quantile(
+                    selected_norm, 0.1
+                ).detach(),
+                "heading_low_norm_ratio": (
+                    selected_norm < 0.25
+                ).float().mean().detach(),
+            }
+        )
+    return result
 
 
 def compute_ldf_loss(
@@ -242,30 +249,25 @@ def compute_ldf_loss(
     body_weight: float = 1.0,
     rollout_weight: float = 1.0,
     root_boundary_weight: float = 0.0,
+    include_detailed_metrics: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Dispatch independent Root/Body objectives and return stable log keys."""
+    """Dispatch Root/Body objectives and return the compact public log contract."""
 
     if root_prediction_type == "x0":
         root = compute_root_x0_loss(prediction, step)
-        root_key = "anchor_root_x0"
     elif root_prediction_type == "velocity" and step.is_rollout:
         root = compute_root_corrective_velocity_loss(prediction, step)
-        root_key = "anchor_root_corrective_velocity"
     elif root_prediction_type == "velocity":
         root = compute_root_ideal_velocity_loss(prediction, step)
-        root_key = "anchor_root_flow_velocity"
     else:
         raise ValueError(f"unsupported root prediction type {root_prediction_type!r}")
 
     if body_prediction_type == "x0":
         body = compute_body_x0_loss(prediction, step)
-        body_key = "latent_body_x0"
     elif body_prediction_type == "velocity" and step.is_rollout:
         body = compute_body_corrective_velocity_loss(prediction, step)
-        body_key = "latent_body_corrective_velocity"
     elif body_prediction_type == "velocity":
         body = compute_body_ideal_velocity_loss(prediction, step)
-        body_key = "latent_body_flow_velocity"
     else:
         raise ValueError(f"unsupported body prediction type {body_prediction_type!r}")
 
@@ -279,28 +281,27 @@ def compute_ldf_loss(
         else root["root"].detach() * 0.0
     )
     scale = float(rollout_weight) if step.is_rollout else 1.0
-    total = scale * (
-        float(root_weight) * root["root"] + float(body_weight) * body
-    ) + float(root_boundary_weight) * boundary
-    zero = total.detach() * 0.0
+    weighted_root = scale * float(root_weight) * root["root"]
+    weighted_body = scale * float(body_weight) * body
+    total = (
+        weighted_root
+        + weighted_body
+        + float(root_boundary_weight) * boundary
+    )
     result = {
-        "anchor_root_x0": zero,
-        "anchor_root_flow_velocity": zero,
-        "anchor_root_corrective_velocity": zero,
-        "anchor_root_xz": root["root_xz"],
-        "anchor_root_height": root["root_height"],
-        "anchor_root_heading": root["root_heading"],
-        "latent_body_x0": zero,
-        "latent_body_flow_velocity": zero,
-        "latent_body_corrective_velocity": zero,
-        "root_boundary_displacement": boundary,
+        "loss_root": weighted_root,
+        "loss_body": weighted_body,
+        "loss_root_xz": root["root_xz"],
+        "loss_root_height": root["root_height"],
+        "loss_root_heading": root["root_heading"],
         "total": total,
     }
-    result[root_key] = root["root"]
-    result[body_key] = body
     result.update(
         _root_heading_metrics(
-            prediction, step, root_prediction_type=root_prediction_type
+            prediction,
+            step,
+            root_prediction_type=root_prediction_type,
+            include_detailed_metrics=include_detailed_metrics,
         )
     )
     return result
