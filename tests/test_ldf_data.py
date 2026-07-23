@@ -560,6 +560,7 @@ def test_create_dataloaders_exposes_one_comparable_validation_probe(monkeypatch)
     )
     train, validation = create_dataloaders(cfg, encoder_context_tokens=2)
     assert train is not None
+    assert train.persistent_workers is False
     # K=5 reserves four rollout tokens, so the five-token short clip is
     # filtered from training. Heavy cold/rollout abilities are measured by the
     # generation runner rather than duplicated as validation loaders.
@@ -569,3 +570,53 @@ def test_create_dataloaders_exposes_one_comparable_validation_probe(monkeypatch)
         "teacher_continuation",
     ]
     assert validation_batches[0]["validation_position"] == ["early"]
+
+
+def test_training_workers_are_persistent_but_validation_workers_are_not(
+    monkeypatch,
+):
+    dataset = MinimumFrameDataset(VariableLengthDataset(), min_frames=20)
+    monkeypatch.setattr(
+        "utils.training.ldf.data.create_dataset", lambda _cfg, _split: dataset
+    )
+    cfg = OmegaConf.create(
+        {
+            "seed": 3,
+            "train": True,
+            "self_forcing": {
+                "k_schedule": [[0, 1]],
+                "teacher_replay": {},
+                "cold_start_replay": 0.0,
+                "cold_start": {
+                    "persistent_probability": 0.5,
+                    "rollout_commits": 1,
+                },
+            },
+            "trainer": {"max_steps": 20},
+            "training": {
+                "window": {
+                    "max_tokens": 10,
+                    "generation_tokens": 5,
+                }
+            },
+            "model": {"params": {"chunk_size": 5}},
+            "data": {
+                "min_frames": 20,
+                "max_frames": 40,
+                "random_yaw": False,
+                "train_batch_size": 1,
+                "val_batch_size": 1,
+                "num_workers": 1,
+                "pin_memory": False,
+            },
+        }
+    )
+
+    train, validation = create_dataloaders(cfg, encoder_context_tokens=2)
+
+    assert train is not None
+    assert train.num_workers == 1
+    assert train.persistent_workers is True
+    assert len(validation) == 1
+    assert validation[0].num_workers == 1
+    assert validation[0].persistent_workers is False

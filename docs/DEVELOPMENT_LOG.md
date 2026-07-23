@@ -6324,3 +6324,201 @@
 
 - heading、evaluation、Dataset validation与LDF training定向测试：
   `69 passed`。
+
+## 2026-07-23 · Body259/VAE/LDF架构可行性实验总复盘
+
+改动类型：实验复盘 / 架构验收 / VAE选择 / LDF短训审计
+
+本轮要回答的问题：
+
+- Root5/Body259能否严格往返HumanML263，并在全局yaw旋转下保持Body不变；
+- 删除latent whitening后，deterministic raw posterior `mu`是否具有可供LDF学习的
+  数值几何，是否存在collapsed channel；
+- VAE训练时的crop-reset和LDF在线24-token warm context是否产生不可接受的latent或
+  重构分布差异；
+- `beta_kl=1e-5`与`1e-4`中哪一个更适合作为正式LDF tokenizer；
+- decoder对LDF不可避免的latent预测误差是否有基本容错能力；
+- Root-x0的XZ、height、heading等权SmoothL1是否能真正学习heading，还是会稳定停在
+  零向量/随机方向捷径；
+- Root/Body loss的首轮数值尺度是否需要在正式远端训练前重新加权。
+
+### 1. Root5/Body259表示与HumanML evaluator闭环
+
+- 真实HumanML样本`000021`的263→Root5/Body259→263闭环达到数值精度：
+  position最大误差`2.98e-7`、root最大误差`6.03e-7`、rotation最大误差`6.11e-7`。
+- HumanML完整val split共1450条动作的exact-drop round-trip FID为
+  `8.2877e-6`，embedding cosine接近1。
+- 对每条动作分别施加0°、45°、90°、180°和seed固定的随机全局yaw后，
+  相对未旋转round-trip的FID处于`0`到`5.52e-10`；各角度相对原始HumanML263的
+  FID仍约为`8.29e-6`。
+- 结论：Root5是world XYZ/heading唯一所有者、Body259对共享全局yaw不变的codec合同
+  成立；HumanML evaluator回写没有角度相关的系统漂移。该实验只验证表示和adapter，
+  不等价于VAE或LDF生成质量。
+
+### 2. VAE warm-context与online encode合同
+
+- 使用EMA VAE在真实validation窗口比较full-clip `mu`与不同真实左context长度的
+  active `mu`。cold-start和partial-real-history接口相对各自full reference均达到
+  约`1e-6`量级数值一致。
+- 30k checkpoint的128样本审计显示：在序列中部强行reset context时，active latent
+  相对full encode的RMSE为`0.25235`、cosine为`0.99155`，对应world MPJPE
+  `6.64 mm`；提供6 tokens真实历史后latent RMSE降至`1.55e-4`，提供12或24 tokens后
+  降至约`2e-6`，重构world MPJPE稳定为约`3.68 mm`。
+- 最终300k候选上，24-token warm-context重构MPJPE分别为：
+  - KL `1e-5`：`2.435 mm`；
+  - KL `1e-4`：`2.444 mm`。
+  对应reset-window MPJPE分别为`4.899 mm`和`5.096 mm`。
+- 结论：VAE随机crop-reset可以作为VAE训练增强，但LDF中部窗口必须使用真实causal
+  warm context；当前逐样本真实context与`tokenize_window()`合同确实消除了该分布
+  缺口。12 tokens在本次结构上已接近数值饱和，正式接口仍保留完整24-token感受野。
+
+### 3. final raw-μ几何与KL候选比较
+
+对两个300k EMA checkpoint使用同一批validation动作、deterministic `mu`和同一
+HumanML evaluator进行比较：
+
+| 指标 | KL `1e-5` | KL `1e-4` |
+|---|---:|---:|
+| deterministic reconstruction FID | `0.0037509` | `0.0037633` |
+| deterministic world MPJPE | `2.638 mm` | `2.668 mm` |
+| rotation geodesic | `0.8354°` | `0.8460°` |
+| foot direction error | `1.5403°` | `1.5427°` |
+| validation raw-μ RMS | `1.8084` | `1.2910` |
+| channel std max/min | `2.7240` | `1.8677` |
+| ideal body velocity RMS | `2.0667` | `1.6333` |
+| covariance effective rank | `56.06` | `71.65` |
+| posterior sigma mean（仅诊断） | `0.00309` | `0.00858` |
+| offline/stream decoder max abs | `0.00513` | `0.00462` |
+
+- 两个候选均无collapsed channel，所有128维channel std均大于`0.1`，deterministic
+  reconstruction和warm-context hard gate均通过。
+- `1e-5`的重构指标略优，但差距约1%；`1e-4`的raw-μ尺度更小、跨channel尺度更均匀、
+  effective rank更高，Body ideal velocity target也更小。
+- posterior sigma不是LDF输入，也不是选择指标；LDF只使用deterministic `mu`。它只用来
+  解释KL正则对latent几何的影响。
+
+### 4. latent扰动容错
+
+在同一GT `mu`上加入各向同性噪声再解码，测量相对无扰动重构的FID退化：
+
+| latent噪声标准差 | KL `1e-5` | KL `1e-4` |
+|---|---:|---:|
+| `0.01` | `-1.20e-6` | `-1.25e-6` |
+| `0.03` | `5.14e-5` | `7.37e-5` |
+| `0.10` | `0.00153` | `0.00241` |
+| `0.30` | `0.05025` | `0.08548` |
+
+- 两个decoder对`0.01`到`0.03`的小扰动均基本稳定；较大扰动下`1e-5`更鲁棒。
+- 该结果没有支持“posterior sigma更大必然让decoder更稳”的假设；posterior sigma只能
+  作为解释变量，必须直接测decoded degradation。
+- 综合近乎相同的deterministic重构、`1e-4`更规整的raw-μ几何和更高effective rank，
+  项目最终选择KL `1e-4`的300k EMA checkpoint进入LDF：
+  `/data1/yuankai/text2Motion/Floodcontrol/vae/20260723_133259_vae_body259/step_300000.ckpt`。
+  这是偏向LDF可学习几何的工程选择，不表示`1e-4`在所有VAE指标上全面优于`1e-5`。
+
+### 5. VAE重构与脚部/FK诊断
+
+- 300k两个候选的deterministic foot direction error均约`1.54°`，foot reverse ratio
+  为0；ankle-toe长度误差约`2 mm`。
+- `1e-4`候选在128样本current-contract审计上的world MPJPE约`2.65 mm`、rotation
+  geodesic约`0.84°`、velocity MAE约`0.0139 m/s`。
+- source FK/direct MPJPE本身约`52.46 mm`，reconstruction FK/direct约`54.11 mm`；
+  二者只相差约`1.65 mm`。这说明主要FK/direct差距来自HumanML IK gauge与冗余表示
+  本身，而不是VAE新制造了同量级的运动学冲突，因此当前没有依据打开强FK loss。
+- 两个最终checkpoint开始训练时早于backward/current contact和feature-level encoder
+  mask修复；实验同时跑了legacy/current encoder边界，主要几何与latent结果近似一致。
+  contact/skating只作为诊断，不用于两个checkpoint的主质量排序。
+
+### 6. Root-x0 / Body-velocity 500步短训
+
+- 使用最终KL `1e-4` VAE、physical Root5、raw deterministic `mu`、Root-x0和
+  Body-velocity在单卡BS32上运行短训；Root/Body/rollout以及Root内部XZ/height/heading
+  权重均为`1.0`。
+- 第164步的可复核分解为：
+  - `loss_root_xz=0.04420`；
+  - `loss_root_height=0.02751`；
+  - `loss_root_heading=0.26332`；
+  - 三项和为`loss_root=0.33503`；
+  - `loss_body=2.44353`；
+  - `loss_total=2.77856`。
+- 0到约160步期间，raw heading norm从约`0.9`降至约`0.27`，heading angle error维持
+  约`90°`，antipodal ratio维持约`14%`。这对应模型先学习圆周目标的均值/近零输出；
+  raw heading SmoothL1约`0.25`正是零向量预测单位圆target的基线。
+- 约400步后模型离开该早期均值解：heading norm恢复到约`0.85–0.9`，heading angle
+  error降至约`15–25°`，antipodal ratio降至接近0，heading loss同步继续下降。
+  因而短训不支持“raw-vector heading loss会稳定卡死在零向量”这一质疑，也没有依据
+  再叠加cosine/norm补丁。
+- Root XZ从约`0.18`降至`0.03–0.05`，height从约`0.62`降至`0.02–0.03`；
+  Body raw-μ velocity loss在约`2.4–3.0`间波动。500步仍处于5000步LR warmup早期，
+  不能据此判断最终Body生成质量。
+- Root和Body由独立Transformer承担，训练时Root→Body local-root condition detach；
+  两个loss的标量大小不代表共享参数上的竞争。因此不为追平Body数值而放大Root，
+  正式远端配置保持所有权重为`1.0`。
+- step loss中的孤立尖峰对应不同noise/window和persistent-cold样本，修复commit dtype
+  后训练已连续通过500步。短训checkpoint保存于
+  `/data1/yuankai/text2Motion/Floodcontrol/ldf/20260723_210352_ldf_hybrid/step_000500.ckpt`。
+
+### 7. 短训期间发现并修复的真实bug
+
+- 首次LDF短训在persistent cold commit时触发BF16 destination与FP32 source的advanced
+  indexed assignment dtype错误。原因是VAE latent state在AMP下为BF16，而scheduler
+  beta与solver更新将commit replacement提升到FP32。
+- `_replace_token()`现在在事务边界显式将Root/Body replacement转换到各自state
+  dtype；新增BF16/FP32交叉回归测试。修复后persistent cold路径不再在约10% replay
+  样本上崩溃。
+- 定向self-forcing测试`39 passed`；training/forward/stream测试
+  `58 passed, 1 skipped`。
+
+### 最终判断与结论边界
+
+本日实验已经提供以下正面证据：
+
+- Root5/Body259 codec、HumanML回写和全局yaw不变性成立；
+- raw deterministic `mu`不存在channel collapse，不需要latent statistics才能作为
+  LDF状态；
+- 真实24-token warm context能把中部窗口active `mu`恢复到full-clip数值精度；
+- VAE deterministic重构、stream decoder、脚部方向和小latent扰动均达到可用水平；
+- Root-x0三块直接监督都产生了可观测的有效优化信号，heading虽然先经过均值塌缩阶段，但能在短训
+  中恢复单位模长并快速降低角度/反向错误；
+- 当前Root/Body权重无需为正式远端训练重新缩放。
+
+本日实验尚未证明：
+
+- 500k LDF长训后的T2M FID、dense-XZ跟踪和长程stream rollout已经达标；
+- KL `1e-4`一定比`1e-5`产生更好的最终LDF；两者的决定性比较仍需要matched LDF
+  pilot或最终decoded FID；
+- 500步Body loss足以判断raw-μ Body Transformer的最终可学习性；
+- HumanML IK gauge的source FK/direct gap可以通过强FK loss无副作用地消除。
+
+因此当前结论是“架构具备进入正式LDF训练的证据”，而不是“最终生成质量已经验收”。
+远端训练冻结使用KL `1e-4` VAE、Root-x0/Body-velocity、50-token窗口、C=5、dynamic
+future、persistent cold/self-forcing课程、joint CFG和全部`1.0` loss权重。
+
+实验与结果文件：
+
+- `debug/results/body259_rotation_fid_val1450.json`
+- `debug/results/vae_ldf_contract/step_030000.json`
+- `debug/results/vae_ldf_selection/step_150000_kl_comparison.{json,md}`
+- `debug/results/vae_ldf_selection/step_300000_kl_comparison.{json,md}`
+- `debug/results/vae_ldf_selection/step_300000_kl_1e-5_contact.json`
+- `debug/results/vae_ldf_selection/step_300000_kl_1e-4_contact.json`
+
+### 8. 八卡DDP启动资源修复
+
+- 远端八卡在`ProcessGroupNCCL`构造阶段报
+  `Resource temporarily unavailable`；该时点早于DataLoader迭代，因此
+  `num_workers=2`对应的16个worker尚未启动，不是本次异常的直接来源。
+- 实测未限制线程时，单个进程仅导入PyTorch就拥有约64个OS线程；Lightning内部
+  DDP启动器又在子脚本已经导入PyTorch和构造模型之后才应用线程启发式，八个rank
+  因而可能在NCCL初始化前占用约512个task并触发用户/cgroup task上限。
+- `train_ldf.py`现在于第一次PyTorch import之前将OMP、MKL、OpenBLAS和NumExpr
+  固定为单线程，并在`main()`固定PyTorch intra-op/interop为1。相同导入探针的
+  OS线程数由64降为1；该修改不改变GPU模型、batch、loss或采样语义。
+- LDF训练DataLoader在`num_workers>0`时启用persistent workers，避免每个短
+  length-bucket epoch反复创建和销毁所有rank的worker；validation worker仍按次
+  释放。远端`num_workers=2`是per-rank语义，即八卡共16个训练worker。
+- 代码审计确认`MinimumFrameDataset`会在每个rank启动时扫描NPZ长度，但文件使用
+  context manager及时关闭；这是重复启动I/O而非线程/进程泄漏，未作为本次NCCL
+  故障处理。
+- 定向DataLoader/入口测试`68 passed`；全仓测试`360 passed`，`py_compile`与
+  `git diff --check`通过。

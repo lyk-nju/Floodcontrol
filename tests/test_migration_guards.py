@@ -39,6 +39,18 @@ for forbidden in (
     )
 
 
+def test_ldf_entrypoint_sets_cpu_thread_limits_before_importing_torch():
+    source = (ROOT / "train_ldf.py").read_text()
+    torch_import = source.index("import torch")
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        assert source.index(f'"{name}"') < torch_import
+
+
 def test_formal_ldf_config_uses_the_vae_as_contract_source():
     cfg = load_config(str(REMOTE_LDF_CONFIG))
     assert "status" not in cfg.config

@@ -4,6 +4,22 @@ from __future__ import annotations
 
 import math
 import os
+
+# Lightning's internal DDP launcher starts child scripts before it applies its
+# CPU-thread heuristic.  On large hosts, importing PyTorch can therefore create
+# dozens of threads in every rank before NCCL initializes; eight ranks can hit
+# the per-user/cgroup task limit and make ProcessGroupNCCL fail with EAGAIN
+# ("Resource temporarily unavailable").  LDF training is GPU-bound and its
+# DataLoader workers are separate processes, so keep every rank's CPU runtime
+# single-threaded from the first PyTorch import.
+for _thread_environment_name in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ[_thread_environment_name] = "1"
+
 from pathlib import Path
 
 import torch
@@ -267,6 +283,8 @@ def _generation_evaluation_enabled(cfg) -> bool:
 
 
 def main() -> None:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
     torch.set_float32_matmul_precision("high")
     cfg = load_config()
     seed_everything(cfg.seed)

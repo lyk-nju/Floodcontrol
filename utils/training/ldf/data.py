@@ -788,6 +788,8 @@ def create_dataloaders(
         "num_workers": int(cfg.data.num_workers),
         "pin_memory": bool(cfg.data.get("pin_memory", True)),
     }
+    if common["num_workers"] < 0:
+        raise ValueError("data.num_workers must be non-negative")
     train_loader = None
     if train_dataset is not None:
         batch_sampler = LengthBucketBatchSampler(
@@ -809,6 +811,11 @@ def create_dataloaders(
                 random_yaw=cfg.data.random_yaw,
                 cold_start_replay=cold_start_replay,
             ),
+            # Recreating every rank's workers at each short length-bucket epoch
+            # causes avoidable process churn.  Augmentation randomness is
+            # carried by sampler indices, so persistent workers do not change
+            # the deterministic data contract.
+            persistent_workers=common["num_workers"] > 0,
             **common,
         )
 
