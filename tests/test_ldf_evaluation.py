@@ -187,6 +187,36 @@ def test_startup_yaw_video_probe_runs_once_before_optimizer_steps(monkeypatch):
     assert calls == [{"step": 160_000, "step_tag": "fit_start"}]
 
 
+def test_startup_validation_runs_t2m_once_even_without_dense_render(monkeypatch):
+    cfg = OmegaConf.create(
+        {
+            "validation": {
+                "generation": {
+                    "enabled": True,
+                    "run_at_start": True,
+                    "render": False,
+                },
+                "dense_xz": {"enabled": False},
+                "t2m": {"enabled": True},
+            },
+            "train": True,
+        }
+    )
+    runner = LDFEvaluationRunner(cfg)
+    calls = []
+    monkeypatch.setattr(runner, "_evaluation_context", lambda module: nullcontext())
+    monkeypatch.setattr(
+        runner,
+        "_run_t2m",
+        lambda module, **kwargs: calls.append(kwargs),
+    )
+    module = types.SimpleNamespace(global_step=160_000)
+
+    assert runner.run_at_start(module) is True
+    assert runner.run_at_start(module) is False
+    assert calls == [{"step": 160_000, "step_tag": "fit_start"}]
+
+
 def test_t2m_console_summary_reports_all_computed_metrics():
     output = _format_t2m_summary(
         {
@@ -676,12 +706,14 @@ def test_dense_xz_video_embeds_trajectory_in_fixed_camera_scene(
     target_call, predicted_call = render_calls
     assert target_call[0][2] != video_path
     assert target_call[1]["show_full_trajectory"] is True
+    assert target_call[1]["show_root_heading"] is True
     assert target_call[1]["traj_mask"].all()
     assert "show_generated_trajectory" not in target_call[1]
     assert torch.equal(target_call[1]["traj_xz"], target_root[:, [0, 2]])
     assert predicted_call[0][2] == video_path
     assert predicted_call[1]["show_full_trajectory"] is True
     assert predicted_call[1]["show_generated_trajectory"] is True
+    assert predicted_call[1]["show_root_heading"] is True
     assert predicted_call[1]["traj_mask"].all()
     assert torch.equal(predicted_call[1]["traj_xz"], target_root[:, [0, 2]])
 

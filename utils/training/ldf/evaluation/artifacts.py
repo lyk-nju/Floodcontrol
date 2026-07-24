@@ -127,6 +127,7 @@ def render_comparison_video(
             traj_xz=target_xz,
             traj_mask=trajectory_mask,
             show_full_trajectory=True,
+            show_root_heading=True,
         )
         render_motion_video(
             predicted_root,
@@ -137,6 +138,7 @@ def render_comparison_video(
             traj_mask=trajectory_mask,
             show_full_trajectory=True,
             show_generated_trajectory=True,
+            show_root_heading=True,
         )
         target_reader = imageio.get_reader(str(target_path))
         predicted_reader = imageio.get_reader(str(predicted_video_path))

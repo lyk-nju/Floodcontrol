@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from tools.sweep_ldf_t2m_cfg import (
     GuidanceVariant,
     assign_variant_groups,
     guidance_variants,
+)
+from utils.training.ldf.evaluation.t2m import (
+    build_t2m_evaluation_batches,
+    shard_t2m_evaluation_batches,
 )
 
 
@@ -55,3 +60,40 @@ def test_t2m_cfg_sweep_assigns_complete_variants_across_gpus():
 def test_t2m_cfg_sweep_rejects_invalid_device_assignments(devices):
     with pytest.raises(ValueError):
         assign_variant_groups(guidance_variants((1.0,)), devices)
+
+
+def test_t2m_batches_are_fixed_before_world_size_sharding():
+    samples = []
+    for index, frames in enumerate((8, 12, 8, 16, 12, 8, 16)):
+        samples.append(
+            (
+                index,
+                {
+                    "root_motion": torch.zeros(frames, 5),
+                    "name": f"sample_{index}",
+                },
+            )
+        )
+    batches = build_t2m_evaluation_batches(
+        samples,
+        maximum_frames=16,
+        batch_size=2,
+    )
+    canonical = [
+        tuple(index for index, _ in batch.samples)
+        for batch in batches
+    ]
+
+    for world_size in (1, 4, 8):
+        observed = []
+        for rank in range(world_size):
+            shard = shard_t2m_evaluation_batches(
+                batches,
+                rank=rank,
+                world_size=world_size,
+            )
+            observed.extend(
+                tuple(index for index, _ in batch.samples)
+                for batch in shard
+            )
+        assert sorted(observed) == sorted(canonical)

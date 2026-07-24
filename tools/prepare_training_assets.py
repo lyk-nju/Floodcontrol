@@ -595,7 +595,7 @@ def _verify(
         if args.skip_t5:
             details["ldf_configs"] = "not checked because --skip-t5 was set"
         else:
-            from train_ldf import _validate_training_config
+            from utils.training.ldf.config import validate_training_config
 
             for config in (args.ldf_config, args.ldf_multi_config):
                 cfg = load_config(
@@ -605,7 +605,7 @@ def _verify(
                         "vae.checkpoint_path": str(checkpoint),
                     },
                 )
-                _validate_training_config(cfg)
+                validate_training_config(cfg)
             details["ldf_configs"] = [args.ldf_config, args.ldf_multi_config]
     return details
 

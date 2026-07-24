@@ -6522,3 +6522,57 @@ future、persistent cold/self-forcing课程、joint CFG和全部`1.0` loss权重
   故障处理。
 - 定向DataLoader/入口测试`68 passed`；全仓测试`360 passed`，`py_compile`与
   `git diff --check`通过。
+
+### 9. 训练内联与独立T2M评测协议统一
+
+- 审计确认旧内联T2M在validation epoch-end callback中逐样本运行，未处于
+  Lightning的BF16 step context；独立CFG sweep则使用BF16和batch=32。两条路径即使
+  CFG相同，也可能因精度和batch GEMM差异在长stream rollout中产生不同结果。
+- 新增唯一的canonical batched T2M核心，训练内联与独立sweep共同使用：
+  - EMA参数；
+  - 生成部分显式BF16；
+  - T2M evaluator保持FP32；
+  - stream模式、逐样本稳定noise seed和固定metric seed；
+  - exact-length batch统一使用`data.val_batch_size`（当前正式配置为32）；
+  - 显式CFG mode与joint scale；
+  - 相同Root5/Body259到HumanML263回写和指标聚合。
+- 完整全局batch在DDP分片之前构造，随后按batch index分给rank；因此1/4/8卡只改变
+  工作归属，不改变每个样本的batch伙伴。全局sample index随embedding一起汇总，
+  避免DistributedSampler补齐样本造成重复或排序漂移。
+- `validation.generation.run_at_start=true`触发的pre-fit `trainer.validate()`现在除
+  dense-XZ yaw视频外，也会在T2M启用时执行一次完整T2M；resume checkpoint由该次
+  validate加载，因此每次恢复训练都会先得到一组起点指标。之后仍按
+  `validation.t2m.steps`周期运行。
+- `InferenceSession`继续保持单设备在线会话；多卡T2M采用完整模型复制与样本batch
+  数据并行，不把一条动作的solver state拆到多卡。
+
+### 10. LDF训练入口职责收口
+
+- `train_ldf.py`由349行精简为108行，入口现在只保留四段稳定流程：
+  初始化配置、构造模型与数据、构造Trainer、执行train/validate。
+- 原入口中的LDF窗口、prediction type、self-forcing、loss、constraint和评测资产
+  合同迁移到`utils/training/ldf/config.py`，公开入口为
+  `validate_training_config()`；训练入口、资产验证工具和测试共享同一实现。
+- run目录、resolved配置快照、WandB logger和absolute-step checkpoint callback
+  迁移到`utils/training/runtime.py`，LDF和VAE入口共同复用，避免训练脚本继续拥有
+  重复的基础设施细节；`train_vae.py`同步由113行精简为68行。
+- 保持原有线程限制时机、Module先于DataLoader构造、LDF自主管理distributed
+  sampler、pre-fit validation、resume checkpoint和callback顺序不变；本次重构不
+  修改模型、loss、采样、配置或数值路径。
+- 除两条既有的`cfg_scale_joint`配置期望冲突外，全仓测试为
+  `378 passed, 2 deselected`；入口/config/runtime相关定向测试全部通过，
+  `py_compile`和`git diff --check`通过。
+
+### 11. Validation视频显示显式Root朝向
+
+- `utils/visualization/motion_video.py`增加可选的逐帧Root heading图层，从当前
+  pelvis/root位置绘制固定0.35米的紫色世界坐标箭头，并将箭头端点纳入固定相机
+  投影范围，避免运动位于画面边缘时被裁切。
+- 严格按照root5合同把`[cos(yaw), sin(yaw)]`转换为世界XZ forward
+  `[sin(yaw), cos(yaw)]`；渲染前归一化方向并拒绝零向量，避免把heading通道直接
+  当作XZ而产生90度错误。
+- LDF comparison视频的Ground truth面板显示GT Root heading，Generated面板显示
+  预测Root heading；startup yaw、周期validation、000021/001168标准案例及复用
+  comparison renderer的CFG视频自然继承该显示，普通VAE骨架视频默认不启用。
+- visualization与LDF evaluation定向测试`31 passed`，并覆盖方向约定、箭头像素
+  输出、非法零heading和GT/生成双面板接线。

@@ -25,6 +25,8 @@ DEFAULT_BACKGROUND_COLOR = (255, 255, 255)
 DEFAULT_JOINT_COLOR = (0, 100, 255)
 TARGET_TRAJECTORY_COLOR = (255, 0, 0)
 GENERATED_TRAJECTORY_COLOR = (0, 0, 255)
+ROOT_HEADING_COLOR = (180, 0, 180)
+DEFAULT_ROOT_HEADING_LENGTH = 0.35
 
 
 def _numpy_float32(value: np.ndarray | torch.Tensor, *, name: str) -> np.ndarray:
@@ -56,10 +58,12 @@ def _project_scene(
     joint_positions: np.ndarray,
     *,
     trajectory_xz: np.ndarray | None,
+    root_heading_xz: np.ndarray | None,
+    root_heading_length: float,
     width: int,
     height: int,
     padding: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Project motion and ground-plane paths with one fixed orthographic camera."""
     elevation = -math.pi / 10.0
     azimuth = -3.0 * math.pi / 4.0
@@ -98,6 +102,12 @@ def _project_scene(
             axis=-1,
         )
         scene_points.append(trajectory_ground)
+    root_heading_tips = None
+    if root_heading_xz is not None:
+        root_heading_tips = joint_positions[:, 0].copy()
+        root_heading_tips[:, 0] += root_heading_xz[:, 0] * root_heading_length
+        root_heading_tips[:, 2] += root_heading_xz[:, 1] * root_heading_length
+        scene_points.append(root_heading_tips)
     bounds_points = np.concatenate(scene_points, axis=0)
     horizontal = bounds_points @ camera_right
     vertical = bounds_points @ camera_up
@@ -124,7 +134,35 @@ def _project_scene(
         project(joint_positions),
         project(root_ground),
         None if trajectory_ground is None else project(trajectory_ground),
+        None if root_heading_tips is None else project(root_heading_tips),
     )
+
+
+def _draw_arrow(
+    draw: ImageDraw.ImageDraw,
+    start: np.ndarray,
+    end: np.ndarray,
+    *,
+    color: tuple[int, int, int],
+    width: int = 4,
+    head_length: float = 10.0,
+) -> None:
+    """Draw one screen-space line arrow with a stable triangular head."""
+
+    start = np.asarray(start, dtype=np.float32)
+    end = np.asarray(end, dtype=np.float32)
+    delta = end - start
+    norm = float(np.linalg.norm(delta))
+    if norm <= 1e-6:
+        return
+    direction = delta / norm
+    perpendicular = np.asarray((-direction[1], direction[0]), dtype=np.float32)
+    base = end - direction * min(float(head_length), 0.45 * norm)
+    half_width = min(0.55 * float(head_length), 0.25 * norm)
+    left = base + perpendicular * half_width
+    right = base - perpendicular * half_width
+    draw.line((tuple(start), tuple(end)), fill=color, width=int(width))
+    draw.polygon((tuple(end), tuple(left), tuple(right)), fill=color)
 
 
 def render_joint_video(
@@ -140,6 +178,8 @@ def render_joint_video(
     traj_mask: np.ndarray | torch.Tensor | None = None,
     show_full_trajectory: bool = False,
     show_generated_trajectory: bool = False,
+    root_heading_xz: np.ndarray | torch.Tensor | None = None,
+    root_heading_length: float = DEFAULT_ROOT_HEADING_LENGTH,
 ) -> None:
     """Render world-space HumanML22 joints as a fixed-camera MP4.
 
@@ -157,6 +197,10 @@ def render_joint_video(
             otherwise reveal it up to the current frame.
         show_generated_trajectory: Draw the generated root path up to the
             current frame using the same timestamps as ``traj_mask``.
+        root_heading_xz: Optional unit forward direction ``[F,2]`` in world
+            XZ coordinates. The current frame is drawn as an arrow from the
+            pelvis/root joint.
+        root_heading_length: Positive physical arrow length in metres.
     """
     joints = _numpy_float32(joint_positions, name="joint_positions")
     if joints.ndim != 3 or tuple(joints.shape[1:]) != (NUM_JOINTS, 3):
@@ -203,9 +247,32 @@ def render_joint_video(
     if show_generated_trajectory and trajectory is None:
         raise ValueError("show_generated_trajectory requires traj_xz")
 
-    projected, projected_root, projected_trajectory = _project_scene(
+    heading = None
+    if root_heading_xz is not None:
+        heading = _numpy_float32(root_heading_xz, name="root_heading_xz")
+        if heading.ndim != 2 or heading.shape != (joints.shape[0], 2):
+            raise ValueError(
+                "root_heading_xz must be [F,2] and match motion length, "
+                f"got {tuple(heading.shape)}"
+            )
+        heading_norm = np.linalg.norm(heading, axis=-1)
+        if np.any(heading_norm <= 1e-6):
+            raise ValueError("root_heading_xz must contain non-zero directions")
+        heading = heading / heading_norm[:, None]
+        root_heading_length = float(root_heading_length)
+        if not math.isfinite(root_heading_length) or root_heading_length <= 0:
+            raise ValueError("root_heading_length must be finite and positive")
+
+    (
+        projected,
+        projected_root,
+        projected_trajectory,
+        projected_heading_tips,
+    ) = _project_scene(
         joints,
         trajectory_xz=trajectory,
+        root_heading_xz=heading,
+        root_heading_length=float(root_heading_length),
         width=width,
         height=height,
         padding=padding,
@@ -279,6 +346,24 @@ def render_joint_video(
                     ),
                     fill=DEFAULT_JOINT_COLOR,
                 )
+            if projected_heading_tips is not None:
+                _draw_arrow(
+                    draw,
+                    frame_positions[0],
+                    projected_heading_tips[frame_index],
+                    color=ROOT_HEADING_COLOR,
+                )
+                legend_x = 230 if projected_trajectory is not None else 12
+                draw.line(
+                    (legend_x, 17, legend_x + 22, 17),
+                    fill=ROOT_HEADING_COLOR,
+                    width=4,
+                )
+                draw.text(
+                    (legend_x + 28, 10),
+                    "root heading",
+                    fill=(0, 0, 0),
+                )
             writer.append_data(np.asarray(image, dtype=np.uint8))
     finally:
         writer.close()
@@ -295,6 +380,8 @@ def render_motion_video(
     traj_mask: np.ndarray | torch.Tensor | None = None,
     show_full_trajectory: bool = False,
     show_generated_trajectory: bool = False,
+    show_root_heading: bool = False,
+    root_heading_length: float = DEFAULT_ROOT_HEADING_LENGTH,
 ) -> None:
     """Recover and render one physical root5/body259 motion and optional route."""
     root = torch.from_numpy(_numpy_float32(root_motion, name="root_motion"))
@@ -305,6 +392,18 @@ def render_motion_video(
         raise ValueError(f"body_motion must be [F,{BODY_DIM}]")
     if root.shape[0] != body.shape[0]:
         raise ValueError("root_motion and body_motion must share frame length")
+    root_heading_xz = None
+    if show_root_heading:
+        heading = root[:, 3:5]
+        heading_norm = torch.linalg.vector_norm(heading, dim=-1)
+        if bool((heading_norm <= 1e-6).any()):
+            raise ValueError("root_motion heading must be non-zero for visualization")
+        # root5 stores [cos(yaw), sin(yaw)], while physical forward direction
+        # on the world XZ plane is [sin(yaw), cos(yaw)].
+        root_heading_xz = torch.stack(
+            (heading[:, 1], heading[:, 0]),
+            dim=-1,
+        ) / heading_norm[:, None]
     joints = recover_joint_positions(root, body)
     render_joint_video(
         joints,
@@ -315,6 +414,8 @@ def render_motion_video(
         traj_mask=traj_mask,
         show_full_trajectory=show_full_trajectory,
         show_generated_trajectory=show_generated_trajectory,
+        root_heading_xz=root_heading_xz,
+        root_heading_length=root_heading_length,
     )
 
 

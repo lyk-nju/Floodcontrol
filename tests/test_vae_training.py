@@ -6,6 +6,7 @@ import pytest
 import train_vae
 from train_vae import main as train_vae_main
 from utils.initialize import load_config
+from utils.training import runtime as training_runtime
 from utils.training.vae import (
     VAELightningModule,
     VAELoss,
@@ -137,13 +138,13 @@ def test_wandb_logger_uses_configured_wandb_info(tmp_path, monkeypatch):
         return "wandb-logger"
 
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    monkeypatch.setattr(train_vae, "WandbLogger", fake_wandb_logger)
-    logger = train_vae._create_logger(cfg, "test", tmp_path)
+    monkeypatch.setattr(training_runtime, "WandbLogger", fake_wandb_logger)
+    logger = training_runtime.create_wandb_logger(cfg, "test", tmp_path)
     assert logger == "wandb-logger"
     assert captured["project"] == cfg.wandb_info.project
     assert captured["entity"] == cfg.wandb_info.entity
     assert captured["name"] == "vae_body259_test"
-    assert train_vae.os.environ["WANDB_API_KEY"] == cfg.wandb_info.key
+    assert training_runtime.os.environ["WANDB_API_KEY"] == cfg.wandb_info.key
 
 
 def test_resume_checkpoint_rejects_statistics_before_loading():

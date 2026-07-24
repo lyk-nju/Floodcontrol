@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import multiprocessing as mp
-import time
 from contextlib import nullcontext
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -18,13 +16,12 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
-from metrics.humanml import convert_root5_body259_to_humanml263
-from metrics.t2m import T2MMetrics
 from utils.initialize import ProjectConfig
 from utils.training.ldf.data import create_dataset
 from utils.training.ldf.evaluation.artifacts import write_json
-from utils.training.ldf.evaluation.generation import (
-    generate_t2m_evaluation_batch,
+from utils.training.ldf.evaluation.t2m import (
+    build_t2m_evaluation_batches,
+    evaluate_t2m_batches,
 )
 from utils.training.ldf.lightning_module import LDFLightningModule
 
@@ -135,24 +132,6 @@ def _load_module(
     return module
 
 
-def _stable_seed(base_seed: int, *parts: object) -> int:
-    digest = hashlib.blake2b(digest_size=8)
-    digest.update(int(base_seed).to_bytes(8, "little", signed=True))
-    for part in parts:
-        encoded = str(part).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
-    return int.from_bytes(digest.digest(), "little") % (2**63 - 1)
-
-
-def _frame_count(sample: dict[str, object], maximum: int) -> int:
-    frames = min(int(sample["root_motion"].shape[0]), int(maximum))
-    frames -= frames % 4
-    if frames <= 0:
-        raise ValueError("T2M sample has no complete four-frame token")
-    return frames
-
-
 def _humanml_samples(dataset, maximum: int) -> list[tuple[int, dict[str, object]]]:
     selected: list[tuple[int, dict[str, object]]] = []
     for dataset_index in range(len(dataset)):
@@ -198,6 +177,8 @@ def _result_contract(
         "max_horizon_token": int(max_horizon_token),
         "num_denoise_steps": int(num_denoise_steps),
         "dense_xz": False,
+        "precision": "bf16",
+        "evaluator": "canonical_batched_stream_v1",
     }
 
 
@@ -244,84 +225,23 @@ def _evaluate_variant(
     progress_every: int,
     batch_size: int,
 ) -> tuple[dict[str, float], float]:
-    metric = T2MMetrics(cfg.metrics.t2m).to(module.device).eval()
-    started = time.perf_counter()
+    del rolling_window_tokens, max_horizon_token
+    batches = build_t2m_evaluation_batches(
+        samples,
+        maximum_frames=maximum_frames,
+        batch_size=batch_size,
+    )
     total = len(samples)
-    buckets: dict[int, list[tuple[int, dict[str, object]]]] = {}
-    for indexed_sample in samples:
-        frames = _frame_count(indexed_sample[1], maximum_frames)
-        buckets.setdefault(frames, []).append(indexed_sample)
-    batches: list[tuple[int, list[tuple[int, dict[str, object]]]]] = []
-    for frames in sorted(buckets, reverse=True):
-        values = buckets[frames]
-        batches.extend(
-            (frames, values[start : start + int(batch_size)])
-            for start in range(0, len(values), int(batch_size))
-        )
-
-    completed = 0
     next_progress = int(progress_every) if progress_every > 0 else total
-    for frames, indexed_batch in batches:
-        sample_indices = [int(item[0]) for item in indexed_batch]
-        batch_samples = [item[1] for item in indexed_batch]
-        seeds = [
-            _stable_seed(
-                base_seed,
-                "t2m",
-                sample["dataset"],
-                sample["name"],
-            )
-            for sample in batch_samples
-        ]
-        autocast = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if module.device.type == "cuda"
-            else nullcontext()
-        )
-        with torch.inference_mode(), autocast:
-            generated = generate_t2m_evaluation_batch(
-                module,
-                batch_samples,
-                guidance_mode=variant.mode,
-                cfg_scale_joint=variant.joint_scale,
-                seeds=seeds,
-                frame_count=frames,
-                num_denoise_steps=num_denoise_steps,
-            )
-        target_root = torch.stack(
-            [sample["root_motion"][:frames] for sample in batch_samples],
-            dim=0,
-        ).to(module.device)
-        target_body = torch.stack(
-            [sample["body_motion"][:frames] for sample in batch_samples],
-            dim=0,
-        ).to(module.device)
-        reference = convert_root5_body259_to_humanml263(
-            target_root,
-            target_body,
-            tail="drop",
-        ).detach().to(module.device)
-        predicted = convert_root5_body259_to_humanml263(
-            generated.root_motion,
-            generated.body_motion,
-            tail="drop",
-        ).detach().to(module.device)
-        lengths = [int(reference.shape[1])] * len(batch_samples)
-        metric.update(
-            reference,
-            predicted,
-            lengths,
-            lengths,
-            [list(prompt.tokens) for prompt in generated.prompts],
-            sample_indices=sample_indices,
-        )
-        completed += len(batch_samples)
+
+    def progress(completed, local_total, current_batch_size, elapsed):
+        nonlocal next_progress
+        del local_total
         if completed == total or completed >= next_progress:
-            elapsed = time.perf_counter() - started
             eta = elapsed / completed * (total - completed)
             print(
                 f"[{variant.name}] {completed}/{total} "
-                f"batch={len(batch_samples)} "
+                f"batch={current_batch_size} "
                 f"elapsed={_format_seconds(elapsed)} "
                 f"eta={_format_seconds(eta)}",
                 flush=True,
@@ -329,15 +249,17 @@ def _evaluate_variant(
             while next_progress <= completed:
                 next_progress += max(1, int(progress_every))
 
-    metric_seed = _stable_seed(base_seed, "t2m_metric", generation_mode)
-    torch.random.default_generator.manual_seed(metric_seed)
-    np.random.seed(metric_seed % (2**32))
-    values = metric.compute(False)
-    metrics = {
-        key: float(value.detach().cpu().item())
-        for key, value in values.items()
-    }
-    return metrics, time.perf_counter() - started
+    return evaluate_t2m_batches(
+        module,
+        metric_config=cfg.metrics.t2m,
+        batches=batches,
+        guidance_mode=variant.mode,
+        cfg_scale_joint=variant.joint_scale,
+        base_seed=base_seed,
+        generation_mode=generation_mode,
+        num_denoise_steps=num_denoise_steps,
+        progress_callback=progress,
+    )
 
 
 def _evaluate_variant_group(
@@ -523,8 +445,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32,
-        help="Maximum equal-length T2M samples generated together on each GPU",
+        default=None,
+        help=(
+            "Maximum equal-length T2M samples generated together on each GPU; "
+            "defaults to data.val_batch_size"
+        ),
     )
     device_group = parser.add_mutually_exclusive_group()
     device_group.add_argument(
@@ -562,14 +487,19 @@ def main() -> None:
         raise ValueError("--max-samples must be non-negative")
     if args.progress_every < 0:
         raise ValueError("--progress-every must be non-negative")
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be positive")
     if args.generation_mode != "stream":
         raise ValueError(
             "batched T2M CFG sweep currently supports generation-mode=stream only"
         )
 
     cfg = _load_config(args.config, args.override)
+    batch_size = (
+        int(cfg.data.val_batch_size)
+        if args.batch_size is None
+        else int(args.batch_size)
+    )
+    if batch_size <= 0:
+        raise ValueError("--batch-size/data.val_batch_size must be positive")
     device = torch.device(
         args.device
         if args.device is not None
@@ -636,7 +566,7 @@ def main() -> None:
         sample_count=sample_count,
         maximum_samples=args.max_samples,
         maximum_frames=maximum_frames,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         base_seed=base_seed,
         rolling_window_tokens=rolling_window_tokens,
         max_horizon_token=max_horizon_token,
@@ -699,7 +629,7 @@ def main() -> None:
                     max_horizon_token=max_horizon_token,
                     num_denoise_steps=num_denoise_steps,
                     progress_every=args.progress_every,
-                    batch_size=args.batch_size,
+                    batch_size=batch_size,
                     raw_weights=bool(args.raw_weights),
                 ): device_index
                 for device_index, group in groups
@@ -737,7 +667,7 @@ def main() -> None:
                     max_horizon_token=max_horizon_token,
                     num_denoise_steps=num_denoise_steps,
                     progress_every=args.progress_every,
-                    batch_size=args.batch_size,
+                    batch_size=batch_size,
                 )
                 result = {
                     "contract": contract,

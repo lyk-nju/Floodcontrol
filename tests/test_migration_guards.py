@@ -8,8 +8,9 @@ import pytest
 from models.diffusion_forcing_wan import LDF
 from models.vae_wan_1d import BodyVAE
 from tests.vae_helpers import make_vae
-from train_ldf import _validate_training_config, main as train_main
+from train_ldf import main as train_main
 from utils.initialize import instantiate_target, load_config
+from utils.training.ldf.config import validate_training_config
 from utils.training.ldf.window import resolve_self_forcing_k
 from web_demo.runtime.model_loader import WEB_RUNTIME_BLOCKER, load_model_bundle
 
@@ -152,7 +153,7 @@ def test_remote_t2m_evaluation_matches_the_training_server_profile():
 def test_mixed_ldf_config_uses_the_same_prompt_and_model_contract():
     cfg = load_config(str(ROOT / "configs" / "ldf_multi.yaml"))
     human_cfg = load_config(str(LOCAL_LDF_CONFIG))
-    _validate_training_config(cfg, check_assets=False)
+    validate_training_config(cfg, check_assets=False)
     assert "status" not in cfg.config
     assert cfg.wandb_info.project == "Floodcontrol"
     assert cfg.data.target == "datasets.multi.MultiDataset"
@@ -335,7 +336,7 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     assert source.index("trainer.validate(") < source.index("trainer.fit(")
     assert "BLOCKED_ON_LDF_TRAINING" not in source
     cfg = load_config(str(LOCAL_LDF_CONFIG))
-    _validate_training_config(cfg, check_assets=False)
+    validate_training_config(cfg, check_assets=False)
     assert cfg.training.constraint_dropout == pytest.approx(0.2)
     assert cfg.training.window.max_tokens == 50
     assert cfg.training.window.generation_tokens == 5
@@ -345,47 +346,47 @@ def test_training_entry_uses_the_public_ldf_training_stack():
     # callback and therefore remains legal for a multi-device DDP run.
     cfg.config.trainer.devices = 8
     cfg.config.trainer.strategy = "ddp"
-    _validate_training_config(cfg, check_assets=False)
+    validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_missing_xz_lookahead():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.max_horizon_token = 0
     with pytest.raises(RuntimeError, match="LDF_XZ_CONSTRAINT_REQUIRED"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_invalid_constraint_dropout():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_dropout = 1.1
     with pytest.raises(ValueError, match="constraint_dropout"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_invalid_root_prediction_type():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.model.params.root_prediction_type = "vel"
     with pytest.raises(ValueError, match="root_prediction_type"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_invalid_body_prediction_type():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.model.params.body_prediction_type = "eps"
     with pytest.raises(ValueError, match="body_prediction_type"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_invalid_constraint_sampling():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_sampling.goal_probability = 0.5
     with pytest.raises(ValueError, match="must sum to one"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.training.constraint_sampling.max_waypoint_count = 0
     with pytest.raises(ValueError, match="max_waypoint_count"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_self_forcing_that_exceeds_window_budget():
@@ -393,7 +394,7 @@ def test_training_entry_rejects_self_forcing_that_exceeds_window_budget():
     cfg.config.self_forcing.k_schedule = [[0, 1], [1, 47]]
     cfg.config.self_forcing.teacher_replay = {47: 0.1}
     with pytest.raises(ValueError, match="self-forcing rollout"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 @pytest.mark.parametrize(
@@ -427,7 +428,7 @@ def test_training_entry_rejects_invalid_self_forcing_contract(
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.self_forcing[field] = value
     with pytest.raises(ValueError, match=message):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_schedule_stage_outside_training_run():
@@ -435,21 +436,21 @@ def test_training_entry_rejects_schedule_stage_outside_training_run():
     cfg.config.self_forcing.k_schedule.append([cfg.trainer.max_steps, 6])
     cfg.config.self_forcing.teacher_replay[6] = 0.0
     with pytest.raises(ValueError, match="start steps must be smaller"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_rejects_removed_self_forcing_enabled_switch():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     cfg.config.self_forcing.enabled = False
     with pytest.raises(ValueError, match="enabled has been removed"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_training_entry_requires_unified_self_forcing_curriculum():
     cfg = load_config(str(LOCAL_LDF_CONFIG))
     del cfg.config.self_forcing
     with pytest.raises(ValueError, match="curriculum configuration is required"):
-        _validate_training_config(cfg, check_assets=False)
+        validate_training_config(cfg, check_assets=False)
 
 
 def test_web_entry_is_explicitly_blocked():

@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import torch
 from lightning import Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.utilities import rank_zero_info
-from omegaconf import OmegaConf
 
-from utils.initialize import (
-    get_shared_run_timestamp,
-    load_config,
-    save_run_snapshot,
+from utils.initialize import load_config
+from utils.training.runtime import (
+    create_run_directory,
+    create_step_checkpoint_callback,
+    create_wandb_logger,
 )
 from utils.training.vae.data import create_dataloaders
 from utils.training.vae.lightning_module import VAELightningModule
@@ -29,49 +23,6 @@ def _validate_training_config(cfg) -> None:
         )
 
 
-def _create_run_directory(cfg) -> tuple[str, Path]:
-    run_time = get_shared_run_timestamp(cfg.save_dir)
-    save_dir = Path(cfg.save_dir) / f"{run_time}_{cfg.exp_name}"
-    save_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.update(cfg.config, "save_dir", str(save_dir))
-    OmegaConf.update(cfg.config, "run_time", run_time)
-    rank_zero_info(f"Save dir: {save_dir}, exp_name: {cfg.exp_name}")
-    save_run_snapshot(cfg, save_dir)
-    return run_time, save_dir
-
-
-def _create_logger(cfg, run_time: str, save_dir: Path):
-    if cfg.debug or not cfg.get("wandb_info"):
-        return None
-    wandb_key = cfg.wandb_info.key
-    if not wandb_key or not wandb_key.strip():
-        rank_zero_info("WandB API key not provided, skipping WandB logging")
-        return None
-    os.environ["WANDB_API_KEY"] = wandb_key
-    rank_zero_info("WandB logging enabled")
-    return WandbLogger(
-        project=cfg.wandb_info.project,
-        entity=cfg.wandb_info.entity,
-        name=f"{cfg.exp_name}_{run_time}",
-        config=OmegaConf.to_container(cfg.config, resolve=True),
-        save_dir=str(save_dir),
-    )
-
-
-def _create_checkpoint_callback(cfg, save_dir: Path) -> ModelCheckpoint:
-    return ModelCheckpoint(
-        dirpath=save_dir,
-        filename="step_{ckpt_absolute_step:06.0f}",
-        every_n_train_steps=cfg.validation.save_every_n_steps,
-        save_top_k=cfg.validation.save_top_k,
-        monitor="ckpt_absolute_step",
-        mode="max",
-        auto_insert_metric_name=False,
-        save_last=True,
-        save_on_train_epoch_end=False,
-    )
-
-
 def main() -> None:
     torch.set_float32_matmul_precision("high")
     cfg = load_config()
@@ -79,12 +30,12 @@ def main() -> None:
     _validate_training_config(cfg)
 
     train_dataloader, val_dataloader = create_dataloaders(cfg)
-    run_time, save_dir = _create_run_directory(cfg)
-    logger = _create_logger(cfg, run_time, save_dir)
+    run_time, save_dir = create_run_directory(cfg)
+    logger = create_wandb_logger(cfg, run_time, save_dir)
     lightning_module = VAELightningModule(cfg.config)
     callbacks = [EMARestoreOnException()]
     if cfg.train:
-        callbacks.append(_create_checkpoint_callback(cfg, save_dir))
+        callbacks.append(create_step_checkpoint_callback(cfg, save_dir))
     trainer = Trainer(
         **cfg.trainer,
         logger=logger,

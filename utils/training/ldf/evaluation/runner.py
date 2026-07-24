@@ -14,9 +14,7 @@ import torch
 import torch.distributed as dist
 from lightning.pytorch.utilities import rank_zero_info
 
-from metrics.humanml import convert_root5_body259_to_humanml263
 from metrics.stream import compute_stream_boundary_metrics
-from metrics.t2m import T2MMetrics
 from metrics.trajectory import (
     compute_dense_xz_metrics,
     compute_foot_skating_ratio,
@@ -39,6 +37,10 @@ from .generation import (
     compile_evaluation_prompt,
     generate_evaluation_sequence,
     rotate_evaluation_sample,
+)
+from .t2m import (
+    T2MEvaluationBatch,
+    evaluate_t2m_batches,
 )
 
 
@@ -147,7 +149,8 @@ def _format_t2m_summary(
     lines = [
         f"[t2m][{mode}][{step_tag}] "
         f"samples={int(summary.get('num_samples', 0))} "
-        f"cfg={summary.get('cfg_mode', 'unknown')}"
+        f"cfg={summary.get('cfg_mode', 'unknown')} "
+        f"scale={float(summary.get('cfg_scale_joint', 1.0)):.2f}"
     ]
 
     fid = metric("FID")
@@ -216,6 +219,14 @@ def _all_gather_objects(value: object) -> list[object]:
     return gathered
 
 
+def _broadcast_object(value: object, *, source: int = 0) -> object:
+    if not dist.is_available() or not dist.is_initialized():
+        return value
+    payload = [value if dist.get_rank() == int(source) else None]
+    dist.broadcast_object_list(payload, src=int(source))
+    return payload[0]
+
+
 def _distributed_barrier() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -250,6 +261,10 @@ class LDFEvaluationRunner:
         self.cfg = cfg
         self._dataset = None
         self._probe_datasets: dict[str, object] = {}
+        self._t2m_batch_plans: dict[
+            tuple[int, int, str],
+            tuple[tuple[int, tuple[tuple[int, int], ...]], ...],
+        ] = {}
         self._text_coverage_validated = False
         self._startup_evaluation_completed = False
 
@@ -340,6 +355,94 @@ class LDFEvaluationRunner:
         if selected_count == 0:
             raise RuntimeError("generation evaluation selected no validation samples")
         return selected, selected_count
+
+    def _t2m_batch_shard(
+        self,
+        module,
+        *,
+        maximum_frames: int,
+        batch_size: int,
+        dataset_name: str,
+    ) -> tuple[tuple[T2MEvaluationBatch, ...], int]:
+        """Build global fixed batches once, then assign complete batches to ranks."""
+
+        if int(batch_size) <= 0:
+            raise ValueError("validation T2M batch_size must be positive")
+        rank, world_size = _distributed_rank_world(module)
+        key = (int(maximum_frames), int(batch_size), str(dataset_name))
+        plan = self._t2m_batch_plans.get(key)
+        source = self._validation_dataset()
+
+        if plan is None:
+            rank_zero_plan = None
+            if rank == 0:
+                try:
+                    buckets: dict[int, list[tuple[int, int]]] = {}
+                    selected_count = 0
+                    for source_index in range(len(source)):
+                        identity = _peek_sample_identity(source, source_index)
+                        sample = None
+                        if identity is None:
+                            sample = source[source_index]
+                            identity = (
+                                str(sample["dataset"]),
+                                str(sample["name"]),
+                            )
+                        if identity[0] != str(dataset_name):
+                            continue
+                        if sample is None:
+                            sample = source[source_index]
+                        frames = _frame_count(sample, maximum_frames)
+                        buckets.setdefault(frames, []).append(
+                            (selected_count, source_index)
+                        )
+                        selected_count += 1
+                    if selected_count == 0:
+                        raise RuntimeError(
+                            "generation evaluation selected no T2M validation samples"
+                        )
+                    batches = []
+                    for frames in sorted(buckets, reverse=True):
+                        values = buckets[frames]
+                        for start in range(0, len(values), int(batch_size)):
+                            batches.append(
+                                (
+                                    int(frames),
+                                    tuple(
+                                        values[start : start + int(batch_size)]
+                                    ),
+                                )
+                            )
+                    rank_zero_plan = tuple(batches)
+                except Exception as error:
+                    rank_zero_plan = {
+                        "error": (
+                            "rank zero could not construct the T2M batch plan: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                    }
+            plan = _broadcast_object(rank_zero_plan)
+            if isinstance(plan, dict) and "error" in plan:
+                raise RuntimeError(str(plan["error"]))
+            if not isinstance(plan, tuple):
+                raise RuntimeError("distributed T2M batch plan was not broadcast")
+            self._t2m_batch_plans[key] = plan
+
+        local_batches = []
+        for batch_index, (frames, references) in enumerate(plan):
+            if batch_index % world_size != rank:
+                continue
+            local_batches.append(
+                T2MEvaluationBatch(
+                    frame_count=int(frames),
+                    samples=tuple(
+                        (int(global_index), source[int(source_index)])
+                        for global_index, source_index in references
+                    ),
+                )
+            )
+        sample_count = sum(len(references) for _, references in plan)
+        return tuple(local_batches), sample_count
 
     def validate_text_coverage(self, module) -> None:
         """Fail before training when scheduled evaluation prompts are not encoded."""
@@ -616,29 +719,40 @@ class LDFEvaluationRunner:
             _distributed_barrier()
 
     def run_at_start(self, module) -> bool:
-        """Consume the optional pre-fit validation with fixed yaw videos."""
+        """Consume the optional pre-fit validation with generation and T2M."""
 
         if self._startup_evaluation_completed or not self.enabled:
             return False
         validation = self.cfg.validation
         generation = validation.generation
-        due = (
+        startup_enabled = (
             bool(self.cfg.get("train", False))
             and bool(generation.get("run_at_start", False))
+        )
+        yaw_due = (
+            startup_enabled
             and bool(generation.get("render", True))
             and bool(validation.dense_xz.get("enabled", False))
         )
-        if not due:
+        t2m_due = startup_enabled and bool(validation.t2m.get("enabled", False))
+        if not yaw_due and not t2m_due:
             self._startup_evaluation_completed = True
             return False
         step = int(module.global_step)
         _distributed_barrier()
         with self._evaluation_context(module):
-            self._run_startup_yaw_videos(
-                module,
-                step=step,
-                step_tag="fit_start",
-            )
+            if yaw_due:
+                self._run_startup_yaw_videos(
+                    module,
+                    step=step,
+                    step_tag="fit_start",
+                )
+            if t2m_due:
+                self._run_t2m(
+                    module,
+                    step=step,
+                    step_tag="fit_start",
+                )
         self._startup_evaluation_completed = True
         _distributed_barrier()
         return True
@@ -925,69 +1039,41 @@ class LDFEvaluationRunner:
         validation = self.cfg.validation
         config = self._generation_config(validation)
         guidance_mode = str(validation.t2m.get("cfg_mode", "nocfg"))
-        samples, sample_count = self._selected_sample_shard(
+        cfg_scale_joint = float(
+            validation.t2m.get(
+                "cfg_scale_joint",
+                module.model.cfg_scale_joint,
+            )
+        )
+        batch_size = int(self.cfg.data.val_batch_size)
+        batches, sample_count = self._t2m_batch_shard(
             module,
-            limit=0,
+            maximum_frames=int(self.cfg.data.max_frames),
+            batch_size=batch_size,
             dataset_name="HumanML3D",
         )
-        maximum_frames = int(self.cfg.data.max_frames)
         base_seed = int(validation.get("seed", self.cfg.get("seed", 0)))
         rank, _ = _distributed_rank_world(module)
 
         for mode in config["modes"]:
-            metric = T2MMetrics(self.cfg.metrics.t2m).to(module.device).eval()
-            for sample_index, sample in samples:
-                frames = _frame_count(sample, maximum_frames)
-                seed = _stable_seed(
-                    base_seed,
-                    "t2m",
-                    sample["dataset"],
-                    sample["name"],
-                )
-                generated = generate_evaluation_sequence(
-                    module,
-                    sample,
-                    mode=mode,
-                    guidance_mode=guidance_mode,
-                    seed=seed,
-                    frame_count=frames,
-                    dense_xz=False,
-                    rolling_window_tokens=config["rolling_window_tokens"],
-                    max_horizon_token=config["max_horizon_token"],
-                    num_denoise_steps=config["num_denoise_steps"],
-                )
-                reference = convert_root5_body259_to_humanml263(
-                    sample["root_motion"][:frames],
-                    sample["body_motion"][:frames],
-                    tail="drop",
-                ).detach().to(module.device)
-                predicted = convert_root5_body259_to_humanml263(
-                    generated.root_motion,
-                    generated.body_motion,
-                    tail="drop",
-                ).detach().to(module.device)
-                length = int(reference.shape[0])
-                metric.update(
-                    reference[None],
-                    predicted[None],
-                    [length],
-                    [length],
-                    [list(generated.prompt.tokens)],
-                    sample_indices=[sample_index],
-                )
-            metric_seed = _stable_seed(base_seed, "t2m_metric", mode, step)
-            torch.random.default_generator.manual_seed(metric_seed)
-            np.random.seed(metric_seed % (2**32))
-            values = metric.compute(False)
-            summary = {
-                key: float(value.detach().cpu().item())
-                for key, value in values.items()
-            }
+            summary, _ = evaluate_t2m_batches(
+                module,
+                metric_config=self.cfg.metrics.t2m,
+                batches=batches,
+                guidance_mode=guidance_mode,
+                cfg_scale_joint=cfg_scale_joint,
+                base_seed=base_seed,
+                generation_mode=mode,
+                num_denoise_steps=config["num_denoise_steps"],
+            )
             summary.update(
                 {
                     "num_samples": sample_count,
                     "mode": mode,
                     "cfg_mode": guidance_mode,
+                    "cfg_scale_joint": cfg_scale_joint,
+                    "batch_size": batch_size,
+                    "precision": "bf16",
                     "split": "val",
                 }
             )

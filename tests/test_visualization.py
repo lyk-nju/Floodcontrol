@@ -98,6 +98,26 @@ def test_joint_renderer_embeds_target_and_generated_trajectories_in_scene(
     )
 
 
+def test_joint_renderer_draws_current_root_heading_arrow(tmp_path, monkeypatch):
+    writer = RecordingWriter()
+    monkeypatch.setattr(
+        motion_video.imageio,
+        "get_writer",
+        lambda path, fps: writer,
+    )
+    motion_video.render_joint_video(
+        _joints(2),
+        tmp_path / "motion_with_heading.mp4",
+        root_heading_xz=torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+    )
+
+    assert len(writer.frames) == 2
+    for frame in writer.frames:
+        assert np.any(
+            np.all(frame == motion_video.ROOT_HEADING_COLOR, axis=-1)
+        )
+
+
 def test_joint_renderer_closes_writer_when_encoding_fails(tmp_path, monkeypatch):
     writer = RecordingWriter(fail_on_append=True)
     monkeypatch.setattr(
@@ -133,12 +153,34 @@ def test_motion_renderer_recovers_world_joints(monkeypatch, tmp_path):
 
     monkeypatch.setattr(motion_video, "render_joint_video", record)
     root = torch.tensor(
-        [[2.0, 1.2, -3.0, 1.0, 0.0], [2.1, 1.2, -3.0, 1.0, 0.0]]
+        [[2.0, 1.2, -3.0, 1.0, 0.0], [2.1, 1.2, -3.0, 0.0, 2.0]]
     )
     body = torch.zeros(2, 259)
     output = tmp_path / "motion.mp4"
-    motion_video.render_motion_video(root, body, output, fps=24)
+    motion_video.render_motion_video(
+        root,
+        body,
+        output,
+        fps=24,
+        show_root_heading=True,
+    )
     assert captured["joints"].shape == (2, 22, 3)
     assert torch.equal(captured["joints"][:, 0], root[:, :3])
     assert captured["output_path"] == output
     assert captured["kwargs"]["fps"] == 24
+    assert torch.allclose(
+        captured["kwargs"]["root_heading_xz"],
+        torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+    )
+
+
+def test_motion_renderer_rejects_zero_root_heading_when_requested(tmp_path):
+    root = torch.zeros(2, 5)
+    body = torch.zeros(2, 259)
+    with pytest.raises(ValueError, match="heading must be non-zero"):
+        motion_video.render_motion_video(
+            root,
+            body,
+            tmp_path / "motion.mp4",
+            show_root_heading=True,
+        )

@@ -1,0 +1,221 @@
+"""Validation for the formal LDF training and evaluation contract."""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+from utils.training.ldf.window import validate_self_forcing_config
+
+
+def _require_file(path: str, name: str) -> None:
+    if not Path(path).is_file():
+        raise RuntimeError(f"{name}_REQUIRED: file not found at {path}")
+
+
+def validate_training_config(cfg, *, check_assets: bool = True) -> None:
+    """Validate one resolved LDF configuration before constructing the model."""
+
+    if check_assets:
+        _require_file(str(cfg.vae.checkpoint_path), "VAE_CHECKPOINT")
+        _require_file(str(cfg.data.text_embeddings_path), "TEXT_EMBEDDINGS")
+    for name in ("root_prediction_type", "body_prediction_type"):
+        value = str(cfg.model.params.get(name, ""))
+        if value not in {"x0", "velocity"}:
+            raise ValueError(f"model.params.{name} must be x0 or velocity")
+    if int(cfg.model.params.text_len) != int(cfg.text_encoder.text_len):
+        raise ValueError("model.text_len and text_encoder.text_len must match")
+
+    training = cfg.get("training") or {}
+    for name in ("text_dropout", "constraint_dropout"):
+        probability = float(training.get(name, 0.0))
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"training.{name} must lie in [0,1]")
+    lookahead = int(training.get("max_horizon_token", 0))
+    window = training.get("window") or {}
+    max_window_tokens = int(window.get("max_tokens", 0))
+    generation_tokens = int(window.get("generation_tokens", 0))
+    if max_window_tokens <= 0:
+        raise ValueError("training.window.max_tokens must be positive")
+    if generation_tokens != int(cfg.model.params.chunk_size):
+        raise ValueError(
+            "training.window.generation_tokens must equal model.params.chunk_size"
+        )
+    if str(window.get("sampling", "")) != "random_generation_start":
+        raise ValueError(
+            "training.window.sampling must be random_generation_start"
+        )
+    if int(cfg.data.max_frames) != max_window_tokens * 4:
+        raise ValueError(
+            "data.max_frames must equal 4 * training.window.max_tokens"
+        )
+    if int(cfg.data.min_frames) < generation_tokens * 4:
+        raise ValueError(
+            "data.min_frames must contain at least one complete generation chunk"
+        )
+    if lookahead <= 0 or lookahead > max_window_tokens - generation_tokens:
+        raise RuntimeError(
+            "LDF_XZ_CONSTRAINT_REQUIRED: "
+            "training.max_horizon_token must lie in "
+            "[1, window.max_tokens - window.generation_tokens]"
+        )
+
+    self_forcing = cfg.get("self_forcing")
+    if self_forcing is None:
+        raise ValueError("self_forcing curriculum configuration is required")
+    validate_self_forcing_config(
+        self_forcing,
+        generation_tokens=generation_tokens,
+        max_window_tokens=max_window_tokens,
+        max_steps=int(cfg.trainer.max_steps),
+    )
+    if int(cfg.model.params.noise_steps) % generation_tokens:
+        raise ValueError(
+            "persistent self-forcing requires model.noise_steps divisible by "
+            "training.window.generation_tokens"
+        )
+
+    loss = cfg.get("loss") or {}
+    for name in (
+        "root_weight",
+        "body_weight",
+        "rollout_weight",
+        "root_boundary_weight",
+    ):
+        value = float(loss.get(name, 0.0))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"loss.{name} must be finite and non-negative")
+
+    sampling = training.get("constraint_sampling") or {}
+    probabilities = [
+        float(sampling.get(name, -1.0))
+        for name in (
+            "dense_probability",
+            "waypoint_probability",
+            "goal_probability",
+        )
+    ]
+    if any(value < 0.0 or value > 1.0 for value in probabilities):
+        raise ValueError(
+            "training.constraint_sampling probabilities must lie in [0,1]"
+        )
+    if abs(sum(probabilities) - 1.0) > 1e-6:
+        raise ValueError(
+            "training.constraint_sampling probabilities must sum to one"
+        )
+    if int(sampling.get("max_waypoint_count", 0)) <= 0:
+        raise ValueError(
+            "training.constraint_sampling.max_waypoint_count must be positive"
+        )
+
+    validation = cfg.get("validation") or {}
+    generation = validation.get("generation") or {}
+    dense_xz = validation.get("dense_xz") or {}
+    t2m = validation.get("t2m") or {}
+    if not bool(generation.get("enabled", False)):
+        return
+
+    validation_steps = int(validation.validation_steps)
+    generation_steps = int(generation.get("steps", 0))
+    if generation_steps <= 0 or generation_steps % validation_steps:
+        raise ValueError(
+            "validation.generation.steps must be a positive multiple of "
+            "validation.validation_steps"
+        )
+    modes = [str(mode) for mode in generation.get("modes", [])]
+    if (
+        not modes
+        or len(set(modes)) != len(modes)
+        or not set(modes) <= {"stream", "rolling"}
+    ):
+        raise ValueError(
+            "validation.generation.modes must be unique stream/rolling values"
+        )
+    for name in ("num_runs", "num_denoise_steps", "max_horizon_token"):
+        if int(generation.get(name, 0)) <= 0:
+            raise ValueError(f"validation.generation.{name} must be positive")
+    rolling = generation.get("rolling") or {}
+    rolling_tokens = int(rolling.get("window_tokens", 0))
+    if rolling_tokens <= generation_tokens:
+        raise ValueError(
+            "validation.generation.rolling.window_tokens must exceed chunk_size"
+        )
+    if rolling_tokens > max_window_tokens:
+        raise ValueError(
+            "validation rolling window cannot exceed training.window.max_tokens"
+        )
+    if int(generation.get("max_horizon_token", 0)) > lookahead:
+        raise ValueError(
+            "validation future constraints cannot exceed the training lookahead cap"
+        )
+
+    if bool(dense_xz.get("enabled", False)):
+        probe = str(dense_xz.get("probe", "")).strip()
+        if not probe:
+            raise ValueError("validation.dense_xz.probe must name a data probe")
+        video_yaw_degrees = [
+            float(value)
+            for value in dense_xz.get("video_yaw_degrees", (0, 90, 180))
+        ]
+        if (
+            not video_yaw_degrees
+            or any(not math.isfinite(value) for value in video_yaw_degrees)
+            or len(set(video_yaw_degrees)) != len(video_yaw_degrees)
+        ):
+            raise ValueError(
+                "validation.dense_xz.video_yaw_degrees must be finite and unique"
+            )
+        probe_paths = cfg.data.get("test_probe_meta_paths") or {}
+        if probe not in probe_paths or not probe_paths[probe]:
+            raise ValueError(
+                f"data.test_probe_meta_paths must define {probe!r}"
+            )
+        if check_assets:
+            for index, path in enumerate(probe_paths[probe]):
+                _require_file(str(path), f"DENSE_XZ_PROBE_{index}")
+
+    if bool(t2m.get("enabled", False)):
+        t2m_steps = int(t2m.get("steps", 0))
+        if t2m_steps <= 0 or t2m_steps % validation_steps:
+            raise ValueError(
+                "validation.t2m.steps must be a positive multiple of "
+                "validation.validation_steps"
+            )
+        t2m_cfg_mode = str(t2m.get("cfg_mode", "nocfg"))
+        if t2m_cfg_mode not in {"nocfg", "joint", "separated"}:
+            raise ValueError(
+                "validation.t2m.cfg_mode must be nocfg, joint, or separated"
+            )
+        generation_modes = tuple(
+            str(mode) for mode in generation.get("modes", ())
+        )
+        if generation_modes != ("stream",):
+            raise ValueError(
+                "canonical T2M evaluation requires "
+                "validation.generation.modes: [stream]"
+            )
+        if cfg.get("metrics") is None or cfg.metrics.get("t2m") is None:
+            raise ValueError("validation.t2m requires metrics.t2m")
+        metric_cfg = cfg.metrics.t2m
+        if check_assets:
+            for name, path in (
+                ("T2M_MEAN", metric_cfg.metric_mean_path),
+                ("T2M_STD", metric_cfg.metric_std_path),
+                ("T2M_TEXT_ENCODER", metric_cfg.textencoder.ckpt),
+                ("T2M_MOVEMENT_ENCODER", metric_cfg.moveencoder.ckpt),
+                ("T2M_MOTION_ENCODER", metric_cfg.motionencoder.ckpt),
+            ):
+                _require_file(str(path), name)
+
+
+def generation_evaluation_enabled(cfg) -> bool:
+    """Return whether this run needs the optional generation callback."""
+
+    validation = cfg.get("validation") or {}
+    generation = validation.get("generation") or {}
+    dense_xz = validation.get("dense_xz") or {}
+    t2m = validation.get("t2m") or {}
+    return bool(generation.get("enabled", False)) and (
+        bool(dense_xz.get("enabled", False))
+        or bool(t2m.get("enabled", False))
+    )
