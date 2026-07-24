@@ -153,7 +153,7 @@ model:
     cfg_mode: joint
     cfg_scale_text: 1.0
     cfg_scale_constraint: 1.0
-    cfg_scale_joint: 3.0
+    cfg_scale_joint: 1.0
     root_prediction_type: x0
     body_prediction_type: velocity
 
