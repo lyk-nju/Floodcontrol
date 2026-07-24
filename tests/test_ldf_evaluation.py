@@ -29,6 +29,7 @@ from utils.training.ldf.evaluation.generation import (
     compile_evaluation_prompt,
     create_evaluation_initial_noise,
     generate_evaluation_sequence,
+    generate_t2m_evaluation_batch,
     rotate_evaluation_sample,
 )
 from utils.training.ldf.evaluation.runner import (
@@ -810,3 +811,76 @@ def test_generation_evaluation_can_override_joint_cfg_scale():
     assert module.model.cfg_scale_joint == 9.0
     assert module.model._seen_cfg_scales
     assert set(module.model._seen_cfg_scales) == {2.0}
+
+
+def test_batched_t2m_generation_matches_independent_stream_sessions():
+    module = _evaluation_module()
+    samples = []
+    for index, caption in enumerate(("walk forward", "turn left")):
+        root = torch.zeros(8, 5)
+        root[:, 0] = float(index) + torch.linspace(0.0, 0.2, 8)
+        root[:, 1] = 1.0
+        root[:, 2] = -float(index)
+        root[:, 3] = 1.0
+        samples.append(
+            {
+                "dataset": "HumanML3D",
+                "name": f"sample_{index}",
+                "root_motion": root,
+                "body_motion": torch.zeros(8, 259),
+                "text_data": [
+                    {
+                        "text": caption,
+                        "tokens": [f"{caption}/OTHER"],
+                        "start_frame": 0,
+                        "end_frame": 8,
+                    }
+                ],
+            }
+        )
+    seeds = [7, 11]
+
+    batched = generate_t2m_evaluation_batch(
+        module,
+        samples,
+        guidance_mode="joint",
+        cfg_scale_joint=2.0,
+        seeds=seeds,
+        frame_count=8,
+        num_denoise_steps=2,
+    )
+    independent = [
+        generate_evaluation_sequence(
+            module,
+            sample,
+            mode="stream",
+            guidance_mode="joint",
+            cfg_scale_joint=2.0,
+            seed=seed,
+            frame_count=8,
+            dense_xz=False,
+            rolling_window_tokens=4,
+            max_horizon_token=2,
+            num_denoise_steps=2,
+        )
+        for sample, seed in zip(samples, seeds)
+    ]
+
+    assert torch.allclose(
+        batched.root_motion,
+        torch.stack([value.root_motion for value in independent]),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        batched.body_motion,
+        torch.stack([value.body_motion for value in independent]),
+        atol=1e-5,
+    )
+    for batched_prompt, independent_value in zip(batched.prompts, independent):
+        assert batched_prompt.timeline == independent_value.prompt.timeline
+        assert batched_prompt.caption == independent_value.prompt.caption
+        assert batched_prompt.tokens == independent_value.prompt.tokens
+        assert np.array_equal(
+            batched_prompt.change_frames,
+            independent_value.prompt.change_frames,
+        )
